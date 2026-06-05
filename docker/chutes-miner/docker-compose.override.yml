@@ -1,0 +1,35 @@
+# Local dev overrides for the chutes-miner control plane (Phase 2).
+# Auto-merged by `docker compose`. NOT for production.
+#
+# Why this is needed (the base docker-compose.yaml has bit-rotted for direct use):
+#   - api build target `api` does not exist (Dockerfile targets: base/production/sql/development),
+#     and it lacks the PROJECT_DIR/PROJECT build args + correct context. We build the image
+#     separately (see the build command run by the agent) and just reference it here.
+#   - host ports 5432/6379 collide with native host services, and 8080 collides with the
+#     validator's socket server -> remap with `!override`.
+#   - the base `../api:/app/api` mount points at a nonexistent dir and would shadow the app
+#     code -> drop it.
+#   - VALIDATORS must point at OUR local validator; the miner reaches it over the host gateway.
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:5434:5432"
+
+  redis:
+    ports: !override
+      - "127.0.0.1:6381:6379"
+
+  api:
+    build: !reset null
+    image: chutes-miner:dev
+    ports: !override
+      - "8090:8000"
+    volumes: !override []
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # The base compose's MINER_SS58 (5E6xfU3o...) does NOT match its MINER_SEED.
+      # 5Df8x... is the ss58 actually derived from MINER_SEED=e031170f...; the validator
+      # verifies the socket signature against this, and it must be seeded into metagraph_nodes.
+      MINER_SS58: 5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj
+      VALIDATORS: '{"supported": [{"hotkey": "5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4", "registry": "http://host.docker.internal:5000", "api": "http://host.docker.internal:8000", "socket": "ws://host.docker.internal:8080"}]}'

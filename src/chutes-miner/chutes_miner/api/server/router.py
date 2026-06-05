@@ -89,7 +89,7 @@ async def create_server(
             detail=f"Server with name={server_args.name} is already provisioned!",
         )
 
-    # Validate short ref.
+    # Validate the GPU short ref against the validator's supported GPUs.
     validator = validator_by_hotkey(server_args.validator)
     supported_gpus = set([])
     try:

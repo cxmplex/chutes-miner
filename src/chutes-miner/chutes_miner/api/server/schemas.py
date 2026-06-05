@@ -58,7 +58,8 @@ class ServerArgsRequest(BaseModel):
     host: str
     id: str
     name: Optional[str] = None
-    gpus: list[NodeArgs]
+    compute_type: str = "gpu"
+    gpus: Optional[list[NodeArgs]] = None
 
 
 class MultiNodeArgsRequest(BaseModel):

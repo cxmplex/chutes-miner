@@ -43,10 +43,12 @@ class MockStrategyDependencies:
 
 class MockServerArgs:
     """Mock ServerArgs class for testing"""
-    def __init__(self, validator="test_validator", hourly_cost=1.0, 
-                 gpu_short_ref="rtx4090", agent_api=None, name="test-server"):
+    def __init__(self, validator="test_validator", hourly_cost=1.0,
+                 gpu_short_ref="rtx4090", agent_api=None, name="test-server",
+                 compute_type="gpu"):
         self.validator = validator
         self.hourly_cost = hourly_cost
+        self.compute_type = compute_type
         self.gpu_short_ref = gpu_short_ref
         self.agent_api = agent_api
         self.name = name

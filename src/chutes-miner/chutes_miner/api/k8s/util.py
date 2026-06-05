@@ -346,6 +346,7 @@ def build_chute_job(
                             security_context=V1SecurityContext(
                                 # XXX Would love to add this, but vllm (and likely other libraries) love writing files...
                                 # read_only_root_filesystem=True,
+                                # IPC_LOCK is only needed for GPU workloads (pinned memory).
                                 capabilities={"add": ["IPC_LOCK"]},
                             ),
                             command=command,

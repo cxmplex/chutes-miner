@@ -30,6 +30,7 @@ def _make_inputs(version: str, tee: bool = False):
         image="parachutes/test:latest",
         gpu_count=1,
         tee=tee,
+        compute_type="gpu",
     )
     server = SimpleNamespace(
         cpu_per_gpu=1,
@@ -122,3 +123,44 @@ def test_build_chute_job_attaches_code_volume_for_legacy_non_tee():
 
     assert any(volume.name == "code" for volume in volumes)
     assert any(mount.name == "code" for mount in mounts)
+
+
+def _make_tee_service() -> V1Service:
+    # TEE chutes on chutes runtime >= 0.6.0 expose an attestation port (8002).
+    return V1Service(
+        spec=V1ServiceSpec(
+            type="NodePort",
+            selector={"app": "chute"},
+            external_traffic_policy="Local",
+            ports=[
+                V1ServicePort(port=8000, target_port=8000, node_port=30080, protocol="TCP"),
+                V1ServicePort(port=8001, target_port=8001, node_port=30081, protocol="TCP"),
+                V1ServicePort(port=8002, target_port=8002, node_port=30082, protocol="TCP"),
+            ],
+        )
+    )
+
+
+def _container_env(job):
+    return {env.name: env.value for env in job.spec.template.spec.containers[0].env}
+
+
+def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
+    chute, server, _ = _make_inputs("0.8.0", tee=True)
+    service = _make_tee_service()
+    job = build_chute_job(
+        deployment_id="deploy-gpu",
+        chute=chute,
+        server=server,
+        service=service,
+        gpu_uuids=["GPU-UUID-1"],
+        probe_port=8000,
+        token="launch-token",
+    )
+    assert job.spec.template.spec.runtime_class_name == "nvidia"
+    env = _container_env(job)
+    assert env["NVIDIA_VISIBLE_DEVICES"] == "GPU-UUID-1"
+    assert env["NCCL_P2P_DISABLE"] == "1"
+    assert job.spec.template.spec.containers[0].security_context.capabilities == {
+        "add": ["IPC_LOCK"]
+    }

@@ -34,6 +34,20 @@ from chutes_miner.validator_migrations import run_validator_migrations
 import chutes_miner.api.k8s as k8s
 
 
+def _chute_compute_fields(chute_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Derive the local Chute GPU allocation columns from a validator chute payload's node_selector.
+
+    CPU (GPU-less) chutes are handled by the validator-driven 1-click path, not this miner-run
+    control plane, so only the GPU allocation count is tracked here.
+    """
+    node_selector = chute_dict.get("node_selector") or {}
+    return {
+        "compute_type": "gpu",
+        "gpu_count": node_selector.get("gpu_count"),
+    }
+
+
 class Gepetto:
     def __init__(self):
         """
@@ -762,7 +776,8 @@ class Gepetto:
                     "tee",
                 ):
                     setattr(chute, key, chute_dict.get(key))
-                chute.gpu_count = chute_dict["node_selector"]["gpu_count"]
+                for field, value in _chute_compute_fields(chute_dict).items():
+                    setattr(chute, field, value)
                 chute.ban_reason = None
             else:
                 chute = Chute(
@@ -775,11 +790,11 @@ class Gepetto:
                     ref_str=chute_dict["ref_str"],
                     version=chute_dict["version"],
                     supported_gpus=chute_dict["supported_gpus"],
-                    gpu_count=chute_dict["node_selector"]["gpu_count"],
                     chutes_version=chute_dict["chutes_version"],
                     ban_reason=None,
                     preemptible=chute_dict["preemptible"],
                     tee=chute_dict["tee"],
+                    **_chute_compute_fields(chute_dict),
                 )
                 db.add(chute)
             await db.commit()
@@ -1126,11 +1141,11 @@ class Gepetto:
                 ref_str=chute_dict["ref_str"],
                 version=chute_dict["version"],
                 supported_gpus=chute_dict["supported_gpus"],
-                gpu_count=chute_dict["node_selector"]["gpu_count"],
                 chutes_version=chute_dict["chutes_version"],
                 ban_reason=None,
                 preemptible=chute_dict["preemptible"],
                 tee=chute_dict["tee"],
+                **_chute_compute_fields(chute_dict),
             )
             session.add(chute)
             await session.commit()
@@ -1225,7 +1240,8 @@ class Gepetto:
                             "tee",
                         ):
                             setattr(chute, key, chute_dict.get(key))
-                        chute.gpu_count = chute_dict["node_selector"]["gpu_count"]
+                        for field, value in _chute_compute_fields(chute_dict).items():
+                            setattr(chute, field, value)
                         chute.ban_reason = None
                     else:
                         chute = Chute(
@@ -1238,11 +1254,11 @@ class Gepetto:
                             ref_str=chute_dict["ref_str"],
                             version=chute_dict["version"],
                             supported_gpus=chute_dict["supported_gpus"],
-                            gpu_count=chute_dict["node_selector"]["gpu_count"],
                             chutes_version=chute_dict["chutes_version"],
                             ban_reason=None,
                             preemptible=chute_dict["preemptible"],
                             tee=chute_dict["tee"],
+                            **_chute_compute_fields(chute_dict),
                         )
                         db.add(chute)
                     await db.commit()
@@ -1774,7 +1790,10 @@ class Gepetto:
                             chute_data["code"],
                             chute_data["ref_str"],
                             f"{chute_data['preemptible']}",
-                            f"{chute_data['node_selector']['gpu_count']}",
+                            # Normalize gpu_count the same way it is stored locally (0 for CPU
+                            # chutes) so CPU chutes don't perpetually appear out-of-sync. For GPU
+                            # chutes this is identical to node_selector['gpu_count'].
+                            f"{_chute_compute_fields(chute_data)['gpu_count']}",
                             f"{chute_data['chutes_version']}",
                             f"{set(sorted(chute_data['supported_gpus']))}",
                         ]

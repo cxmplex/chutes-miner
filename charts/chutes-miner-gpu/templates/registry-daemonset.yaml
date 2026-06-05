@@ -17,9 +17,17 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+      {{- if .Values.registry.gpuOnlyNodeSelector }}
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+        {{- with .Values.registry.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- else }}
       {{- with .Values.registry.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
       # restartPolicy: Always on an init container makes it a native sidecar
       # (KEP-753). It starts before regular containers, but keeps running for
