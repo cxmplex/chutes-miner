@@ -25,12 +25,8 @@ registry:
     targetPort: 5000
     # BE SURE THIS MATCHES registry_port IN ANSIBLE!
     nodePort: 30500
-  # By default the in-cluster registry proxy is pinned to GPU worker nodes. CPU-only TEE
-  # workers do not expose the nvidia.com/gpu.present label, so set gpuOnlyNodeSelector to
-  # false (see values-cpu.yaml) to allow scheduling it on CPU worker nodes. Any entries in
-  # nodeSelector below are always merged in addition to the GPU pin.
-  gpuOnlyNodeSelector: true
-  nodeSelector: {}
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
   config:
     workerProcesses: 1
     workerConnections: 1024

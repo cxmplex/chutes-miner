@@ -15,8 +15,7 @@ class ServerArgs(BaseModel):
     name: str
     validator: str
     hourly_cost: float
-    compute_type: str = "gpu"
-    gpu_short_ref: Optional[str] = None
+    gpu_short_ref: str
     agent_api: Optional[str] = None
 
 
@@ -33,15 +32,9 @@ class Server(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     labels = Column(JSONB, nullable=False)
     seed = Column(BigInteger)
-    compute_type = Column(String, nullable=False, server_default="gpu")
-    gpu_count = Column(Integer, nullable=True)
-    cpu_per_gpu = Column(Integer, nullable=True, default=1)
-    memory_per_gpu = Column(Integer, nullable=True, default=1)
-    # Total usable CPU/RAM capacity for CPU-only (GPU-less) servers.
-    cpu_count = Column(Integer, nullable=True)
-    ram_gb = Column(Integer, nullable=True)
-    # Composite CPU benchmark score from the TEE attestation service (CPU servers only).
-    benchmark_score = Column(Float, nullable=True)
+    gpu_count = Column(Integer, nullable=False)
+    cpu_per_gpu = Column(Integer, nullable=False, default=1)
+    memory_per_gpu = Column(Integer, nullable=False, default=1)
     hourly_cost = Column(Float, nullable=False)
     locked = Column(Boolean, default=False)
     kubeconfig = Column(Text, nullable=True)  # Make this false if enforicng migration

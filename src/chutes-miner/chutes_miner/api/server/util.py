@@ -169,24 +169,21 @@ async def track_server(
     if status != "Ready":
         raise ValueError(f"Node is not yet ready [{status=}]")
 
-    # Determine total usable CPU/RAM capacity.
+    # Calculate CPU/RAM per GPU for allocation purposes.
+    gpu_count = int(node_object.status.capacity["nvidia.com/gpu"])
+    gpu_mem_mb = int(node_object.metadata.labels.get("nvidia.com/gpu.memory", "32"))
+    gpu_mem_gb = int(gpu_mem_mb / 1024)
     cpu_count = (
         int(node_object.status.capacity["cpu"]) - 2
     )  # leave 2 CPUs for incidentals, daemon sets, etc.
+    cpu_per_gpu = 1 if cpu_count <= gpu_count else min(4, math.floor(cpu_count / gpu_count))
     raw_mem = node_object.status.capacity["memory"]
-    total_memory_gb = 0
     if raw_mem.endswith("Ki"):
         total_memory_gb = int(int(raw_mem.replace("Ki", "")) / 1024 / 1024) - 6
     elif raw_mem.endswith("Mi"):
         total_memory_gb = int(int(raw_mem.replace("Mi", "")) / 1024) - 6
     elif raw_mem.endswith("Gi"):
         total_memory_gb = int(raw_mem.replace("Gi", "")) - 6
-
-    # Calculate CPU/RAM per GPU for allocation purposes.
-    gpu_count = int(node_object.status.capacity["nvidia.com/gpu"])
-    gpu_mem_mb = int(node_object.metadata.labels.get("nvidia.com/gpu.memory", "32"))
-    gpu_mem_gb = int(gpu_mem_mb / 1024)
-    cpu_per_gpu = 1 if cpu_count <= gpu_count else min(4, math.floor(cpu_count / gpu_count))
     memory_per_gpu = (
         1
         if total_memory_gb <= gpu_count
@@ -207,8 +204,6 @@ async def track_server(
             gpu_count=gpu_count,
             cpu_per_gpu=cpu_per_gpu,
             memory_per_gpu=memory_per_gpu,
-            cpu_count=max(cpu_count, 0),
-            ram_gb=max(total_memory_gb, 0),
             hourly_cost=hourly_cost,
             kubeconfig=_kubeconfig,
             agent_api=agent_api,
@@ -254,18 +249,15 @@ async def bootstrap_server(
             # Make sure this is available for deploying
             MultiClusterKubeConfig().add_config(kubeconfig)
 
-        add_labels = {
-            "chutes/validator": server_args.validator,
-            "chutes/worker": "true",
-        }
-        if server_args.gpu_short_ref:
-            add_labels["gpu-short-ref"] = server_args.gpu_short_ref
-
         node, server = await track_server(
             server_args.validator,
             server_args.hourly_cost,
             node_object,
-            add_labels=add_labels,
+            add_labels={
+                "gpu-short-ref": server_args.gpu_short_ref,
+                "chutes/validator": server_args.validator,
+                "chutes/worker": "true",
+            },
             agent_api=server_args.agent_api,
             kubeconfig=kubeconfig,
         )

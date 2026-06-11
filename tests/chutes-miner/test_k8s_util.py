@@ -30,7 +30,6 @@ def _make_inputs(version: str, tee: bool = False):
         image="parachutes/test:latest",
         gpu_count=1,
         tee=tee,
-        compute_type="gpu",
     )
     server = SimpleNamespace(
         cpu_per_gpu=1,
