@@ -30,7 +30,7 @@ from chutes_miner.api.k8s.constants import (
     CHUTE_SVC_PREFIX,
 )
 from chutes_common.schemas.server import Server
-from chutes_miner.api.config import settings
+from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.util import semcomp
 
 
@@ -61,6 +61,11 @@ def build_chute_job(
 ) -> V1Job:
     cpu = str(server.cpu_per_gpu * chute.gpu_count)
     ram = str(server.memory_per_gpu * chute.gpu_count) + "Gi"
+    validator = validator_by_hotkey(server.validator)
+    if validator is None:
+        raise ValueError(
+            f"No configured validator API for hotkey {server.validator!r}."
+        )
     deployment_labels = {
         "chutes/deployment-id": deployment_id,
         "chutes/chute": "true",
@@ -77,7 +82,12 @@ def build_chute_job(
         deployment_labels["chutes/job"] = "true"
 
     # Command will vary depending on chutes version.
-    extra_env = []
+    # GPU workloads use their validator-signed launch JWT for narrowly scoped model discovery and
+    # one-use ensure authorization. They do not have a CPU-TD attestation cert/key, and a miner-set
+    # host-id environment variable would not be possession proof.
+    extra_env = [
+        V1EnvVar(name="CHUTES_API_URL", value=validator.api.rstrip("/")),
+    ]
     command = [
         "chutes",
         "run",
@@ -139,7 +149,9 @@ def build_chute_job(
     code_volumes = []
     code_volume_mounts = []
     if attach_code_volume:
-        code_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}"))
+        code_uuid = str(
+            uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}")
+        )
         code_volumes = [
             V1Volume(
                 name="code",
@@ -206,7 +218,9 @@ def build_chute_job(
                         ),
                         V1Volume(
                             name="shm",
-                            empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
+                            empty_dir=V1EmptyDirVolumeSource(
+                                medium="Memory", size_limit="16Gi"
+                            ),
                         ),
                     ],
                     init_containers=[
@@ -394,10 +408,21 @@ def build_chute_service(
                 "chutes/deployment-id": deployment_id,
             },
             ports=[
-                V1ServicePort(port=8000, target_port=8000, protocol="TCP", name="chute-8000"),
-                V1ServicePort(port=8001, target_port=8001, protocol="TCP", name="chute-8001"),
+                V1ServicePort(
+                    port=8000, target_port=8000, protocol="TCP", name="chute-8000"
+                ),
+                V1ServicePort(
+                    port=8001, target_port=8001, protocol="TCP", name="chute-8001"
+                ),
                 *(
-                    [V1ServicePort(port=8002, target_port=8002, protocol="TCP", name="chute-8002")]
+                    [
+                        V1ServicePort(
+                            port=8002,
+                            target_port=8002,
+                            protocol="TCP",
+                            name="chute-8002",
+                        )
+                    ]
                     if needs_attestation_port
                     else []
                 ),

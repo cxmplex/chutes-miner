@@ -13,8 +13,12 @@ def _make_service() -> V1Service:
             selector={"app": "chute"},
             external_traffic_policy="Local",
             ports=[
-                V1ServicePort(port=8000, target_port=8000, node_port=30080, protocol="TCP"),
-                V1ServicePort(port=8001, target_port=8001, node_port=30081, protocol="TCP"),
+                V1ServicePort(
+                    port=8000, target_port=8000, node_port=30080, protocol="TCP"
+                ),
+                V1ServicePort(
+                    port=8001, target_port=8001, node_port=30081, protocol="TCP"
+                ),
             ],
         )
     )
@@ -32,10 +36,11 @@ def _make_inputs(version: str, tee: bool = False):
         tee=tee,
     )
     server = SimpleNamespace(
+        server_id="server-uid-1",
         cpu_per_gpu=1,
         memory_per_gpu=2,
         seed=42,
-        validator="Validator",
+        validator="test_validator",
         name="node-1",
         ip_address="10.0.0.10",
     )
@@ -72,6 +77,7 @@ def test_build_chute_job_skips_code_volume_for_min_version():
     assert all(volume.name != "code" for volume in volumes)
     assert all(mount.name != "code" for mount in mounts)
 
+
 def test_build_chute_job_skips_code_volume_for_newer_version():
     job = _build_job("0.3.65")
     volumes = job.spec.template.spec.volumes
@@ -79,6 +85,7 @@ def test_build_chute_job_skips_code_volume_for_newer_version():
 
     assert all(volume.name != "code" for volume in volumes)
     assert all(mount.name != "code" for mount in mounts)
+
 
 @pytest.mark.parametrize("version", ["0.4.0.rc2", "0.4.0.rc16", "0.4.49.rc100"])
 def test_build_chute_job_skips_code_volume_for_newer_rc_version(version):
@@ -132,9 +139,15 @@ def _make_tee_service() -> V1Service:
             selector={"app": "chute"},
             external_traffic_policy="Local",
             ports=[
-                V1ServicePort(port=8000, target_port=8000, node_port=30080, protocol="TCP"),
-                V1ServicePort(port=8001, target_port=8001, node_port=30081, protocol="TCP"),
-                V1ServicePort(port=8002, target_port=8002, node_port=30082, protocol="TCP"),
+                V1ServicePort(
+                    port=8000, target_port=8000, node_port=30080, protocol="TCP"
+                ),
+                V1ServicePort(
+                    port=8001, target_port=8001, node_port=30081, protocol="TCP"
+                ),
+                V1ServicePort(
+                    port=8002, target_port=8002, node_port=30082, protocol="TCP"
+                ),
             ],
         )
     )
@@ -160,6 +173,27 @@ def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
     env = _container_env(job)
     assert env["NVIDIA_VISIBLE_DEVICES"] == "GPU-UUID-1"
     assert env["NCCL_P2P_DISABLE"] == "1"
+    assert "CHUTES_HOST_ID" not in env
+    assert env["CHUTES_API_URL"] == "http://test-api"
+    assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
     assert job.spec.template.spec.containers[0].security_context.capabilities == {
         "add": ["IPC_LOCK"]
     }
+
+
+def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim():
+    chute, server, service = _make_inputs("0.8.0", tee=False)
+    job = build_chute_job(
+        deployment_id="deploy-gpu",
+        chute=chute,
+        server=server,
+        service=service,
+        gpu_uuids=["GPU-UUID-1"],
+        probe_port=8000,
+        token="launch-token",
+    )
+
+    env = _container_env(job)
+    assert env["CHUTES_API_URL"] == "http://test-api"
+    assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
+    assert "CHUTES_HOST_ID" not in env
