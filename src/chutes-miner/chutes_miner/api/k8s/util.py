@@ -1,5 +1,7 @@
-from typing import Any, Optional
+import re
 import uuid
+from typing import Any, Optional
+
 from kubernetes.client import (
     V1Service,
     V1ObjectMeta,
@@ -34,6 +36,9 @@ from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.util import semcomp
 
 
+_VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
+
+
 def resolve_deployment_validator(chute: Chute, server: Server):
     """Return the configured validator only for an exact chute/server match."""
     chute_validator = chute.validator
@@ -64,6 +69,20 @@ def _needs_attestation_port(chute: Chute) -> bool:
     """True when chute is TEE-enabled and chutes runtime version >= 0.6.0."""
     version_str = chute.chutes_version or chute.version or "0.0.0"
     return bool(chute.tee and semcomp(version_str, "0.6.0") >= 0)
+
+
+def _tee_download_env(vm_version: Optional[str]) -> list[V1EnvVar]:
+    """Select only download controls supported by the measured guest generation."""
+    if not vm_version or _VERSION_PREFIX_RE.match(vm_version) is None:
+        # An unknown image may contain either pre-Xet or Hub 1.x dependencies. Their
+        # default downloader works in both cases, while forcing either transport does not.
+        return []
+    if semcomp(vm_version, "1.3.1") >= 0:
+        return [
+            V1EnvVar(name="HF_XET_FIXED_DOWNLOAD_CONCURRENCY", value="16"),
+            V1EnvVar(name="TOKIO_WORKER_THREADS", value="8"),
+        ]
+    return [V1EnvVar(name="HF_HUB_DISABLE_XET", value="1")]
 
 
 def build_chute_job(
@@ -151,33 +170,14 @@ def build_chute_job(
     ]
 
     if chute.tee:
-        if vm_version and semcomp(vm_version, "1.3.1") >= 0:
-            extra_env += [
-                V1EnvVar(
-                    name="HF_XET_FIXED_DOWNLOAD_CONCURRENCY",
-                    value="16",
-                ),
-                V1EnvVar(
-                    name="TOKIO_WORKER_THREADS",
-                    value="8",
-                ),
-            ]
-        else:
-            extra_env += [
-                V1EnvVar(
-                    name="HF_HUB_DISABLE_XET",
-                    value="1",
-                ),
-                V1EnvVar(
-                    name="HF_HUB_ENABLE_HF_TRANSFER",
-                    value="1",
-                ),
-            ]
+        extra_env += _tee_download_env(vm_version)
 
     code_volumes = []
     code_volume_mounts = []
     if attach_code_volume:
-        code_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}"))
+        code_uuid = str(
+            uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}")
+        )
         code_volumes = [
             V1Volume(
                 name="code",
@@ -215,6 +215,7 @@ def build_chute_job(
                 ),
                 spec=V1PodSpec(
                     restart_policy="Never",
+                    automount_service_account_token=False,
                     termination_grace_period_seconds=settings.chute_shutdown_time_seconds,
                     node_name=server.name,  ## Start here
                     runtime_class_name=settings.nvidia_runtime,
@@ -244,7 +245,9 @@ def build_chute_job(
                         ),
                         V1Volume(
                             name="shm",
-                            empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
+                            empty_dir=V1EmptyDirVolumeSource(
+                                medium="Memory", size_limit="16Gi"
+                            ),
                         ),
                     ],
                     init_containers=[
@@ -432,8 +435,12 @@ def build_chute_service(
                 "chutes/deployment-id": deployment_id,
             },
             ports=[
-                V1ServicePort(port=8000, target_port=8000, protocol="TCP", name="chute-8000"),
-                V1ServicePort(port=8001, target_port=8001, protocol="TCP", name="chute-8001"),
+                V1ServicePort(
+                    port=8000, target_port=8000, protocol="TCP", name="chute-8000"
+                ),
+                V1ServicePort(
+                    port=8001, target_port=8001, protocol="TCP", name="chute-8001"
+                ),
                 *(
                     [
                         V1ServicePort(
