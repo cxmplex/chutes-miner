@@ -6,6 +6,7 @@ import uuid
 import pytest
 
 from chutes_common.schemas.gpu import GPU
+from chutes_common.schemas.chute import Chute
 from chutes_miner.api.config import settings
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
@@ -54,6 +55,23 @@ def _server(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _remote_chute_payload(**overrides):
+    values = {
+        "chute_id": "chute-1",
+        "name": "test chute",
+        "image": "owner/image:latest",
+        "ref_str": "chute:chute",
+        "version": "1.0.0",
+        "supported_gpus": ["h100"],
+        "node_selector": {"gpu_count": 1},
+        "chutes_version": "0.8.0",
+        "preemptible": True,
+        "tee": False,
+    }
+    values.update(overrides)
+    return values
 
 
 class _ScalarResult:
@@ -107,6 +125,70 @@ def test_parse_server_versions_uses_actual_miner_servers_schema():
             ]
         }
     ) == {"old": "1.3.0", "new": "1.8.0", "unknown": None}
+
+
+def test_local_chute_schema_and_remote_parser_exclude_source():
+    assert "code" not in Chute.__table__.columns
+    assert "filename" not in Chute.__table__.columns
+    values = Gepetto._remote_chute_values(
+        _remote_chute_payload(),
+        VALIDATOR,
+        expected_chute_id="chute-1",
+        expected_version="1.0.0",
+    )
+    assert "code" not in values
+    assert "legacy placeholder" not in repr(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("code", "print('legacy placeholder')"),
+        ("filename", "chute.py"),
+    ],
+)
+def test_remote_chute_parser_rejects_obsolete_source_fields(field, value):
+    payload = _remote_chute_payload(**{field: value})
+    with pytest.raises(ValueError, match="obsolete source fields are forbidden"):
+        Gepetto._remote_chute_values(
+            payload,
+            VALIDATOR,
+            expected_chute_id="chute-1",
+            expected_version="1.0.0",
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_launch_token_rejects_unsupported_runtime_before_request(
+    mock_aiohttp_response,
+):
+    gepetto = _gepetto()
+    with pytest.raises(DeploymentFailure, match="Unsupported chutes runtime version"):
+        await gepetto.get_launch_token(_chute(chutes_version="0.3.60"))
+    mock_aiohttp_response.json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_response):
+    gepetto = _gepetto()
+    mock_aiohttp_response.status = 200
+    mock_aiohttp_response.json.return_value = {
+        "token": "launch-token",
+        "config_id": "config-1",
+    }
+
+    assert await gepetto.get_launch_token(_chute()) == {
+        "token": "launch-token",
+        "config_id": "config-1",
+    }
+
+    mock_aiohttp_response.json.return_value = {
+        "token": "launch-token",
+        "config_id": "config-1",
+        "code": "print('legacy placeholder')",
+    }
+    with pytest.raises(DeploymentFailure, match="expected exactly token and config_id"):
+        await gepetto.get_launch_token(_chute())
 
 
 @pytest.mark.parametrize(
@@ -186,7 +268,12 @@ async def test_direct_deployment_rejects_validator_mismatch_before_allocation(
     mock_db_session.execute = AsyncMock(return_value=result)
 
     with pytest.raises(DeploymentFailure, match="does not match"):
-        await K8sOperator().deploy_chute(sample_chute, sample_server)
+        await K8sOperator().deploy_chute(
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
+        )
 
     mock_db_session.add.assert_not_called()
     mock_db_session.flush.assert_not_awaited()
@@ -205,7 +292,12 @@ async def test_direct_deployment_rejects_unknown_validator_before_allocation(
     mock_db_session.execute = AsyncMock(return_value=result)
 
     with pytest.raises(DeploymentFailure, match="No configured validator API"):
-        await K8sOperator().deploy_chute(sample_chute, sample_server)
+        await K8sOperator().deploy_chute(
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
+        )
 
     mock_db_session.add.assert_not_called()
     mock_db_session.flush.assert_not_awaited()

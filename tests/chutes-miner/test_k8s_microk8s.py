@@ -38,10 +38,9 @@ def mock_k8s_operator_single_cluster():
     K8sOperator.__new__ = original_new
     K8sOperator._instance = None
 
+
 @pytest.fixture(autouse=True)
-def multicluster_setup(
-    mock_k8s_batch_client, mock_k8s_app_client, mock_k8s_core_client
-):    
+def multicluster_setup(mock_k8s_batch_client, mock_k8s_app_client, mock_k8s_core_client):
     pass
 
 
@@ -217,9 +216,7 @@ async def test_get_deployment(mock_k8s_batch_client):
     mock_k8s_batch_client.read_namespaced_job.return_value = deployment
 
     # Setup extract_deployment_info mock
-    with patch(
-        "chutes_miner.api.k8s.operator.K8sOperator._extract_job_info"
-    ) as mock_extract:
+    with patch("chutes_miner.api.k8s.operator.K8sOperator._extract_job_info") as mock_extract:
         mock_extract.return_value = {"name": "test-deployment"}
 
         # Call the function
@@ -248,9 +245,7 @@ async def test_get_deployed_chutes(mock_k8s_batch_client):
     mock_k8s_batch_client.list_namespaced_job.return_value = job_list
 
     # Setup extract_deployment_info mock
-    with patch(
-        "chutes_miner.api.k8s.operator.K8sOperator._extract_job_info"
-    ) as mock_extract:
+    with patch("chutes_miner.api.k8s.operator.K8sOperator._extract_job_info") as mock_extract:
         mock_extract.side_effect = [
             {"name": "chute-1", "chute_id": "id1"},
             {"name": "chute-2", "chute_id": "id2"},
@@ -267,43 +262,21 @@ async def test_get_deployed_chutes(mock_k8s_batch_client):
         assert result[1]["name"] == "chute-2"
 
 
-# Tests for delete_code
+# Tests for retired source ConfigMap cleanup
 @pytest.mark.asyncio
-async def test_delete_code_success(mock_k8s_core_client):
-    """Test successful deletion of code configmap."""
-    # Call the function
-    await k8s.delete_code("test-chute-id", "1.0.0")
+async def test_purge_legacy_source_configmaps(mock_k8s_core_client):
+    config_map = MagicMock()
+    config_map.metadata.name = "chute-code-obsolete"
+    mock_k8s_core_client.list_namespaced_config_map.return_value.items = [config_map]
 
-    # Assertions
+    await k8s.purge_legacy_source_config_maps()
+
+    mock_k8s_core_client.list_namespaced_config_map.assert_called_once_with(
+        namespace="chutes",
+        label_selector="chutes/code=true",
+    )
     mock_k8s_core_client.delete_namespaced_config_map.assert_called_once()
-    # Verify the name is based on the UUID generated from chute_id and version
-    assert "chute-code-" in mock_k8s_core_client.delete_namespaced_config_map.call_args[1]["name"]
-
-
-@pytest.mark.asyncio
-async def test_delete_code_not_found(mock_k8s_core_client):
-    """Test handling of 404 error when deleting configmap."""
-    # Setup mock to raise ApiException with 404
-    error = ApiException(status=404)
-    mock_k8s_core_client.delete_namespaced_config_map.side_effect = error
-
-    # Call the function - should not raise exception
-    await k8s.delete_code("test-chute-id", "1.0.0")
-
-    # Assertions
-    mock_k8s_core_client.delete_namespaced_config_map.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_delete_code_other_error(mock_k8s_core_client):
-    """Test handling of non-404 error when deleting configmap."""
-    # Setup mock to raise ApiException with 500
-    error = ApiException(status=500)
-    mock_k8s_core_client.delete_namespaced_config_map.side_effect = error
-
-    # Call the function and expect exception
-    with pytest.raises(ApiException):
-        await k8s.delete_code("test-chute-id", "1.0.0")
+    mock_k8s_core_client.create_namespaced_config_map.assert_not_called()
 
 
 # Tests for wait_for_deletion
@@ -355,7 +328,9 @@ async def test_wait_for_deletion_with_pods(mock_k8s_core_client, mock_k8s_api_cl
 
 
 @pytest.mark.asyncio
-async def test_wait_for_deletion_with_timeout(mock_k8s_core_client, mock_k8s_api_client, mock_watch):
+async def test_wait_for_deletion_with_timeout(
+    mock_k8s_core_client, mock_k8s_api_client, mock_watch
+):
     """Test wait_for_deletion when pods exist and then get deleted."""
     # Setup mock to return pods initially, then empty
     pod_list_with_pods = MagicMock()
@@ -420,81 +395,26 @@ async def test_undeploy_with_service_error(mock_k8s_core_client, mock_k8s_batch_
         mock_wait.assert_called_once()
 
 
-# Tests for create_code_config_map
-@pytest.mark.asyncio
-async def test_create_code_config_map_success(mock_k8s_core_client):
-    """Test successful creation of code configmap."""
-    # Setup mock chute
-    chute = MagicMock()
-    chute.chute_id = "test-chute-id"
-    chute.version = "1.0.0"
-    chute.filename = "app.py"
-    chute.code = "print('Hello World')"
-    chute.tee = False
-
-    # Call the function
-    await k8s.create_code_config_map(chute)
-
-    # Assertions
-    mock_k8s_core_client.create_namespaced_config_map.assert_called_once()
-    # Check configmap data
-    called_config_map = mock_k8s_core_client.create_namespaced_config_map.call_args[1]["body"]
-    assert called_config_map.data["app.py"] == "print('Hello World')"
-
-
-@pytest.mark.asyncio
-async def test_create_code_config_map_conflict(mock_k8s_core_client):
-    """Test handling of 409 conflict when creating configmap."""
-    # Setup mock to raise ApiException with 409
-    error = ApiException(status=409)
-    mock_k8s_core_client.create_namespaced_config_map.side_effect = error
-
-    # Setup mock chute
-    chute = MagicMock()
-    chute.chute_id = "test-chute-id"
-    chute.version = "1.0.0"
-    chute.filename = "app.py"
-    chute.code = "print('Hello World')"
-    chute.tee = False
-
-    # Call the function - should not raise exception
-    await k8s.create_code_config_map(chute)
-
-    # Assertions
-    mock_k8s_core_client.create_namespaced_config_map.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_create_code_config_map_other_error(mock_k8s_core_client):
-    """Test handling of non-409 error when creating configmap."""
-    # Setup mock to raise ApiException with 500
-    error = ApiException(status=500)
-    mock_k8s_core_client.create_namespaced_config_map.side_effect = error
-
-    # Setup mock chute
-    chute = MagicMock()
-    chute.chute_id = "test-chute-id"
-    chute.version = "1.0.0"
-    chute.filename = "app.py"
-    chute.code = "print('Hello World')"
-    chute.tee = False
-
-    # Call the function and expect exception
-    with pytest.raises(ApiException):
-        await k8s.create_code_config_map(chute)
-
-
 # Tests for deploy_chute
 @pytest.mark.asyncio
 async def test_deploy_chute_success(
-    mock_k8s_core_client, mock_k8s_batch_client, mock_db_session, sample_server, sample_chute,
-    create_api_test_nodes, create_api_test_pods
+    mock_k8s_core_client,
+    mock_k8s_batch_client,
+    mock_db_session,
+    sample_server,
+    sample_chute,
+    create_api_test_nodes,
+    create_api_test_pods,
 ):
     """Test successful deployment of a chute."""
     # Setup mocks for kubernetes deployment and service creation
     mock_deployment = MagicMock()
     mock_service = MagicMock()
-    mock_service.spec.ports = [MagicMock(node_port=30000), MagicMock(node_port=8000), MagicMock(node_port=8001)]
+    mock_service.spec.ports = [
+        MagicMock(node_port=30000),
+        MagicMock(node_port=8000),
+        MagicMock(node_port=8001),
+    ]
 
     mock_k8s_batch_client.create_namespaced_job.return_value = mock_deployment
     mock_k8s_core_client.create_namespaced_service.return_value = mock_service
@@ -513,14 +433,19 @@ async def test_deploy_chute_success(
     mock_k8s_core_client.read_node.return_value = serializer.deserialize(nodes[0], "V1Node")
 
     pods = create_api_test_pods(1)
-    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(items=serializer.deserialize(pods, "list[V1Pod]"))
+    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(
+        items=serializer.deserialize(pods, "list[V1Pod]")
+    )
 
     # Call the function
     with patch(
         "chutes_miner.api.k8s.operator.uuid.uuid4", return_value=mock_deployment_db.deployment_id
     ):
         result, created_deployment = await k8s.deploy_chute(
-            sample_chute, sample_server
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
         )
 
     # Assertions
@@ -552,19 +477,33 @@ async def test_deploy_chute_no_gpu_capacity(sample_server, sample_chute, mock_db
 
     # Call the function and expect exception
     with pytest.raises(DeploymentFailure, match="cannot allocate"):
-        await k8s.deploy_chute(sample_chute, sample_server)
+        await k8s.deploy_chute(
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
+        )
 
 
 @pytest.mark.asyncio
 async def test_deploy_chute_deployment_disappeared(
-    mock_k8s_core_client, mock_k8s_batch_client, mock_db_session, sample_server, sample_chute,
-    create_api_test_nodes, create_api_test_pods
+    mock_k8s_core_client,
+    mock_k8s_batch_client,
+    mock_db_session,
+    sample_server,
+    sample_chute,
+    create_api_test_nodes,
+    create_api_test_pods,
 ):
     """Test handling when deployment disappears mid-flight."""
     # Setup mocks for kubernetes deployment and service creation
     mock_deployment = MagicMock()
     mock_service = MagicMock()
-    mock_service.spec.ports = [MagicMock(node_port=30000), MagicMock(node_port=8000), MagicMock(node_port=8001)]
+    mock_service.spec.ports = [
+        MagicMock(node_port=30000),
+        MagicMock(node_port=8000),
+        MagicMock(node_port=8001),
+    ]
 
     mock_k8s_batch_client.create_namespaced_job.return_value = mock_deployment
     mock_k8s_core_client.create_namespaced_service.return_value = mock_service
@@ -581,17 +520,29 @@ async def test_deploy_chute_deployment_disappeared(
     mock_k8s_core_client.read_node.return_value = serializer.deserialize(nodes[0], "V1Node")
 
     pods = create_api_test_pods(1)
-    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(items=serializer.deserialize(pods, "list[V1Pod]"))
+    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(
+        items=serializer.deserialize(pods, "list[V1Pod]")
+    )
 
     # Call the function and expect exception
     with pytest.raises(DeploymentFailure, match="Deployment disappeared mid-flight"):
-        await k8s.deploy_chute(sample_chute, sample_server)
+        await k8s.deploy_chute(
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
+        )
 
 
 @pytest.mark.asyncio
 async def test_deploy_chute_api_exception(
-    mock_k8s_core_client, mock_k8s_batch_client, mock_db_session, sample_server, sample_chute,
-    create_api_test_nodes, create_api_test_pods
+    mock_k8s_core_client,
+    mock_k8s_batch_client,
+    mock_db_session,
+    sample_server,
+    sample_chute,
+    create_api_test_nodes,
+    create_api_test_pods,
 ):
     """Test handling of API exception during deployment."""
     # Setup mock to raise ApiException
@@ -609,18 +560,29 @@ async def test_deploy_chute_api_exception(
 
     # Setup service creation to succeed
     mock_service = MagicMock()
-    mock_service.spec.ports = [MagicMock(node_port=30000), MagicMock(node_port=8000), MagicMock(node_port=8001)]
+    mock_service.spec.ports = [
+        MagicMock(node_port=30000),
+        MagicMock(node_port=8000),
+        MagicMock(node_port=8001),
+    ]
     mock_k8s_core_client.create_namespaced_service.return_value = mock_service
 
     nodes = create_api_test_nodes(1)
     mock_k8s_core_client.read_node.return_value = serializer.deserialize(nodes[0], "V1Node")
 
     pods = create_api_test_pods(1)
-    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(items=serializer.deserialize(pods, "list[V1Pod]"))
+    mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(
+        items=serializer.deserialize(pods, "list[V1Pod]")
+    )
 
     # Call the function and expect exception
     with pytest.raises(DeploymentFailure, match="Failed to deploy chute"):
-        await k8s.deploy_chute(sample_chute, sample_server)
+        await k8s.deploy_chute(
+            sample_chute,
+            sample_server,
+            token="launch-token",
+            config_id="config-1",
+        )
 
     # Verify cleanup was attempted
     mock_k8s_core_client.delete_namespaced_service.assert_called_once()

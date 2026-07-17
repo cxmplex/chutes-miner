@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from kubernetes.client import ApiClient, V1Service, V1ServicePort, V1ServiceSpec
 
+from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.util import build_chute_job
 
 
@@ -18,12 +19,8 @@ def _make_service() -> V1Service:
             selector={"app": "chute"},
             external_traffic_policy="Local",
             ports=[
-                V1ServicePort(
-                    port=8000, target_port=8000, node_port=30080, protocol="TCP"
-                ),
-                V1ServicePort(
-                    port=8001, target_port=8001, node_port=30081, protocol="TCP"
-                ),
+                V1ServicePort(port=8000, target_port=8000, node_port=30080, protocol="TCP"),
+                V1ServicePort(port=8001, target_port=8001, node_port=30081, protocol="TCP"),
             ],
         )
     )
@@ -35,7 +32,6 @@ def _make_inputs(version: str, tee: bool = False):
         version=version,
         chutes_version=version,
         ref_str="gh://chutes/test",
-        filename="main.py",
         image="parachutes/test:latest",
         gpu_count=1,
         tee=tee,
@@ -63,25 +59,39 @@ def _build_job(version: str):
         service=service,
         gpu_uuids=["UUID-1"],
         probe_port=8000,
+        token="launch-token",
+        config_id="config-1",
     )
 
 
-def test_build_chute_job_attaches_code_volume_for_legacy_version():
-    job = _build_job("0.3.59")
-    volumes = job.spec.template.spec.volumes
-    mounts = job.spec.template.spec.containers[0].volume_mounts
+@pytest.mark.parametrize("version", [None, "", "garbage", "0.3.60", "0.3.60.rc1"])
+def test_build_chute_job_rejects_legacy_source_delivery_versions(version):
+    chute, server, service = _make_inputs(version)
+    with pytest.raises(DeploymentFailure, match="Unsupported chutes runtime version"):
+        build_chute_job(
+            deployment_id="deploy-1",
+            chute=chute,
+            server=server,
+            service=service,
+            gpu_uuids=["UUID-1"],
+            probe_port=8000,
+            token="launch-token",
+            config_id="config-1",
+        )
 
-    assert any(volume.name == "code" for volume in volumes)
-    assert any(mount.name == "code" for mount in mounts)
 
-
-def test_build_chute_job_skips_code_volume_for_min_version():
-    job = _build_job("0.3.61")
+@pytest.mark.parametrize("version", ["0.3.61", "0.3.61.rc1", "0.3.62"])
+def test_build_chute_job_supported_boundary_has_no_source_volume(version):
+    job = _build_job(version)
     volumes = job.spec.template.spec.volumes
     mounts = job.spec.template.spec.containers[0].volume_mounts
 
     assert all(volume.name != "code" for volume in volumes)
     assert all(mount.name != "code" for mount in mounts)
+    serialized = ApiClient().sanitize_for_serialization(job)
+    assert "legacy placeholder" not in json.dumps(serialized)
+    assert "configMap" not in json.dumps(serialized)
+    assert "--graval-seed" not in job.spec.template.spec.containers[0].command
 
 
 def test_build_chute_job_skips_code_volume_for_newer_version():
@@ -104,14 +114,16 @@ def test_build_chute_job_skips_code_volume_for_newer_rc_version(version):
 
 
 def test_build_chute_job_skips_code_volume_for_tee_chute():
-    chute, server, service = _make_inputs("0.3.0", tee=True)
+    chute, server, _ = _make_inputs("0.6.0", tee=True)
     job = build_chute_job(
         deployment_id="deploy-1",
         chute=chute,
         server=server,
-        service=service,
+        service=_make_tee_service(),
         gpu_uuids=["UUID-1"],
         probe_port=8000,
+        token="launch-token",
+        config_id="config-1",
     )
     volumes = job.spec.template.spec.volumes
     mounts = job.spec.template.spec.containers[0].volume_mounts
@@ -120,21 +132,21 @@ def test_build_chute_job_skips_code_volume_for_tee_chute():
     assert all(mount.name != "code" for mount in mounts)
 
 
-def test_build_chute_job_attaches_code_volume_for_legacy_non_tee():
-    chute, server, service = _make_inputs("0.3.0", tee=False)
-    job = build_chute_job(
-        deployment_id="deploy-1",
-        chute=chute,
-        server=server,
-        service=service,
-        gpu_uuids=["UUID-1"],
-        probe_port=8000,
-    )
-    volumes = job.spec.template.spec.volumes
-    mounts = job.spec.template.spec.containers[0].volume_mounts
-
-    assert any(volume.name == "code" for volume in volumes)
-    assert any(mount.name == "code" for mount in mounts)
+def test_build_chute_job_rejects_legacy_tee_without_source_fallback():
+    chute, server, service = _make_inputs("0.3.60", tee=True)
+    with pytest.raises(
+        DeploymentFailure, match="Legacy source ConfigMap delivery has been removed"
+    ):
+        build_chute_job(
+            deployment_id="deploy-1",
+            chute=chute,
+            server=server,
+            service=service,
+            gpu_uuids=["UUID-1"],
+            probe_port=8000,
+            token="launch-token",
+            config_id="config-1",
+        )
 
 
 def _make_tee_service(include_extra_port: bool = False) -> V1Service:
@@ -145,9 +157,7 @@ def _make_tee_service(include_extra_port: bool = False) -> V1Service:
         V1ServicePort(port=8002, target_port=8002, node_port=30082, protocol="TCP"),
     ]
     if include_extra_port:
-        ports.append(
-            V1ServicePort(port=9000, target_port=9000, node_port=30900, protocol="TCP")
-        )
+        ports.append(V1ServicePort(port=9000, target_port=9000, node_port=30900, protocol="TCP"))
     return V1Service(
         spec=V1ServiceSpec(
             type="NodePort",
@@ -173,6 +183,7 @@ def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
         gpu_uuids=["GPU-UUID-1"],
         probe_port=8000,
         token="launch-token",
+        config_id="config-1",
     )
     assert job.spec.template.spec.runtime_class_name == "nvidia"
     env = _container_env(job)
@@ -198,6 +209,7 @@ def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim()
         gpu_uuids=["GPU-UUID-1"],
         probe_port=8000,
         token="launch-token",
+        config_id="config-1",
     )
 
     env = _container_env(job)
@@ -217,9 +229,7 @@ def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim()
         ("unknown", "default"),
     ],
 )
-def test_build_tee_job_combines_vm_environment_with_launch_context(
-    vm_version, download_mode
-):
+def test_build_tee_job_combines_vm_environment_with_launch_context(vm_version, download_mode):
     chute, server, _ = _make_inputs("0.8.0", tee=True)
     job = build_chute_job(
         deployment_id="deploy-gpu",
@@ -229,6 +239,7 @@ def test_build_tee_job_combines_vm_environment_with_launch_context(
         gpu_uuids=["GPU-UUID-1"],
         probe_port=8000,
         token="launch-token",
+        config_id="config-1",
         vm_version=vm_version,
     )
 
@@ -281,6 +292,7 @@ def test_generated_tee_job_is_admitted_by_measured_guest_policy(vm_version):
         gpu_uuids=["GPU-UUID-1"],
         probe_port=8000,
         token="launch-token",
+        config_id="config-1",
         vm_version=vm_version,
     )
     env = _container_env(job)
@@ -292,10 +304,7 @@ def test_generated_tee_job_is_admitted_by_measured_guest_policy(vm_version):
 
     image = job.spec.template.spec.containers[0].image
     validator_registry = image.split("/", 1)[0]
-    policy_query = (
-        "data.kubernetes.admission.deny "
-        f"with data.config.validator_registry as {json.dumps(validator_registry)}"
-    )
+    policy_query = f"data.kubernetes.admission.deny with data.config.validator_registry as {json.dumps(validator_registry)}"
 
     admission_input = {
         "request": {
@@ -335,23 +344,23 @@ def test_generated_tee_job_is_admitted_by_measured_guest_policy(vm_version):
     assert denials == []
 
 
-def test_build_job_without_launch_token_keeps_api_context_only():
+@pytest.mark.parametrize(
+    ("token", "config_id"),
+    [(None, None), ("launch-token", None), (None, "config-1")],
+)
+def test_build_job_rejects_missing_launch_context(token, config_id):
     chute, server, service = _make_inputs("0.8.0")
-    job = build_chute_job(
-        deployment_id="deploy-gpu",
-        chute=chute,
-        server=server,
-        service=service,
-        gpu_uuids=["GPU-UUID-1"],
-        probe_port=8000,
-    )
-
-    env = _container_env(job)
-    assert env["CHUTES_API_URL"] == "http://test-api"
-    assert "CHUTES_LAUNCH_JWT" not in env
-    assert "CHUTES_EXTERNAL_HOST" not in env
-    assert "CHUTES_HOST_ID" not in env
-    assert "--graval-seed" in job.spec.template.spec.containers[0].command
+    with pytest.raises(DeploymentFailure, match="Missing required launch config"):
+        build_chute_job(
+            deployment_id="deploy-gpu",
+            chute=chute,
+            server=server,
+            service=service,
+            gpu_uuids=["GPU-UUID-1"],
+            probe_port=8000,
+            token=token,
+            config_id=config_id,
+        )
 
 
 def test_build_job_rejects_validator_mismatch():
@@ -367,6 +376,7 @@ def test_build_job_rejects_validator_mismatch():
             gpu_uuids=["GPU-UUID-1"],
             probe_port=8000,
             token="launch-token",
+            config_id="config-1",
         )
 
 
@@ -383,4 +393,5 @@ def test_build_job_rejects_unknown_validator():
             gpu_uuids=["GPU-UUID-1"],
             probe_port=8000,
             token="launch-token",
+            config_id="config-1",
         )

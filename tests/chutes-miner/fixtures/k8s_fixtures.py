@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 from dateutil.tz import tzutc
 
+
 @pytest.fixture(autouse=True)
 def mock_is_tee_cluster():
     with patch("chutes_miner.api.k8s.operator._is_tee_cluster", return_value=False):
@@ -78,6 +79,7 @@ def mock_k8s_app_client():
     for patcher in patches:
         patcher.stop()
 
+
 @pytest.fixture()
 def mock_k8s_batch_client():
     import_paths = ["chutes_miner.api.k8s.operator.k8s_batch_client"]
@@ -105,6 +107,7 @@ def mock_k8s_batch_client():
     for patcher in patches:
         patcher.stop()
 
+
 @pytest.fixture()
 def mock_k8s_api_client():
     import_paths = ["chutes_miner.api.k8s.operator.k8s_api_client"]
@@ -121,6 +124,7 @@ def mock_k8s_api_client():
 
     for patcher in patches:
         patcher.stop()
+
 
 # @pytest.fixture(autouse=True)
 # def mock_k8s_api_client():
@@ -145,9 +149,14 @@ def mock_k8s_api_client():
 #     for patcher in patches:
 #         patcher.stop()
 
+
 @pytest.fixture
-def mock_k8s_client_manager(mock_k8s_api_client, mock_k8s_core_client, mock_k8s_app_client, mock_k8s_batch_client):
-    with patch("chutes_miner.api.k8s.operator.KubernetesMultiClusterClientManager") as mock_manager_class:
+def mock_k8s_client_manager(
+    mock_k8s_api_client, mock_k8s_core_client, mock_k8s_app_client, mock_k8s_batch_client
+):
+    with patch(
+        "chutes_miner.api.k8s.operator.KubernetesMultiClusterClientManager"
+    ) as mock_manager_class:
         mock_manager = MagicMock()
         mock_manager.get_api_client.return_value = mock_k8s_api_client
         mock_manager.get_app_client.return_value = mock_k8s_app_client
@@ -169,10 +178,10 @@ def sample_server():
         seed=12345,
         deployments=[],
         gpus=[
-            GPU(gpu_id=f"{uuid.uuid4()}", server_id="test-server-id", verified=True) for i in range(4)
-        ]
+            GPU(gpu_id=f"{uuid.uuid4()}", server_id="test-server-id", verified=True)
+            for i in range(4)
+        ],
     )
-
 
     return server
 
@@ -183,11 +192,10 @@ def sample_chute():
         chute_id="test-chute-id",
         validator="test_validator",
         version="1.0.0",
-        filename="app.py",
-        code="print('Hello World')",
         image="test/image:latest",
         gpu_count=2,
         ref_str="test-ref-str",
+        chutes_version="0.8.0",
     )
 
 
@@ -483,32 +491,35 @@ def mock_pod():
 
     return pod
 
+
 @pytest.fixture
 def create_api_test_nodes():
-
     def _create_nodes(num_nodes):
         nodes = []
 
         for i in range(num_nodes):
-            nodes.append({
-                "metadata": {
-                    "name": "node1",
-                    "labels": {
-                        "chutes/validator": "TEST123",
-                        "chutes/external-ip": "192.168.1.100",
-                        "nvidia.com/gpu.memory": "16384",
+            nodes.append(
+                {
+                    "metadata": {
+                        "name": "node1",
+                        "labels": {
+                            "chutes/validator": "TEST123",
+                            "chutes/external-ip": "192.168.1.100",
+                            "nvidia.com/gpu.memory": "16384",
+                        },
+                        "uid": "node1-uid",
                     },
-                    "uid": "node1-uid",
-                },
-                "status": {
-                    "phase": "Ready",
-                    "capacity": {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "2"},
-                },
-            })
+                    "status": {
+                        "phase": "Ready",
+                        "capacity": {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "2"},
+                    },
+                }
+            )
 
         return nodes
-    
+
     return _create_nodes
+
 
 @pytest.fixture
 def create_api_test_pods():
@@ -534,7 +545,9 @@ def create_api_test_pods():
             pod_name = f"{base_name}-{i}"
             pod_uid = str(uuid.uuid4())
             rs_uid = str(uuid.uuid4())
-            deployment_uuid = job["metadata"]["labels"]["chutes/deployment-id"] if job else f"{uuid.uuid4()}"
+            deployment_uuid = (
+                job["metadata"]["labels"]["chutes/deployment-id"] if job else f"{uuid.uuid4()}"
+            )
             container_id = f"containerd://{uuid.uuid4().hex}"
 
             # Format current time in ISO format for JSON compatibility
@@ -556,9 +569,9 @@ def create_api_test_pods():
                     "generateName": f"{base_name}-",
                     "generation": None,
                     "labels": {
-                        "app": base_name, 
+                        "app": base_name,
                         "pod-template-hash": "5bf549858c",
-                        "chutes/deployment-id": f"{deployment_uuid}"
+                        "chutes/deployment-id": f"{deployment_uuid}",
                     },
                     "name": pod_name,
                     "namespace": namespace,
@@ -840,6 +853,7 @@ def create_api_test_deployments():
 
     return _generate_deployments
 
+
 @pytest.fixture
 def create_api_test_jobs():
     """
@@ -876,7 +890,7 @@ def create_api_test_jobs():
                         "chutes/chute-id": f"chute-{uuid.uuid4()}",
                         "chutes/version": "1",
                         "chutes/chute": "true",
-                        "chutes/deployment-id": f"deployment-{uuid.uuid4()}"
+                        "chutes/deployment-id": f"deployment-{uuid.uuid4()}",
                     },
                 },
                 "spec": {
@@ -885,9 +899,7 @@ def create_api_test_jobs():
                     "completions": 1,
                     "parallelism": 1,
                     "template": {
-                        "metadata": {
-                            "labels": {"app": app_name}
-                        },
+                        "metadata": {"labels": {"app": app_name}},
                         "spec": {
                             "nodeName": "test-node",
                             "containers": [
@@ -935,7 +947,9 @@ def create_api_test_jobs():
                         {
                             "lastProbeTime": current_timestamp,
                             "lastTransitionTime": current_timestamp,
-                            "message": "Job completed successfully" if i % 3 == 1 else "Job is running",
+                            "message": "Job completed successfully"
+                            if i % 3 == 1
+                            else "Job is running",
                             "reason": "Complete" if i % 3 == 1 else "Running",
                             "status": "True" if i % 3 == 1 else "False",
                             "type": "Complete",

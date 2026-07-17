@@ -1,0 +1,7 @@
+-- migrate:up
+ALTER TABLE chutes DROP COLUMN IF EXISTS code;
+ALTER TABLE chutes DROP COLUMN IF EXISTS filename;
+
+-- migrate:down
+ALTER TABLE chutes ADD COLUMN IF NOT EXISTS code TEXT;
+ALTER TABLE chutes ADD COLUMN IF NOT EXISTS filename TEXT;

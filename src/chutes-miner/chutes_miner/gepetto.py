@@ -2,22 +2,23 @@
 Gepetto - coordinate all the things.
 """
 
-import re
 import random
 import aiohttp
 import asyncio
 import hashlib
 from chutes_miner.api.k8s.operator import K8sOperator
-from chutes_miner.api.k8s.util import resolve_deployment_validator
+from chutes_miner.api.k8s.util import (
+    require_supported_chutes_version,
+    resolve_deployment_validator,
+)
 from chutes_miner.api.server.util import clear_server_cache, stop_server_monitoring
 import orjson as json
 import traceback
-import semver
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from loguru import logger
 from typing import Dict, Any, Optional
-from sqlalchemy import select, func, case, text, or_, update
+from sqlalchemy import select, func, case, text, update
 from sqlalchemy.orm import selectinload
 from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.redis_pubsub import RedisListener
@@ -95,8 +96,8 @@ class Gepetto:
             await conn.run_sync(Base.metadata.create_all)
         if settings.validator_migrations_enabled:
             await run_validator_migrations()
+        await k8s.purge_legacy_source_config_maps()
         await self.reconcile()
-        asyncio.create_task(self.activator())
         asyncio.create_task(self.autoscaler())
         asyncio.create_task(self.reconciler())
         await self.pubsub.start()
@@ -107,6 +108,7 @@ class Gepetto:
         hotkey: str,
         url: str,
         id_key: str,
+        forbidden_keys: frozenset[str] | None = None,
     ):
         """
         Refresh images/chutes from validator(s).
@@ -125,6 +127,10 @@ class Gepetto:
                     content = content_enc.decode()
                     if content.startswith("data: {"):
                         data = json.loads(content[6:])
+                        if forbidden := (forbidden_keys or frozenset()).intersection(data):
+                            raise ValueError(
+                                f"Invalid response from {url}: forbidden fields {', '.join(sorted(forbidden))}"
+                            )
                         updated_items[data[id_key]] = data
                     elif content.startswith("data: NO_ITEMS"):
                         explicit_null = True
@@ -203,6 +209,69 @@ class Gepetto:
         except ValueError as exc:
             raise DeploymentFailure(str(exc)) from exc
 
+    @staticmethod
+    def _remote_chute_values(
+        chute_data: dict,
+        validator_hotkey: str,
+        *,
+        expected_chute_id: str,
+        expected_version: str,
+    ) -> dict:
+        if not isinstance(chute_data, dict):
+            raise ValueError("Invalid miner chute response: expected an object.")
+        if forbidden := {"code", "filename"}.intersection(chute_data):
+            raise ValueError(
+                f"Invalid miner chute response: obsolete source fields are forbidden "
+                f"({', '.join(sorted(forbidden))})."
+            )
+
+        required = {
+            "chute_id",
+            "name",
+            "image",
+            "ref_str",
+            "version",
+            "supported_gpus",
+            "node_selector",
+            "chutes_version",
+            "preemptible",
+            "tee",
+        }
+        if missing := required.difference(chute_data):
+            raise ValueError(f"Invalid miner chute response: missing {', '.join(sorted(missing))}.")
+        if chute_data["chute_id"] != expected_chute_id:
+            raise ValueError(
+                f"Invalid miner chute response: expected chute_id {expected_chute_id!r}, "
+                f"received {chute_data['chute_id']!r}."
+            )
+        if chute_data["version"] != expected_version:
+            raise ValueError(
+                f"Invalid miner chute response: expected version {expected_version!r}, "
+                f"received {chute_data['version']!r}."
+            )
+
+        require_supported_chutes_version(
+            chute_data["chutes_version"],
+            expected_chute_id,
+        )
+        node_selector = chute_data["node_selector"]
+        if not isinstance(node_selector, dict) or "gpu_count" not in node_selector:
+            raise ValueError("Invalid miner chute response: node_selector.gpu_count is required.")
+
+        return {
+            "validator": validator_hotkey,
+            "name": chute_data["name"],
+            "image": chute_data["image"],
+            "ref_str": chute_data["ref_str"],
+            "version": chute_data["version"],
+            "supported_gpus": chute_data["supported_gpus"],
+            "gpu_count": node_selector["gpu_count"],
+            "chutes_version": chute_data["chutes_version"],
+            "ban_reason": None,
+            "preemptible": chute_data["preemptible"],
+            "tee": chute_data["tee"],
+        }
+
     async def remote_refresh_all(self):
         """
         Refresh chutes from the validators.
@@ -225,6 +294,9 @@ class Gepetto:
                     validator.hotkey,
                     f"{validator.api}/miner/{clazz}/",
                     id_field,
+                    forbidden_keys=frozenset({"code", "filename"})
+                    if clazz == "chutes"
+                    else frozenset(),
                 )
             # Also refresh global active instances for preemption decisions
             await self._refresh_global_active_instances(validator)
@@ -315,61 +387,11 @@ class Gepetto:
                 .scalar_one_or_none()
             )
 
-    async def announce_deployment(self, deployment: Deployment):
-        """
-        Tell a validator that we're creating a deployment.
-        """
-        if (vali := validator_by_hotkey(deployment.validator)) is None:
-            logger.warning(f"No validator for deployment: {deployment.deployment_id}")
-            return
-        body = {
-            "node_ids": [gpu.gpu_id for gpu in deployment.gpus],
-            "host": deployment.host,
-            "port": deployment.port,
-        }
-        try:
-            async with aiohttp.ClientSession(raise_for_status=False) as session:
-                headers, payload_string = sign_request(payload=body)
-                async with session.post(
-                    f"{vali.api}/instances/{deployment.chute_id}/",
-                    headers=headers,
-                    data=payload_string,
-                ) as resp:
-                    if resp.status >= 300:
-                        error = await resp.text()
-                        logger.error(f"Error announcing deployment to validator:\n{error}")
-                        raise DeploymentFailure(
-                            f"Error announcing deployment {deployment.deployment_id} to validator:\n{error}"
-                        )
-
-                    instance = await resp.json()
-
-                    # Track the instance ID.
-                    async with get_session() as session:
-                        await session.execute(
-                            update(Deployment)
-                            .where(Deployment.deployment_id == deployment.deployment_id)
-                            .values({"instance_id": instance["instance_id"]})
-                        )
-                        await session.commit()
-                    logger.success(f"Successfully advertised instance: {instance['instance_id']}")
-        except DeploymentFailure:
-            raise
-        except Exception as exc:
-            logger.warning(f"Error announcing deployment: {exc}\n{traceback.format_exc()}")
-            raise DeploymentFailure(
-                f"Failed to announce deployment {deployment.deployment_id}: {exc=}"
-            )
-
     async def get_launch_token(self, chute: Chute, job_id: str = None):
         """
-        Fetch a launch config JWT, if the chutes version supports/requires it.
+        Fetch the validator-issued launch config required to deliver source.
         """
-        if not chute.chutes_version:
-            return None
-        core_version = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+).*", chute.chutes_version).group(1)
-        if semver.compare(core_version or "0.0.0", "0.3.0") < 0:
-            return None
+        require_supported_chutes_version(chute.chutes_version, chute.chute_id)
         if (validator := validator_by_hotkey(chute.validator)) is None:
             raise DeploymentFailure(f"Validator not found: {chute.validator}")
         try:
@@ -384,7 +406,24 @@ class Gepetto:
                     params=params,
                 ) as resp:
                     if resp.status == 200:
-                        return await resp.json()
+                        payload = await resp.json()
+                        if not isinstance(payload, dict) or set(payload) != {
+                            "token",
+                            "config_id",
+                        }:
+                            raise DeploymentFailure(
+                                f"Invalid launch config response for {chute.chute_id}: "
+                                "expected exactly token and config_id."
+                            )
+                        if not all(
+                            isinstance(payload[field], str) and payload[field]
+                            for field in ("token", "config_id")
+                        ):
+                            raise DeploymentFailure(
+                                f"Invalid launch config response for {chute.chute_id}: "
+                                "token and config_id must be non-empty strings."
+                            )
+                        return payload
 
                     error_body = await resp.text()
                     if resp.status == 423:
@@ -406,84 +445,6 @@ class Gepetto:
         except Exception as exc:
             logger.warning(f"Unable to fetch launch config token: {exc}")
             raise DeploymentFailure(f"Failed to fetch JWT for launch: {exc}") from exc
-
-    async def activate(self, deployment: Deployment):
-        """
-        Tell a validator that a deployment is active/ready.
-        """
-        if (vali := validator_by_hotkey(deployment.validator)) is None:
-            logger.warning(f"No validator for deployment: {deployment.deployment_id}")
-            return
-        body = {"active": True}
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
-            headers, payload_string = sign_request(payload=body)
-            async with session.patch(
-                f"{vali.api}/instances/{deployment.chute_id}/{deployment.instance_id}",
-                headers=headers,
-                data=payload_string,
-            ) as resp:
-                if resp.status >= 300:
-                    logger.error(f"Error activating deployment:\n{await resp.text()}")
-                resp.raise_for_status()
-                data = await resp.json()
-                async with get_session() as session:
-                    deployment = (
-                        (
-                            await session.execute(
-                                select(Deployment).where(
-                                    Deployment.deployment_id == deployment.deployment_id
-                                )
-                            )
-                        )
-                        .unique()
-                        .scalar_one_or_none()
-                    )
-                    if deployment:
-                        deployment.active = True
-                        deployment.activated_at = func.now()
-                        if data.get("verified"):
-                            deployment.verified_at = func.now()
-                        await session.commit()
-                logger.success(f"Successfully activated {deployment.instance_id=}")
-
-    async def activator(self):
-        """
-        Loop to mark all deployments ready in the validator when they are ready in k8s.
-        """
-        while True:
-            try:
-                query = select(Deployment).where(
-                    or_(
-                        Deployment.active.is_(False),
-                        Deployment.verified_at.is_(None),
-                    ),
-                    Deployment.stub.is_(False),
-                    Deployment.instance_id.is_not(None),
-                    Deployment.job_id.is_(None),  # Skip job deployments in activator
-                )
-                async with get_session() as session:
-                    deployments = (await session.execute(query)).unique().scalars()
-                if not deployments:
-                    await asyncio.sleep(5)
-                    continue
-
-                # For each deployment, check if it's ready to go in kubernetes.
-                for deployment in deployments:
-                    core_version = re.match(
-                        r"^([0-9]+\.[0-9]+\.[0-9]+).*", deployment.chute.chutes_version or "0.0.0"
-                    ).group(1)
-                    if semver.compare(core_version or "0.0.0", "0.3.0") >= 0:
-                        # The new chutes library activates the chute as part of startup flow via JWT.
-                        continue
-                    k8s_deployment = await k8s.get_deployment(deployment.deployment_id)
-                    if not k8s_deployment:
-                        logger.warning("NO K8s!")
-                    if k8s_deployment.get("ready"):
-                        await self.activate(deployment)
-                await asyncio.sleep(5)
-            except Exception as exc:
-                logger.error(f"Error performing announcement loop: {exc}")
-                await asyncio.sleep(5)
 
     async def _autoscale(self):
         """
@@ -766,16 +727,15 @@ class Gepetto:
             self._require_validator_match(chute, server)
             if validator.hotkey != chute.validator:
                 raise DeploymentFailure(
-                    f"Job validator {validator.hotkey!r} does not match "
-                    f"chute validator {chute.validator!r}."
+                    f"Job validator {validator.hotkey!r} does not match chute validator {chute.validator!r}."
                 )
             launch_token = await self.get_launch_token(chute, job_id=job_id)
             extra_ports = await self._get_job_extra_services(chute)
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 server.server_id,
-                token=launch_token["token"] if launch_token else None,
-                config_id=launch_token["config_id"] if launch_token else None,
+                token=launch_token["token"],
+                config_id=launch_token["config_id"],
                 job_id=job_id,
                 extra_labels={"chutes/job": "true"},
                 disk_gb=disk_gb,
@@ -818,8 +778,14 @@ class Gepetto:
                     headers=headers,
                 ) as resp:
                     chute_dict = await resp.json()
-        except Exception:
-            logger.error(f"Error loading remote chute data: {chute_id=} {version=}")
+            chute_values = self._remote_chute_values(
+                chute_dict,
+                validator_hotkey,
+                expected_chute_id=chute_id,
+                expected_version=version,
+            )
+        except Exception as exc:
+            logger.error(f"Error loading remote chute data: {chute_id=} {version=}: {exc}")
             return
 
         # Upsert the chute in the local DB.
@@ -837,41 +803,17 @@ class Gepetto:
                 .scalar_one_or_none()
             )
             if chute:
-                for key in (
-                    "image",
-                    "code",
-                    "filename",
-                    "ref_str",
-                    "version",
-                    "supported_gpus",
-                    "chutes_version",
-                    "preemptible",
-                    "tee",
-                ):
-                    setattr(chute, key, chute_dict.get(key))
-                chute.gpu_count = chute_dict["node_selector"]["gpu_count"]
-                chute.ban_reason = None
+                for key, value in chute_values.items():
+                    if key != "validator":
+                        setattr(chute, key, value)
             else:
                 chute = Chute(
                     chute_id=chute_id,
-                    validator=validator.hotkey,
-                    name=chute_dict["name"],
-                    image=chute_dict["image"],
-                    code=chute_dict["code"],
-                    filename=chute_dict["filename"],
-                    ref_str=chute_dict["ref_str"],
-                    version=chute_dict["version"],
-                    supported_gpus=chute_dict["supported_gpus"],
-                    gpu_count=chute_dict["node_selector"]["gpu_count"],
-                    chutes_version=chute_dict["chutes_version"],
-                    ban_reason=None,
-                    preemptible=chute_dict["preemptible"],
-                    tee=chute_dict["tee"],
+                    **chute_values,
                 )
                 db.add(chute)
             await db.commit()
             await db.refresh(chute)
-            await k8s.create_code_config_map(chute, force=True)
 
     async def job_created(self, event_data: Dict[str, Any]):
         """
@@ -1163,7 +1105,6 @@ class Gepetto:
                     )
                 await session.delete(chute)
                 await session.commit()
-        await k8s.delete_code(chute_id, version)
 
     async def chute_created(self, event_data: Dict[str, Any], desired_count: int = 1):
         """
@@ -1197,33 +1138,25 @@ class Gepetto:
                     headers=headers,
                 ) as resp:
                     chute_dict = await resp.json()
-        except Exception:
-            logger.error(f"Error loading remote chute data: {chute_id=} {version=}")
+            chute_values = self._remote_chute_values(
+                chute_dict,
+                validator_hotkey,
+                expected_chute_id=chute_id,
+                expected_version=version,
+            )
+        except Exception as exc:
+            logger.error(f"Error loading remote chute data: {chute_id=} {version=}: {exc}")
             return
 
         # Track in inventory.
         async with get_session() as session:
             chute = Chute(
                 chute_id=chute_id,
-                validator=validator.hotkey,
-                name=chute_dict["name"],
-                image=chute_dict["image"],
-                code=chute_dict["code"],
-                filename=chute_dict["filename"],
-                ref_str=chute_dict["ref_str"],
-                version=chute_dict["version"],
-                supported_gpus=chute_dict["supported_gpus"],
-                gpu_count=chute_dict["node_selector"]["gpu_count"],
-                chutes_version=chute_dict["chutes_version"],
-                ban_reason=None,
-                preemptible=chute_dict["preemptible"],
-                tee=chute_dict["tee"],
+                **chute_values,
             )
             session.add(chute)
             await session.commit()
             await session.refresh(chute)
-
-        await k8s.create_code_config_map(chute)
 
         # Don't deploy if this is a job-only chute, i.e. it has no "cords" to serve
         # so there's nothing to deploy.
@@ -1300,8 +1233,14 @@ class Gepetto:
                             headers=headers,
                         ) as resp:
                             chute_dict = await resp.json()
-                except Exception:
-                    logger.error(f"Error loading remote chute data: {chute_id=} {version=}")
+                    chute_values = self._remote_chute_values(
+                        chute_dict,
+                        validator_hotkey,
+                        expected_chute_id=chute_id,
+                        expected_version=version,
+                    )
+                except Exception as exc:
+                    logger.error(f"Error loading remote chute data: {chute_id=} {version=}: {exc}")
                     return
 
                 async with get_session() as db:
@@ -1318,41 +1257,17 @@ class Gepetto:
                         .scalar_one_or_none()
                     )
                     if chute:
-                        for key in (
-                            "image",
-                            "code",
-                            "filename",
-                            "ref_str",
-                            "version",
-                            "supported_gpus",
-                            "chutes_version",
-                            "preemptible",
-                            "tee",
-                        ):
-                            setattr(chute, key, chute_dict.get(key))
-                        chute.gpu_count = chute_dict["node_selector"]["gpu_count"]
-                        chute.ban_reason = None
+                        for key, value in chute_values.items():
+                            if key != "validator":
+                                setattr(chute, key, value)
                     else:
                         chute = Chute(
                             chute_id=chute_id,
-                            validator=validator.hotkey,
-                            name=chute_dict["name"],
-                            image=chute_dict["image"],
-                            code=chute_dict["code"],
-                            filename=chute_dict["filename"],
-                            ref_str=chute_dict["ref_str"],
-                            version=chute_dict["version"],
-                            supported_gpus=chute_dict["supported_gpus"],
-                            gpu_count=chute_dict["node_selector"]["gpu_count"],
-                            chutes_version=chute_dict["chutes_version"],
-                            ban_reason=None,
-                            preemptible=chute_dict["preemptible"],
-                            tee=chute_dict["tee"],
+                            **chute_values,
                         )
                         db.add(chute)
                     await db.commit()
                     await db.refresh(chute)
-                    await k8s.create_code_config_map(chute, force=True)
 
             # Deploy the new version.
             logger.info(
@@ -1371,15 +1286,13 @@ class Gepetto:
                     deployment, _ = await k8s.deploy_chute(
                         chute.chute_id,
                         server_id,
-                        token=launch_token["token"] if launch_token else None,
-                        config_id=launch_token["config_id"] if launch_token else None,
+                        token=launch_token["token"],
+                        config_id=launch_token["config_id"],
                         vm_version=self._server_vm_version(chute.validator, server_id),
                     )
                     logger.success(
                         f"Successfully updated {chute_id=} to {version=} on {server_id=}: {deployment.deployment_id=}"
                     )
-                    if not launch_token:
-                        await self.announce_deployment(deployment)
                 except DeploymentFailure as exc:
                     logger.error(
                         f"Unhandled error attempting to deploy {chute.chute_id=} on {server_id=}: {exc}\n{traceback.format_exc()}"
@@ -1439,8 +1352,7 @@ class Gepetto:
             return None
         if not chute.validator or validator_by_hotkey(chute.validator) is None:
             logger.error(
-                f"Will not select a server for {chute.chute_id=}: "
-                f"validator {chute.validator!r} is not configured"
+                f"Will not select a server for {chute.chute_id=}: validator {chute.validator!r} is not configured"
             )
             return None
         supported_gpus = list(chute.supported_gpus)
@@ -1554,8 +1466,7 @@ class Gepetto:
             return False
         if not chute.validator or validator_by_hotkey(chute.validator) is None:
             logger.error(
-                f"Refusing to preempt for {chute.chute_id=}: "
-                f"validator {chute.validator!r} is not configured"
+                f"Refusing to preempt for {chute.chute_id=}: validator {chute.validator!r} is not configured"
             )
             return False
 
@@ -1790,8 +1701,8 @@ class Gepetto:
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 target_server.server_id,
-                token=launch_token["token"] if launch_token else None,
-                config_id=launch_token["config_id"] if launch_token else None,
+                token=launch_token["token"],
+                config_id=launch_token["config_id"],
                 job_id=job_id,
                 disk_gb=disk_gb,
                 extra_service_ports=extra_ports,
@@ -1800,8 +1711,6 @@ class Gepetto:
             logger.success(
                 f"Successfully deployed {chute.chute_id=} {job_id=} via preemption on {target_server.server_id=}: {deployment.deployment_id=}"
             )
-            if not launch_token:
-                await self.announce_deployment(deployment)
             return True
         except DeploymentFailure as exc:
             logger.error(
@@ -1872,8 +1781,8 @@ class Gepetto:
                             deployment, _ = await k8s.deploy_chute(
                                 chute.chute_id,
                                 server.server_id,
-                                token=launch_token["token"] if launch_token else None,
-                                config_id=launch_token["config_id"] if launch_token else None,
+                                token=launch_token["token"],
+                                config_id=launch_token["config_id"],
                                 vm_version=self._server_vm_version(
                                     chute.validator, server.server_id
                                 ),
@@ -1881,8 +1790,6 @@ class Gepetto:
                             logger.success(
                                 f"Successfully deployed {chute.chute_id=} on {server.server_id=}: {deployment.deployment_id=}"
                             )
-                            if not launch_token:
-                                await self.announce_deployment(deployment)
                             scaled = True
                         except DeploymentFailure as exc:
                             logger.error(
@@ -1933,7 +1840,6 @@ class Gepetto:
                         [
                             chute.name,
                             chute.image,
-                            chute.code,
                             chute.ref_str,
                             f"{chute.preemptible}",
                             f"{chute.gpu_count}",
@@ -1951,7 +1857,6 @@ class Gepetto:
                         [
                             chute_data["name"],
                             chute_data["image"],
-                            chute_data["code"],
                             chute_data["ref_str"],
                             f"{chute_data['preemptible']}",
                             f"{chute_data['node_selector']['gpu_count']}",
@@ -2070,6 +1975,21 @@ class Gepetto:
             # Clean up based on deployments/instances.
             async for row in (await session.stream(select(Deployment))).unique():
                 deployment = row[0]
+
+                try:
+                    require_supported_chutes_version(
+                        deployment.chute.chutes_version,
+                        deployment.chute_id,
+                    )
+                except DeploymentFailure as exc:
+                    logger.error(
+                        f"Removing unsupported deployment {deployment.deployment_id}: {exc}"
+                    )
+                    all_deployments.add(deployment.deployment_id)
+                    if deployment.instance_id:
+                        all_instances.add(deployment.instance_id)
+                    tasks.append(asyncio.create_task(self.undeploy(deployment.deployment_id)))
+                    continue
 
                 # Make sure the instances created with launch configs have the instance ID tracked.
                 if deployment.config_id and not deployment.instance_id:

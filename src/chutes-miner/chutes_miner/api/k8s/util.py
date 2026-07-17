@@ -1,5 +1,4 @@
 import re
-import uuid
 from typing import Any, Optional
 
 from kubernetes.client import (
@@ -16,7 +15,6 @@ from kubernetes.client import (
     V1EnvVar,
     V1Volume,
     V1VolumeMount,
-    V1ConfigMapVolumeSource,
     V1HostPathVolumeSource,
     V1SecurityContext,
     V1EmptyDirVolumeSource,
@@ -27,16 +25,17 @@ from kubernetes.client import (
 
 from chutes_common.schemas.chute import Chute
 from chutes_miner.api.k8s.constants import (
-    CHUTE_CODE_CM_PREFIX,
     CHUTE_DEPLOY_PREFIX,
     CHUTE_SVC_PREFIX,
 )
 from chutes_common.schemas.server import Server
 from chutes_miner.api.config import settings, validator_by_hotkey
+from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.util import semcomp
 
 
 _VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
+MIN_SUPPORTED_CHUTES_VERSION = "0.3.61"
 
 
 def resolve_deployment_validator(chute: Chute, server: Server):
@@ -58,11 +57,13 @@ def resolve_deployment_validator(chute: Chute, server: Server):
     return validator
 
 
-def _requires_code_volume(chute: Chute) -> bool:
-    if chute.tee:
-        return False
-    version_str = chute.chutes_version or chute.version or "0.0.0"
-    return semcomp(version_str, "0.3.61") < 0
+def require_supported_chutes_version(version: Optional[str], chute_id: str) -> None:
+    if not version or semcomp(version, MIN_SUPPORTED_CHUTES_VERSION) < 0:
+        raise DeploymentFailure(
+            f"Unsupported chutes runtime version {version!r} for chute {chute_id}; "
+            f"minimum supported version is {MIN_SUPPORTED_CHUTES_VERSION}. "
+            "Legacy source ConfigMap delivery has been removed; rebuild the chute image."
+        )
 
 
 def _needs_attestation_port(chute: Chute) -> bool:
@@ -98,6 +99,13 @@ def build_chute_job(
     disk_gb: int = 10,
     vm_version: Optional[str] = None,
 ) -> V1Job:
+    require_supported_chutes_version(chute.chutes_version, chute.chute_id)
+    if not token or not config_id:
+        raise DeploymentFailure(
+            f"Missing required launch config for chute {chute.chute_id}; "
+            "source is delivered only through a validator-issued launch token."
+        )
+
     cpu = str(server.cpu_per_gpu * chute.gpu_count)
     ram = str(server.memory_per_gpu * chute.gpu_count) + "Gi"
     validator = resolve_deployment_validator(chute, server)
@@ -108,15 +116,11 @@ def build_chute_job(
         "chutes/version": chute.version,
     }
 
-    attach_code_volume = _requires_code_volume(chute)
-
-    if config_id:
-        deployment_labels["chutes/config-id"] = config_id
+    deployment_labels["chutes/config-id"] = config_id
     if job_id:
         deployment_labels["chutes/job-id"] = job_id
         deployment_labels["chutes/job"] = "true"
 
-    # Command will vary depending on chutes version.
     # GPU workloads use their validator-signed launch JWT for narrowly scoped model discovery and
     # one-use ensure authorization. They do not have a CPU-TD attestation cert/key, and a miner-set
     # host-id environment variable would not be possession proof.
@@ -130,19 +134,16 @@ def build_chute_job(
         "--port",
         "8000",
     ]
-    if not token:
-        command += ["--graval-seed", str(server.seed)]
-    else:
-        extra_env += [
-            V1EnvVar(
-                name="CHUTES_LAUNCH_JWT",
-                value=token,
-            ),
-            V1EnvVar(
-                name="CHUTES_EXTERNAL_HOST",
-                value=server.ip_address,
-            ),
-        ]
+    extra_env += [
+        V1EnvVar(
+            name="CHUTES_LAUNCH_JWT",
+            value=token,
+        ),
+        V1EnvVar(
+            name="CHUTES_EXTERNAL_HOST",
+            value=server.ip_address,
+        ),
+    ]
 
     # Port mappings must be in the environment variables.
     # Attestation port 8002 only for TEE chutes on chutes runtime >= 0.6.0.
@@ -171,28 +172,6 @@ def build_chute_job(
 
     if chute.tee:
         extra_env += _tee_download_env(vm_version)
-
-    code_volumes = []
-    code_volume_mounts = []
-    if attach_code_volume:
-        code_uuid = str(
-            uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}")
-        )
-        code_volumes = [
-            V1Volume(
-                name="code",
-                config_map=V1ConfigMapVolumeSource(
-                    name=f"{CHUTE_CODE_CM_PREFIX}-{code_uuid}",
-                ),
-            )
-        ]
-        code_volume_mounts = [
-            V1VolumeMount(
-                name="code",
-                mount_path=f"/app/{chute.filename}",
-                sub_path=chute.filename,
-            )
-        ]
 
     return V1Job(
         metadata=V1ObjectMeta(
@@ -224,7 +203,6 @@ def build_chute_job(
                         run_as_group=1000,
                     ),
                     volumes=[
-                        *code_volumes,
                         V1Volume(
                             name="cache",
                             host_path=V1HostPathVolumeSource(
@@ -245,9 +223,7 @@ def build_chute_job(
                         ),
                         V1Volume(
                             name="shm",
-                            empty_dir=V1EmptyDirVolumeSource(
-                                medium="Memory", size_limit="16Gi"
-                            ),
+                            empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
                         ),
                     ],
                     init_containers=[
@@ -379,7 +355,6 @@ def build_chute_job(
                                 },
                             ),
                             volume_mounts=[
-                                *code_volume_mounts,
                                 V1VolumeMount(name="cache", mount_path="/cache"),
                                 V1VolumeMount(name="tmp", mount_path="/tmp"),
                                 V1VolumeMount(name="shm", mount_path="/dev/shm"),
@@ -435,12 +410,8 @@ def build_chute_service(
                 "chutes/deployment-id": deployment_id,
             },
             ports=[
-                V1ServicePort(
-                    port=8000, target_port=8000, protocol="TCP", name="chute-8000"
-                ),
-                V1ServicePort(
-                    port=8001, target_port=8001, protocol="TCP", name="chute-8001"
-                ),
+                V1ServicePort(port=8000, target_port=8000, protocol="TCP", name="chute-8000"),
+                V1ServicePort(port=8001, target_port=8001, protocol="TCP", name="chute-8001"),
                 *(
                     [
                         V1ServicePort(

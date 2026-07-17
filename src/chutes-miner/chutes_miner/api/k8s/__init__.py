@@ -38,11 +38,9 @@ async def get_deployed_chutes_legacy() -> List[Dict]:
     return await K8sOperator()._get_chute_deployments()
 
 
-async def delete_code(chute_id: str, version: str):
-    """
-    Delete the code configmap associated with a chute & version.
-    """
-    return await K8sOperator().delete_code(chute_id, version)
+async def purge_legacy_source_config_maps() -> None:
+    """Remove ConfigMaps left by retired miner-mounted source delivery."""
+    await K8sOperator().purge_legacy_source_config_maps()
 
 
 async def wait_for_deletion(label_selector: str, timeout_seconds: int = 120):
@@ -63,13 +61,6 @@ async def undeploy(deployment_id: str, timeout_seconds: int | None = None):
 async def delete_preflight(deployment_id: str, timeout_seconds: int = 120) -> bool:
     """Verify it's safe to delete a deployment before touching local state."""
     return await K8sOperator().delete_preflight(deployment_id, timeout_seconds=timeout_seconds)
-
-
-async def create_code_config_map(chute: Chute, force=False):
-    """
-    Create a ConfigMap to store the chute code.
-    """
-    return await K8sOperator().create_code_config_map(chute, force)
 
 
 async def deploy_chute(

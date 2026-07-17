@@ -16,8 +16,6 @@ class Chute(Base):
     validator = Column(String, nullable=False)
     name = Column(String)
     image = Column(String, nullable=False)
-    code = Column(String, nullable=False)
-    filename = Column(String, nullable=False)
     ref_str = Column(String, nullable=False)
     version = Column(String, nullable=False)
     supported_gpus = Column(ARRAY(String), nullable=False)

@@ -1,17 +1,14 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 import json
 import math
-import re
 import time
 import uuid
 import traceback
 import abc
 import threading
 from aiohttp import ConnectionTimeoutError
-import semver
 from chutes_common.monitoring.messages import (
     ClusterChangeMessage,
     ClusterReconnetMessage,
@@ -31,7 +28,6 @@ from kubernetes.client import (
     V1Node,
     V1NodeList,
     V1PodList,
-    V1ObjectMeta,
     V1DeploymentList,
     V1ConfigMap,
     V1Job,
@@ -45,7 +41,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.database import get_session, get_sync_session
 from chutes_miner.api.k8s.constants import (
-    CHUTE_CODE_CM_PREFIX,
     CHUTE_DEPLOY_PREFIX,
     CHUTE_SVC_PREFIX,
     GRAVAL_JOB_PREFIX,
@@ -55,6 +50,7 @@ from chutes_common.k8s import WatchEvent, WatchEventType
 from chutes_miner.api.k8s.util import (
     build_chute_job,
     build_chute_service,
+    require_supported_chutes_version,
     resolve_deployment_validator,
 )
 from chutes_common.schemas.server import Server
@@ -143,7 +139,6 @@ class ConfigMapWorker:
         manager: KubernetesMultiClusterClientManager,
         verify_node_health: Callable[[str], None],
         get_request_timeout: Callable[[int], Tuple[int, int]],
-        build_code_config_map: Callable[[Chute], V1ConfigMap],
     ):
         if getattr(self, "_initialized", False):
             return
@@ -152,7 +147,6 @@ class ConfigMapWorker:
         self._manager = manager
         self._verify_node_health = verify_node_health
         self._get_request_timeout = get_request_timeout
-        self._build_code_config_map = build_code_config_map
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._queue: Optional[asyncio.Queue[ConfigMapWorkerRequest]] = None
@@ -449,31 +443,25 @@ class ConfigMapWorker:
         if _is_tee_cluster(cluster_name):
             return
         try:
-            with get_sync_session() as session:
-                client = self._manager.get_core_client(cluster_name)
-                chute_cms: V1ConfigMapList = client.list_namespaced_config_map(
-                    settings.namespace, label_selector="chutes/code=true"
+            client = self._manager.get_core_client(cluster_name)
+            chute_cms: V1ConfigMapList = client.list_namespaced_config_map(
+                settings.namespace, label_selector="chutes/code=true"
+            )
+
+            for cm in chute_cms.items:
+                self._delete_config_map_from_cluster(
+                    cluster=cluster_name,
+                    name=cm.metadata.name,
+                    namespace=settings.namespace,
                 )
 
-                for cm in chute_cms.items:
-                    self._delete_config_map_from_cluster(
-                        cluster=cluster_name,
-                        name=cm.metadata.name,
-                        namespace=settings.namespace,
-                    )
-
-                chutes = (session.execute(select(Chute))).unique().scalars()
-                for chute in chutes:
-                    config_map = self._build_code_config_map(chute)
-                    self._deploy_config_map_to_cluster(
-                        cluster=cluster_name,
-                        config_map=config_map,
-                        namespace=settings.namespace,
-                    )
-
-            logger.info(f"Successfully synced chute configmaps for {cluster_name}")
+            logger.info(
+                f"Purged {len(chute_cms.items)} legacy chute source configmaps from {cluster_name}"
+            )
         except Exception as e:
-            logger.error(f"Unexpected exception syncing chute configmaps for {cluster_name}:\n{e}")
+            logger.error(
+                f"Unexpected exception purging legacy chute source configmaps from {cluster_name}:\n{e}"
+            )
 
 
 # Abstract base class for all Kubernetes operations
@@ -883,25 +871,14 @@ class K8sOperator(abc.ABC):
             logger.error(f"Failed to get legacy deployments: {e}")
         return deployments
 
-    async def delete_code(self, chute_id: str, version: str) -> None:
-        """
-        Delete the code configmap associated with a chute & version.
-        """
-        try:
-            code_uuid = self._get_code_uuid(chute_id, version)
-            self.delete_config_map(f"{CHUTE_CODE_CM_PREFIX}-{code_uuid}")
-        except ApiException as exc:
-            if exc.status != 404:
-                logger.error(f"Failed to delete code reference: {exc}")
-                raise
-
     @abc.abstractmethod
     def delete_config_map(self, name: str, namespace=settings.namespace, timeout_seconds: int = 60):
         raise NotImplementedError()
 
-    @lru_cache(maxsize=5)
-    def _get_code_uuid(self, chute_id: str, version: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{chute_id}::{version}"))
+    @abc.abstractmethod
+    async def purge_legacy_source_config_maps(self) -> None:
+        """Remove ConfigMaps created by the retired miner-mounted source path."""
+        raise NotImplementedError()
 
     async def wait_for_deletion(self, label_selector: str, timeout_seconds: int = 120) -> None:
         """
@@ -1019,32 +996,6 @@ class K8sOperator(abc.ABC):
     def _delete_job(self, name, namespace=settings.namespace):
         raise NotImplementedError()
 
-    async def create_code_config_map(self, chute: Chute, force=False) -> None:
-        """Create a ConfigMap to store the chute code."""
-        if chute.tee:
-            return
-        try:
-            config_map = self._build_code_config_map(chute)
-            await self._deploy_config_map(config_map, force=force)
-        except ApiException as e:
-            if e.status != 409:
-                raise
-
-    def _build_code_config_map(self, chute: Chute) -> V1ConfigMap:
-        code_uuid = self._get_code_uuid(chute.chute_id, chute.version)
-        config_map = V1ConfigMap(
-            metadata=V1ObjectMeta(
-                name=f"{CHUTE_CODE_CM_PREFIX}-{code_uuid}",
-                labels={
-                    "chutes/chute-id": chute.chute_id,
-                    "chutes/version": chute.version,
-                    "chutes/code": "true",
-                },
-            ),
-            data={chute.filename: chute.code},
-        )
-        return config_map
-
     @abc.abstractmethod
     async def _deploy_config_map(
         self, config_map: V1ConfigMap, namespace=settings.namespace, timeout_seconds=60, force=False
@@ -1078,6 +1029,12 @@ class K8sOperator(abc.ABC):
             async with get_session() as session:
                 chute = await self._get_chute(session, chute_id)
                 chute_version = chute.version
+                require_supported_chutes_version(chute.chutes_version, chute.chute_id)
+                if not token or not config_id:
+                    raise DeploymentFailure(
+                        f"Missing required launch config for chute {chute.chute_id}; "
+                        "source is delivered only through a validator-issued launch token."
+                    )
                 server = await self._get_server(session, server_id)
                 resolve_deployment_validator(chute, server)
                 available_gpus = self._verify_gpus(chute, server)
@@ -1272,15 +1229,8 @@ class K8sOperator(abc.ABC):
             )
 
     def _get_probe_port(self, chute: Chute):
-        # Determine the port to use for the liveness probe.
-        probe_port = 8000
-        core_version = re.match(
-            r"^([0-9]+\.[0-9]+\.[0-9]+).*", (chute.chutes_version or "0.0.0")
-        ).group(1)
-        if semver.compare(core_version or "0.0.0", "0.3.3") >= 0:
-            probe_port = 8001
-
-        return probe_port
+        require_supported_chutes_version(chute.chutes_version, chute.chute_id)
+        return 8001
 
     async def deploy_graval(
         self, node: V1Node, job: V1Job, service: V1Service
@@ -1787,6 +1737,21 @@ class SingleClusterK8sOperator(K8sOperator):
             name=name, namespace=namespace, _request_timeout=timeout_seconds
         )
 
+    async def purge_legacy_source_config_maps(self) -> None:
+        config_maps = k8s_core_client().list_namespaced_config_map(
+            namespace=settings.namespace,
+            label_selector="chutes/code=true",
+        )
+        for config_map in config_maps.items:
+            try:
+                self.delete_config_map(config_map.metadata.name)
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+        logger.info(
+            f"Purged {len(config_maps.items)} legacy chute source configmaps from the local cluster"
+        )
+
     async def _deploy_config_map(
         self, config_map: V1ConfigMap, namespace=settings.namespace, timeout_seconds=60, force=False
     ):
@@ -1839,7 +1804,6 @@ class MultiClusterK8sOperator(K8sOperator):
                     manager=self._manager,
                     verify_node_health=self._verify_node_health,
                     get_request_timeout=self._get_request_timeout,
-                    build_code_config_map=self._build_code_config_map,
                 )
 
     def _get_request_timeout(self, read_timeout: int) -> Tuple[int, int]:
@@ -1969,7 +1933,7 @@ class MultiClusterK8sOperator(K8sOperator):
                                 )
                             ):
                                 logger.error(
-                                    f"Failed to enqueue configmap sync for cluster {message.cluster}."
+                                    f"Failed to enqueue legacy source ConfigMap purge for cluster {message.cluster}."
                                 )
                         else:
                             logger.warning(
@@ -2029,11 +1993,14 @@ class MultiClusterK8sOperator(K8sOperator):
                 )
                 return
 
-            logger.info(f"Cluster {message.cluster} reconnected.  Refreshing Chutes config maps.")
+            logger.info(
+                f"Cluster {message.cluster} reconnected. Purging legacy chute source ConfigMaps."
+            )
 
             if not self._config_map_worker.sync_cluster_configmaps(message.cluster):
                 logger.error(
-                    f"Failed to enqueue configmap sync for cluster {message.cluster} after reconnect."
+                    f"Failed to enqueue legacy source ConfigMap purge for "
+                    f"{message.cluster} after reconnect."
                 )
 
         except Exception as e:
@@ -2303,6 +2270,31 @@ class MultiClusterK8sOperator(K8sOperator):
         clusters = self._redis.get_all_cluster_names()
         for cluster in clusters:
             self._delete_config_map_from_cluster(cluster, name, namespace, timeout_seconds)
+
+    async def purge_legacy_source_config_maps(self) -> None:
+        for cluster in self._redis.get_all_cluster_names():
+            if _is_tee_cluster(cluster):
+                continue
+            try:
+                client = self._manager.get_core_client(cluster)
+                config_maps = client.list_namespaced_config_map(
+                    namespace=settings.namespace,
+                    label_selector="chutes/code=true",
+                    _request_timeout=self._get_request_timeout(60),
+                )
+                for config_map in config_maps.items:
+                    self._delete_config_map_from_cluster(
+                        cluster,
+                        config_map.metadata.name,
+                        settings.namespace,
+                    )
+                logger.info(
+                    f"Purged {len(config_maps.items)} legacy chute source configmaps from {cluster}"
+                )
+            except (MaxRetryError, ConnectionTimeoutError) as exc:
+                logger.warning(
+                    f"Could not purge legacy chute source configmaps from {cluster}: {exc}"
+                )
 
     def _delete_config_map_from_cluster(
         self, cluster, name, namespace=settings.namespace, timeout_seconds: int = 60
