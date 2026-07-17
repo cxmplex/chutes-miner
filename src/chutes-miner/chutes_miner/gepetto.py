@@ -3,10 +3,12 @@ Gepetto - coordinate all the things.
 """
 
 import re
+import random
 import aiohttp
 import asyncio
 import hashlib
 from chutes_miner.api.k8s.operator import K8sOperator
+from chutes_miner.api.k8s.util import resolve_deployment_validator
 from chutes_miner.api.server.util import clear_server_cache, stop_server_monitoring
 import orjson as json
 import traceback
@@ -34,6 +36,12 @@ from chutes_miner.validator_migrations import run_validator_migrations
 import chutes_miner.api.k8s as k8s
 
 
+# When scaling up, randomly pick from up to this many of the tightest-fitting servers
+# (rather than always the single most-utilized one) to spread load and avoid repeatedly
+# scheduling onto a server that has an issue the disk check doesn't catch.
+SCALE_UP_CANDIDATE_POOL = 2
+
+
 class Gepetto:
     def __init__(self):
         """
@@ -47,6 +55,12 @@ class Gepetto:
         self.remote_metrics = {validator.hotkey: {} for validator in settings.validators}
         # Global active instances across all miners (for preemption decisions)
         self.global_active_instances = {validator.hotkey: [] for validator in settings.validators}
+        # Tracks the TEE VM version per server_id, sourced live from the validator each reconcile
+        # cycle. Passed through to build_chute_job so pod scheduling can tune the runtime to the
+        # VM version (e.g. HF download env vars for VMs >= 1.3.1).
+        self.remote_server_versions: Dict[str, Dict[str, Optional[str]]] = {
+            validator.hotkey: {} for validator in settings.validators
+        }
         self._scale_lock = asyncio.Lock()
         self._restart_lock = asyncio.Lock()
         self.setup_handlers()
@@ -134,10 +148,69 @@ class Gepetto:
                 f"Failed to refresh global active instances from {validator.hotkey}: {exc}"
             )
 
+    async def _refresh_server_versions(self, validator):
+        """
+        Refresh the in-memory vm version map from the validator's /miner/servers/ endpoint.
+
+        The version is the TEE measurement version reconciled from the TDX quote by the
+        validator — the miner has no independent way to know it, so it is never persisted
+        locally and is re-fetched every reconcile cycle. It feeds build_chute_job so pod
+        scheduling can tune the runtime to the VM version.
+        """
+        try:
+            async with aiohttp.ClientSession(raise_for_status=True) as session:
+                headers, _ = sign_request(purpose="miner")
+                async with session.get(f"{validator.api}/miner/servers/", headers=headers) as resp:
+                    data = await resp.json()
+            self.remote_server_versions[validator.hotkey] = self._parse_server_versions(data)
+        except Exception as exc:
+            # A failed or malformed refresh must not keep a version from an older VM.
+            # Unknown versions intentionally use the conservative legacy HF environment.
+            self.remote_server_versions[validator.hotkey] = {}
+            logger.error(f"Failed to refresh server versions from {validator.hotkey}: {exc}")
+
+    @staticmethod
+    def _parse_server_versions(data: Any) -> Dict[str, Optional[str]]:
+        """Parse the validator's MinerServersResponse without retaining partial data."""
+        if not isinstance(data, dict) or not isinstance(data.get("servers"), list):
+            raise ValueError("Invalid MinerServersResponse: expected a servers list.")
+        versions: Dict[str, Optional[str]] = {}
+        for remote_server in data["servers"]:
+            if not isinstance(remote_server, dict):
+                raise ValueError("Invalid MinerServer entry: expected an object.")
+            server_id = remote_server.get("server_id")
+            version = remote_server.get("version")
+            if not isinstance(server_id, str) or not server_id:
+                raise ValueError("Invalid MinerServer entry: missing server_id.")
+            if server_id in versions:
+                raise ValueError(
+                    f"Invalid MinerServersResponse: duplicate server_id {server_id!r}."
+                )
+            if version is not None and not isinstance(version, str):
+                raise ValueError(
+                    f"Invalid MinerServer entry for {server_id!r}: version must be a string or null."
+                )
+            versions[server_id] = version
+        return versions
+
+    def _server_vm_version(self, validator_hotkey: str, server_id: str) -> Optional[str]:
+        return self.remote_server_versions.get(validator_hotkey, {}).get(server_id)
+
+    @staticmethod
+    def _require_validator_match(chute: Chute, server: Server) -> None:
+        try:
+            resolve_deployment_validator(chute, server)
+        except ValueError as exc:
+            raise DeploymentFailure(str(exc)) from exc
+
     async def remote_refresh_all(self):
         """
         Refresh chutes from the validators.
         """
+        for validator in settings.validators:
+            # Refresh all version maps first so a later inventory failure for one
+            # validator cannot leave an older VM version active for another.
+            await self._refresh_server_versions(validator)
         for validator in settings.validators:
             for clazz, id_field in (
                 ("chutes", "chute_id"),
@@ -690,6 +763,12 @@ class Gepetto:
         )
         deployment = None
         try:
+            self._require_validator_match(chute, server)
+            if validator.hotkey != chute.validator:
+                raise DeploymentFailure(
+                    f"Job validator {validator.hotkey!r} does not match "
+                    f"chute validator {chute.validator!r}."
+                )
             launch_token = await self.get_launch_token(chute, job_id=job_id)
             extra_ports = await self._get_job_extra_services(chute)
             deployment, k8s_dep = await k8s.deploy_chute(
@@ -701,6 +780,7 @@ class Gepetto:
                 extra_labels={"chutes/job": "true"},
                 disk_gb=disk_gb,
                 extra_service_ports=extra_ports,
+                vm_version=self._server_vm_version(chute.validator, server.server_id),
             )
             logger.success(
                 f"Successfully deployed {job_id=} {chute.chute_id=} on {server.server_id=}: {deployment.deployment_id=}"
@@ -745,7 +825,14 @@ class Gepetto:
         # Upsert the chute in the local DB.
         async with get_session() as db:
             chute = (
-                (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
+                (
+                    await db.execute(
+                        select(Chute).where(
+                            Chute.chute_id == chute_id,
+                            Chute.validator == validator_hotkey,
+                        )
+                    )
+                )
                 .unique()
                 .scalar_one_or_none()
             )
@@ -1172,12 +1259,15 @@ class Gepetto:
             # Remove the instance/deployment.
             server_id = None
             server_gpu_type = None
+            server_validator = None
             async with get_session() as session:
                 deployment = (
                     (
                         await session.execute(
                             select(Deployment).where(
                                 Deployment.instance_id == instance_id,
+                                Deployment.chute_id == chute_id,
+                                Deployment.validator == validator_hotkey,
                                 Deployment.job_id.is_(None),
                             )
                         )
@@ -1189,6 +1279,14 @@ class Gepetto:
                     server_id = deployment.server.server_id
                     server_gpu_type = deployment.server.gpus[0].model_short_ref
                     server_is_tee = deployment.server.is_tee
+                    server_validator = deployment.server.validator
+                    if server_validator != validator_hotkey:
+                        logger.error(
+                            f"Refusing rolling update for {instance_id=}: deployment validator "
+                            f"{validator_hotkey!r} does not match server validator "
+                            f"{server_validator!r}"
+                        )
+                        return
                     await self.undeploy(deployment.deployment_id)
 
             # Make sure the local chute is updated.
@@ -1208,7 +1306,14 @@ class Gepetto:
 
                 async with get_session() as db:
                     chute = (
-                        (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
+                        (
+                            await db.execute(
+                                select(Chute).where(
+                                    Chute.chute_id == chute_id,
+                                    Chute.validator == validator_hotkey,
+                                )
+                            )
+                        )
                         .unique()
                         .scalar_one_or_none()
                     )
@@ -1253,7 +1358,12 @@ class Gepetto:
             logger.info(
                 f"Determining if we can deploy {chute.chute_id=} on {server_id=} with {server_gpu_type=} and supported={chute.supported_gpus}"
             )
-            if server_id and server_gpu_type in chute.supported_gpus and server_is_tee == chute.tee:
+            if (
+                server_id
+                and server_validator == chute.validator
+                and server_gpu_type in chute.supported_gpus
+                and server_is_tee == chute.tee
+            ):
                 logger.info(f"Attempting to deploy {chute.chute_id=} on {server_id=}")
                 deployment = None
                 try:
@@ -1263,6 +1373,7 @@ class Gepetto:
                         server_id,
                         token=launch_token["token"] if launch_token else None,
                         config_id=launch_token["config_id"] if launch_token else None,
+                        vm_version=self._server_vm_version(chute.validator, server_id),
                     )
                     logger.success(
                         f"Successfully updated {chute_id=} to {version=} on {server_id=}: {deployment.deployment_id=}"
@@ -1308,6 +1419,8 @@ class Gepetto:
             .where(Server.locked.is_(False))
             .where(Deployment.preemptible.is_(True))
             .where(Deployment.chute_id == chute.chute_id)
+            .where(Deployment.validator == chute.validator)
+            .where(Server.validator == chute.validator)
             .where(Deployment.job_id.is_(None))
             .where(Deployment.activated_at <= func.now() - timedelta(minutes=63))
             .order_by(text("removal_score DESC"))
@@ -1323,6 +1436,12 @@ class Gepetto:
         """
         if chute.ban_reason:
             logger.warning(f"Will not scale up banned chute {chute.chute_id=}: {chute.ban_reason=}")
+            return None
+        if not chute.validator or validator_by_hotkey(chute.validator) is None:
+            logger.error(
+                f"Will not select a server for {chute.chute_id=}: "
+                f"validator {chute.validator!r} is not configured"
+            )
             return None
         supported_gpus = list(chute.supported_gpus)
         total_gpus_per_server = (
@@ -1371,14 +1490,31 @@ class Gepetto:
                 ),
                 Server.locked.is_(False),
                 Server.is_tee.is_(chute.tee),
+                Server.validator == chute.validator,
             )
+            # Cheapest first, then best-fit (fewest free GPUs that still satisfy the
+            # chute) so we pack tightly and preserve emptier servers for larger models.
             .order_by(Server.hourly_cost.asc(), text("free_gpus ASC"))
         )
         async with get_session() as session:
             servers = (await session.execute(query)).unique().scalars().all()
+            # Servers come back tightest-fit first. Rather than always returning the
+            # single most-utilized server (which black-holes scheduling onto one box if
+            # it has an issue the disk check misses), gather the top few best-fit servers
+            # that pass the disk check and pick one at random to spread load.
+            candidates = []
             for server in servers:
+                try:
+                    Gepetto._require_validator_match(chute, server)
+                except DeploymentFailure as exc:
+                    logger.error(f"Skipping invalid scale-up candidate: {exc}")
+                    continue
                 if await k8s.check_node_has_disk_available(server.name, disk_gb):
-                    return server
+                    candidates.append(server)
+                    if len(candidates) >= SCALE_UP_CANDIDATE_POOL:
+                        break
+            if candidates:
+                return random.choice(candidates)
         return None
 
     def _get_global_instance_count(self, validator: str, chute_id: str) -> int:
@@ -1414,6 +1550,12 @@ class Gepetto:
         if chute.ban_reason:
             logger.warning(
                 f"Refusing to perform a preempting deploy of banned chute {chute.chute_id=}: {chute.ban_reason=}"
+            )
+            return False
+        if not chute.validator or validator_by_hotkey(chute.validator) is None:
+            logger.error(
+                f"Refusing to preempt for {chute.chute_id=}: "
+                f"validator {chute.validator!r} is not configured"
             )
             return False
 
@@ -1482,6 +1624,7 @@ class Gepetto:
                 total_gpus_per_server.c.total_gpus >= chute.gpu_count,
                 Server.locked.is_(False),
                 Server.is_tee.is_(chute.tee),
+                Server.validator == chute.validator,
             )
             .order_by(Server.hourly_cost.asc(), text("free_gpus ASC"))
         )
@@ -1492,11 +1635,16 @@ class Gepetto:
             return False
 
         # Fetch disk space.
-        servers = [
-            server
-            for server in servers
-            if await k8s.check_node_has_disk_available(server.name, disk_gb)
-        ]
+        eligible_servers = []
+        for server in servers:
+            try:
+                self._require_validator_match(chute, server)
+            except DeploymentFailure as exc:
+                logger.error(f"Skipping invalid preemption candidate: {exc}")
+                continue
+            if await k8s.check_node_has_disk_available(server.name, disk_gb):
+                eligible_servers.append(server)
+        servers = eligible_servers
 
         # Build global instance counts from global_active_instances
         global_counts = {}
@@ -1525,6 +1673,11 @@ class Gepetto:
             for deployment in sorted(server.deployments, key=get_deployment_multiplier):
                 # Never preempt jobs.
                 if deployment.job_id:
+                    continue
+
+                # A server is bound to one validator. Do not mutate legacy/corrupt
+                # cross-validator deployments while making room for this chute.
+                if deployment.validator != chute.validator:
                     continue
 
                 # Never preempt non-preemptible (private) deployments.
@@ -1599,6 +1752,11 @@ class Gepetto:
                 f"Could not find a server with sufficient preemptable deployments for {chute.chute_id=}"
             )
             return False
+        try:
+            self._require_validator_match(chute, target_server)
+        except DeploymentFailure as exc:
+            logger.error(f"Refusing cross-validator preemption target: {exc}")
+            return False
 
         # Before we actually delete any deployments, let's ensure we can actually obtain the launch token,
         # because only one miner can claim a single job for example, so we don't want to undeploy if we
@@ -1634,18 +1792,20 @@ class Gepetto:
                 target_server.server_id,
                 token=launch_token["token"] if launch_token else None,
                 config_id=launch_token["config_id"] if launch_token else None,
+                job_id=job_id,
                 disk_gb=disk_gb,
                 extra_service_ports=extra_ports,
+                vm_version=self._server_vm_version(chute.validator, target_server.server_id),
             )
             logger.success(
-                f"Successfully deployed {chute.chute_id=} {job_id=} via preemption on {server.server_id=}: {deployment.deployment_id=}"
+                f"Successfully deployed {chute.chute_id=} {job_id=} via preemption on {target_server.server_id=}: {deployment.deployment_id=}"
             )
             if not launch_token:
                 await self.announce_deployment(deployment)
             return True
         except DeploymentFailure as exc:
             logger.error(
-                f"Error attempting to deploy {chute.chute_id=} {job_id=} on {server.server_id=} via preemption: {exc}\n{traceback.format_exc()}"
+                f"Error attempting to deploy {chute.chute_id=} {job_id=} on {target_server.server_id=} via preemption: {exc}\n{traceback.format_exc()}"
             )
             if deployment:
                 await self.undeploy(deployment.deployment_id)
@@ -1707,12 +1867,16 @@ class Gepetto:
                         )
                         deployment = None
                         try:
+                            self._require_validator_match(chute, server)
                             launch_token = await self.get_launch_token(chute)
                             deployment, _ = await k8s.deploy_chute(
                                 chute.chute_id,
                                 server.server_id,
                                 token=launch_token["token"] if launch_token else None,
                                 config_id=launch_token["config_id"] if launch_token else None,
+                                vm_version=self._server_vm_version(
+                                    chute.validator, server.server_id
+                                ),
                             )
                             logger.success(
                                 f"Successfully deployed {chute.chute_id=} on {server.server_id=}: {deployment.deployment_id=}"
@@ -1730,6 +1894,22 @@ class Gepetto:
                             break
 
             return scaled
+
+    @staticmethod
+    def _k8s_config_ids() -> Optional[set[str]]:
+        """Return observed config IDs, or None when the pod inventory is unavailable."""
+        try:
+            pods = K8sOperator().get_pods(label_selector="chutes/config-id")
+            return {pod.metadata.labels["chutes/config-id"] for pod in pods.items}
+        except Exception as exc:
+            logger.error(f"Failed to get pods by config-id label: {exc}")
+            return None
+
+    @staticmethod
+    def _config_id_is_orphaned(
+        config_id: Optional[str], k8s_config_ids: Optional[set[str]]
+    ) -> bool:
+        return bool(k8s_config_ids is not None and config_id and config_id not in k8s_config_ids)
 
     async def reconcile(self):
         """
@@ -1831,13 +2011,9 @@ class Gepetto:
                 f"Found {len(k8s_legacy_ids)} legacy deployment-based chutes: {k8s_legacy_ids}"
             )
 
-        # Get all pods with config_id labels for orphan detection
-        k8s_config_ids = set()
-        try:
-            pods = K8sOperator().get_pods(label_selector="chutes/config-id")
-            k8s_config_ids = {pod.metadata.labels["chutes/config-id"] for pod in pods.items}
-        except Exception as exc:
-            logger.error(f"Failed to get pods by config-id label: {exc}")
+        # A failed pod inventory is unknown, not an empty result: orphan cleanup
+        # must not turn a transient cluster failure into mass deletion.
+        k8s_config_ids = self._k8s_config_ids()
 
         # Build map of config_id -> instance from remote inventory.
         remote_by_config_id = {}
@@ -1925,8 +2101,9 @@ class Gepetto:
                                 f"Updating deployment {deployment.deployment_id} active status to {deployment.active}"
                             )
 
-                # Early check for orphaned deployments with config_id
-                if deployment.config_id and deployment.config_id not in k8s_config_ids:
+                # Early check for orphaned deployments with config_id.
+                # Skip if k8s_config_ids is None (pod scan failed) to avoid mass deletion.
+                if self._config_id_is_orphaned(deployment.config_id, k8s_config_ids):
                     logger.warning(
                         f"Deployment {deployment.deployment_id} has config_id={deployment.config_id} but no matching pod in k8s, cleaning up"
                     )

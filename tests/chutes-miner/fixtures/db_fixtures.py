@@ -19,8 +19,10 @@ def mock_db_session():
     mock_result = MagicMock()
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.return_value = []
+    mock_result.rowcount = 2
     session.execute = AsyncMock(return_value=mock_result)
     session.where = AsyncMock(return_value=mock_result)
+    session.flush = AsyncMock()
     session.commit = AsyncMock()
     session.delete = AsyncMock()
     session.refresh = AsyncMock()
@@ -49,7 +51,7 @@ def mock_refresh(obj: Any):
         gpu.server.verification_port = 8080
         gpu.server.configure_mock(name="test-node-name")
 
-# TODO: Update uses of mock_db_session from above to use this instead
+# New tests should prefer this fixture when they do not need a patched session factory.
 @pytest.fixture
 def get_mock_db_session():
 
@@ -65,8 +67,10 @@ def get_mock_db_session():
     mock_execute_result.scalars.return_value = mock_execute_result
     mock_execute_result.scalar_one_or_none.return_value = []
     mock_execute_result.all.return_value = []
+    mock_execute_result.rowcount = 2
     session.execute = AsyncMock(return_value=mock_execute_result)
     session.where = AsyncMock(return_value=mock_execute_result)
+    session.flush = AsyncMock()
     session.commit = AsyncMock()
     session.delete = AsyncMock()
     session.refresh = AsyncMock(side_effect=mock_refresh)

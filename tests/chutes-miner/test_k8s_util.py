@@ -34,6 +34,7 @@ def _make_inputs(version: str, tee: bool = False):
         image="parachutes/test:latest",
         gpu_count=1,
         tee=tee,
+        validator="test_validator",
     )
     server = SimpleNamespace(
         server_id="server-uid-1",
@@ -176,6 +177,7 @@ def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
     assert "CHUTES_HOST_ID" not in env
     assert env["CHUTES_API_URL"] == "http://test-api"
     assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
+    assert env["CHUTES_EXTERNAL_HOST"] == "10.0.0.10"
     assert job.spec.template.spec.containers[0].security_context.capabilities == {
         "add": ["IPC_LOCK"]
     }
@@ -196,4 +198,96 @@ def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim()
     env = _container_env(job)
     assert env["CHUTES_API_URL"] == "http://test-api"
     assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
+    assert env["CHUTES_EXTERNAL_HOST"] == "10.0.0.10"
     assert "CHUTES_HOST_ID" not in env
+
+
+@pytest.mark.parametrize(
+    ("vm_version", "uses_xet"),
+    [
+        ("1.3.0", False),
+        ("1.3.1", True),
+        ("1.8.0", True),
+        (None, False),
+        ("unknown", False),
+    ],
+)
+def test_build_tee_job_combines_vm_environment_with_launch_context(vm_version, uses_xet):
+    chute, server, _ = _make_inputs("0.8.0", tee=True)
+    job = build_chute_job(
+        deployment_id="deploy-gpu",
+        chute=chute,
+        server=server,
+        service=_make_tee_service(),
+        gpu_uuids=["GPU-UUID-1"],
+        probe_port=8000,
+        token="launch-token",
+        vm_version=vm_version,
+    )
+
+    env = _container_env(job)
+    assert env["CHUTES_API_URL"] == "http://test-api"
+    assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
+    assert env["CHUTES_EXTERNAL_HOST"] == server.ip_address
+    assert "CHUTES_HOST_ID" not in env
+    if uses_xet:
+        assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "16"
+        assert env["TOKIO_WORKER_THREADS"] == "8"
+        assert "HF_HUB_DISABLE_XET" not in env
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+    else:
+        assert env["HF_HUB_DISABLE_XET"] == "1"
+        assert env["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+        assert "HF_XET_FIXED_DOWNLOAD_CONCURRENCY" not in env
+        assert "TOKIO_WORKER_THREADS" not in env
+
+
+def test_build_job_without_launch_token_keeps_api_context_only():
+    chute, server, service = _make_inputs("0.8.0")
+    job = build_chute_job(
+        deployment_id="deploy-gpu",
+        chute=chute,
+        server=server,
+        service=service,
+        gpu_uuids=["GPU-UUID-1"],
+        probe_port=8000,
+    )
+
+    env = _container_env(job)
+    assert env["CHUTES_API_URL"] == "http://test-api"
+    assert "CHUTES_LAUNCH_JWT" not in env
+    assert "CHUTES_EXTERNAL_HOST" not in env
+    assert "CHUTES_HOST_ID" not in env
+    assert "--graval-seed" in job.spec.template.spec.containers[0].command
+
+
+def test_build_job_rejects_validator_mismatch():
+    chute, server, service = _make_inputs("0.8.0")
+    chute.validator = "different-validator"
+
+    with pytest.raises(ValueError, match="does not match"):
+        build_chute_job(
+            deployment_id="deploy-gpu",
+            chute=chute,
+            server=server,
+            service=service,
+            gpu_uuids=["GPU-UUID-1"],
+            probe_port=8000,
+            token="launch-token",
+        )
+
+
+def test_build_job_rejects_unknown_validator():
+    chute, server, service = _make_inputs("0.8.0")
+    chute.validator = server.validator = "unknown-validator"
+
+    with pytest.raises(ValueError, match="No configured validator API"):
+        build_chute_job(
+            deployment_id="deploy-gpu",
+            chute=chute,
+            server=server,
+            service=service,
+            gpu_uuids=["GPU-UUID-1"],
+            probe_port=8000,
+            token="launch-token",
+        )

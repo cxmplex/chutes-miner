@@ -21,7 +21,6 @@ from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.constants import (
     CHUTE_DEPLOY_PREFIX,
     SEARCH_DEPLOYMENTS_PATH,
-    SEARCH_NODES_PATH,
     SEARCH_PODS_PATH,
 )
 from chutes_miner.api.k8s.operator import K8sOperator, MultiClusterK8sOperator
@@ -732,6 +731,7 @@ async def test_deploy_chute_success(
     mock_deployment_db = MagicMock(spec=Deployment)
     mock_deployment_db.deployment_id = pods[0]["metadata"]["labels"]["chutes/deployment-id"]
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, mock_deployment_db]
     mock_db_session.execute = AsyncMock(return_value=mock_result)
@@ -818,6 +818,7 @@ async def test_deploy_chute_deployment_disappeared(
     # Setup session mock to return None for deployment
     # Setup session mock for deployment retrieval
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, None, None]
     mock_db_session.execute = AsyncMock(return_value=mock_result)
@@ -861,6 +862,7 @@ async def test_deploy_chute_api_exception(
     mock_deployment_db = MagicMock(spec=Deployment)
     mock_deployment_db.deployment_id = uuid.uuid4()
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, mock_deployment_db]
     mock_db_session.execute = AsyncMock(return_value=mock_result)

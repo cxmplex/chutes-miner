@@ -1,5 +1,4 @@
 # Fixtures for commonly used objects
-from re import L
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -163,7 +162,7 @@ def sample_server():
     server = Server(
         server_id="test-server-id",
         name="test-node",
-        validator="TEST123",
+        validator="test_validator",
         ip_address="192.168.1.100",
         cpu_per_gpu=4,
         memory_per_gpu=16,
@@ -182,6 +181,7 @@ def sample_server():
 def sample_chute():
     return Chute(
         chute_id="test-chute-id",
+        validator="test_validator",
         version="1.0.0",
         filename="app.py",
         code="print('Hello World')",
@@ -604,7 +604,7 @@ def create_api_test_pods():
                             ],
                         }
                     ],
-                    "nodeName": f"test-node",
+                    "nodeName": "test-node",
                     "restartPolicy": "Always",
                     "serviceAccount": f"{base_name}-sa",
                     "serviceAccountName": f"{base_name}-sa",

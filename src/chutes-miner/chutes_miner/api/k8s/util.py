@@ -34,6 +34,25 @@ from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.util import semcomp
 
 
+def resolve_deployment_validator(chute: Chute, server: Server):
+    """Return the configured validator only for an exact chute/server match."""
+    chute_validator = chute.validator
+    server_validator = server.validator
+    if not chute_validator:
+        raise ValueError(f"Chute {chute.chute_id} has no validator.")
+    if not server_validator:
+        raise ValueError(f"Server {server.server_id} has no validator.")
+    if chute_validator != server_validator:
+        raise ValueError(
+            f"Chute {chute.chute_id} validator {chute_validator!r} does not match "
+            f"server {server.server_id} validator {server_validator!r}."
+        )
+    validator = validator_by_hotkey(chute_validator)
+    if validator is None:
+        raise ValueError(f"No configured validator API for hotkey {chute_validator!r}.")
+    return validator
+
+
 def _requires_code_volume(chute: Chute) -> bool:
     if chute.tee:
         return False
@@ -58,14 +77,11 @@ def build_chute_job(
     job_id: Optional[str] = None,
     config_id: Optional[str] = None,
     disk_gb: int = 10,
+    vm_version: Optional[str] = None,
 ) -> V1Job:
     cpu = str(server.cpu_per_gpu * chute.gpu_count)
     ram = str(server.memory_per_gpu * chute.gpu_count) + "Gi"
-    validator = validator_by_hotkey(server.validator)
-    if validator is None:
-        raise ValueError(
-            f"No configured validator API for hotkey {server.validator!r}."
-        )
+    validator = resolve_deployment_validator(chute, server)
     deployment_labels = {
         "chutes/deployment-id": deployment_id,
         "chutes/chute": "true",
@@ -135,23 +151,33 @@ def build_chute_job(
     ]
 
     if chute.tee:
-        extra_env += [
-            V1EnvVar(
-                name="HF_HUB_DISABLE_XET",
-                value="1",
-            ),
-            V1EnvVar(
-                name="HF_HUB_ENABLE_HF_TRANSFER",
-                value="1",
-            ),
-        ]
+        if vm_version and semcomp(vm_version, "1.3.1") >= 0:
+            extra_env += [
+                V1EnvVar(
+                    name="HF_XET_FIXED_DOWNLOAD_CONCURRENCY",
+                    value="16",
+                ),
+                V1EnvVar(
+                    name="TOKIO_WORKER_THREADS",
+                    value="8",
+                ),
+            ]
+        else:
+            extra_env += [
+                V1EnvVar(
+                    name="HF_HUB_DISABLE_XET",
+                    value="1",
+                ),
+                V1EnvVar(
+                    name="HF_HUB_ENABLE_HF_TRANSFER",
+                    value="1",
+                ),
+            ]
 
     code_volumes = []
     code_volume_mounts = []
     if attach_code_volume:
-        code_uuid = str(
-            uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}")
-        )
+        code_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.chute_id}::{chute.version}"))
         code_volumes = [
             V1Volume(
                 name="code",
@@ -218,9 +244,7 @@ def build_chute_job(
                         ),
                         V1Volume(
                             name="shm",
-                            empty_dir=V1EmptyDirVolumeSource(
-                                medium="Memory", size_limit="16Gi"
-                            ),
+                            empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
                         ),
                     ],
                     init_containers=[
@@ -408,12 +432,8 @@ def build_chute_service(
                 "chutes/deployment-id": deployment_id,
             },
             ports=[
-                V1ServicePort(
-                    port=8000, target_port=8000, protocol="TCP", name="chute-8000"
-                ),
-                V1ServicePort(
-                    port=8001, target_port=8001, protocol="TCP", name="chute-8001"
-                ),
+                V1ServicePort(port=8000, target_port=8000, protocol="TCP", name="chute-8000"),
+                V1ServicePort(port=8001, target_port=8001, protocol="TCP", name="chute-8001"),
                 *(
                     [
                         V1ServicePort(

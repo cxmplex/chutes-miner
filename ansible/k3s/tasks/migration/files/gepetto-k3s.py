@@ -47,6 +47,23 @@ class Gepetto:
         self._restart_lock = asyncio.Lock()
         self.setup_handlers()
 
+    @staticmethod
+    def _validator_matches(chute: Chute, server: Server) -> bool:
+        if not chute.validator or validator_by_hotkey(chute.validator) is None:
+            logger.error(
+                f"Refusing deployment for {chute.chute_id=}: "
+                f"validator {chute.validator!r} is not configured"
+            )
+            return False
+        if server.validator != chute.validator:
+            logger.error(
+                f"Refusing deployment for {chute.chute_id=}: validator "
+                f"{chute.validator!r} does not match server {server.server_id} "
+                f"validator {server.validator!r}"
+            )
+            return False
+        return True
+
     def setup_handlers(self):
         """
         Configure the various event listeners/handlers.
@@ -669,6 +686,12 @@ class Gepetto:
         )
         deployment = None
         try:
+            if (
+                not self._validator_matches(chute, server)
+                or validator.hotkey != chute.validator
+            ):
+                await self.release_job(chute, job_id)
+                return
             launch_token = await self.get_launch_token(chute, job_id=job_id)
             extra_ports = await self._get_job_extra_services(chute)
             deployment, k8s_dep = await k8s.deploy_chute(
@@ -724,7 +747,14 @@ class Gepetto:
         # Upsert the chute in the local DB.
         async with get_session() as db:
             chute = (
-                (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
+                (
+                    await db.execute(
+                        select(Chute).where(
+                            Chute.chute_id == chute_id,
+                            Chute.validator == validator_hotkey,
+                        )
+                    )
+                )
                 .unique()
                 .scalar_one_or_none()
             )
@@ -1117,12 +1147,15 @@ class Gepetto:
             # Remove the instance/deployment.
             server_id = None
             server_gpu_type = None
+            server_validator = None
             async with get_session() as session:
                 deployment = (
                     (
                         await session.execute(
                             select(Deployment).where(
                                 Deployment.instance_id == instance_id,
+                                Deployment.chute_id == chute_id,
+                                Deployment.validator == validator_hotkey,
                                 Deployment.job_id.is_(None),
                             )
                         )
@@ -1133,6 +1166,14 @@ class Gepetto:
                 if deployment:
                     server_id = deployment.server.server_id
                     server_gpu_type = deployment.server.gpus[0].model_short_ref
+                    server_validator = deployment.server.validator
+                    if server_validator != validator_hotkey:
+                        logger.error(
+                            f"Refusing rolling update for {instance_id=}: deployment validator "
+                            f"{validator_hotkey!r} does not match server validator "
+                            f"{server_validator!r}"
+                        )
+                        return
                     await self.undeploy(deployment.deployment_id)
 
             # Make sure the local chute is updated.
@@ -1152,7 +1193,14 @@ class Gepetto:
 
                 async with get_session() as db:
                     chute = (
-                        (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
+                        (
+                            await db.execute(
+                                select(Chute).where(
+                                    Chute.chute_id == chute_id,
+                                    Chute.validator == validator_hotkey,
+                                )
+                            )
+                        )
                         .unique()
                         .scalar_one_or_none()
                     )
@@ -1193,7 +1241,11 @@ class Gepetto:
             logger.info(
                 f"Determining if we can deploy {chute.chute_id=} on {server_id=} with {server_gpu_type=} and supported={chute.supported_gpus}"
             )
-            if server_id and server_gpu_type in chute.supported_gpus:
+            if (
+                server_id
+                and server_validator == chute.validator
+                and server_gpu_type in chute.supported_gpus
+            ):
                 logger.info(f"Attempting to deploy {chute.chute_id=} on {server_id=}")
                 deployment = None
                 try:
@@ -1247,6 +1299,8 @@ class Gepetto:
             .join(gpu_counts, Server.server_id == gpu_counts.c.server_id)
             .where(Server.locked.is_(False))
             .where(Deployment.chute_id == chute.chute_id)
+            .where(Deployment.validator == chute.validator)
+            .where(Server.validator == chute.validator)
             .where(Deployment.job_id.is_(None))  # Don't scale down job deployments
             .where(Deployment.created_at <= func.now() - timedelta(minutes=5))
             .order_by(text("removal_score DESC"))
@@ -1262,6 +1316,12 @@ class Gepetto:
         """
         if chute.ban_reason:
             logger.warning(f"Will not scale up banned chute {chute.chute_id=}: {chute.ban_reason=}")
+            return None
+        if not chute.validator or validator_by_hotkey(chute.validator) is None:
+            logger.error(
+                f"Will not select a server for {chute.chute_id=}: "
+                f"validator {chute.validator!r} is not configured"
+            )
             return None
         supported_gpus = list(chute.supported_gpus)
         total_gpus_per_server = (
@@ -1309,12 +1369,15 @@ class Gepetto:
                     >= chute.gpu_count
                 ),
                 Server.locked.is_(False),
+                Server.validator == chute.validator,
             )
             .order_by(Server.hourly_cost.asc(), text("free_gpus ASC"))
         )
         async with get_session() as session:
             servers = (await session.execute(query)).unique().scalars().all()
             for server in servers:
+                if not Gepetto._validator_matches(chute, server):
+                    continue
                 if await k8s.check_node_has_disk_available(server.name, disk_gb):
                     return server
         return None
@@ -1326,6 +1389,12 @@ class Gepetto:
         if chute.ban_reason:
             logger.warning(
                 f"Refusing to perform a preempting deploy of banned chute {chute.chute_id=}: {chute.ban_reason=}"
+            )
+            return
+        if not chute.validator or validator_by_hotkey(chute.validator) is None:
+            logger.error(
+                f"Refusing to preempt for {chute.chute_id=}: "
+                f"validator {chute.validator!r} is not configured"
             )
             return
 
@@ -1403,6 +1472,7 @@ class Gepetto:
                 GPU.verified.is_(True),
                 total_gpus_per_server.c.total_gpus >= chute.gpu_count,
                 Server.locked.is_(False),
+                Server.validator == chute.validator,
             )
             .order_by(Server.hourly_cost.asc(), text("free_gpus ASC"))
         )
@@ -1416,7 +1486,8 @@ class Gepetto:
         servers = [
             server
             for server in servers
-            if await k8s.check_node_has_disk_available(server.name, disk_gb)
+            if self._validator_matches(chute, server)
+            and await k8s.check_node_has_disk_available(server.name, disk_gb)
         ]
 
         # Iterate through servers to see if any *could* handle preemption.
@@ -1442,6 +1513,8 @@ class Gepetto:
                 # Never preempt jobs.
                 if deployment.job_id:
                     logger.warning(f"Cannot preempt job deployments: {deployment.job_id=}")
+                    continue
+                if deployment.validator != chute.validator:
                     continue
 
                 # Make sure we aren't pointlessly preempting (already have a deployment in progress).
@@ -1504,6 +1577,8 @@ class Gepetto:
                 f"Could not find a server with sufficient preemptable deployments for {chute.chute_id=}"
             )
             return
+        if not self._validator_matches(chute, target_server):
+            return
 
         # Before we actually delete any deployments, let's ensure we can actually obtain the launch token,
         # because only one miner can claim a single job for example, so we don't want to undeploy if we
@@ -1537,9 +1612,9 @@ class Gepetto:
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 target_server.server_id,
-                deployment_id,
                 token=launch_token["token"] if launch_token else None,
                 config_id=launch_token["config_id"] if launch_token else None,
+                job_id=job_id,
                 disk_gb=disk_gb,
                 extra_service_ports=extra_ports,
             )
@@ -1608,6 +1683,8 @@ class Gepetto:
                         )
                         deployment = None
                         try:
+                            if not self._validator_matches(chute, server):
+                                return
                             launch_token = await self.get_launch_token(chute)
                             deployment, _ = await k8s.deploy_chute(
                                 chute.chute_id,

@@ -503,6 +503,7 @@ async def test_deploy_chute_success(
     mock_deployment_db = MagicMock(spec=Deployment)
     mock_deployment_db.deployment_id = uuid.uuid4()
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, mock_deployment_db]
     mock_db_session.execute = AsyncMock(return_value=mock_result)
@@ -571,6 +572,7 @@ async def test_deploy_chute_deployment_disappeared(
     # Setup session mock to return None for deployment
     # Setup session mock for deployment retrieval
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, None, None]
     mock_db_session.execute = AsyncMock(return_value=mock_result)
@@ -600,6 +602,7 @@ async def test_deploy_chute_api_exception(
     mock_deployment_db = MagicMock(spec=Deployment)
     mock_deployment_db.deployment_id = uuid.uuid4()
     mock_result = MagicMock()
+    mock_result.rowcount = sample_chute.gpu_count
     mock_result.unique.return_value = mock_result
     mock_result.scalar_one_or_none.side_effect = [sample_chute, sample_server, mock_deployment_db]
     mock_db_session.execute = AsyncMock(return_value=mock_result)
