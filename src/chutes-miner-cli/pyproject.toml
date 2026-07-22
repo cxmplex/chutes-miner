@@ -11,6 +11,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.10",
 ]
+include = ["chutes_miner_cli/data/l0-publisher-keys.json"]
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -24,6 +25,7 @@ typer = "^0.14.0"
 click = ">8.1.0,<8.2.0"
 aiohttp = {extras = ["speedups"], version = ">3.10,<4"}
 pyyaml = "^6.0.3"
+cryptography = "^49.0.0"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.12.2"

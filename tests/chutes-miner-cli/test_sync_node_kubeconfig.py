@@ -43,6 +43,14 @@ def _write_initial_kubeconfig(path: str, server_value: str):
         yaml.safe_dump(config, fh)
 
 
+@pytest.fixture(autouse=True)
+def _confirm_kubeconfig_write(monkeypatch):
+    monkeypatch.setattr(
+        "chutes_miner_cli.cli.typer.confirm",
+        lambda *_args, **_kwargs: True,
+    )
+
+
 def test_sync_node_kubeconfig_adds_context(
     mock_hotkey_content,
     mock_get_client_session,

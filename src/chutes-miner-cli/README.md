@@ -15,6 +15,34 @@ This CLI ships with helpers for managing kubeconfigs when operating miner cluste
 
 ---
 
+## Seedless Model-B L0
+
+The `l0` command group never accepts artifact hashes, provider credentials, or miner seed text.
+It signs API requests with the local hotkey JSON without printing `secretSeed`, verifies the
+publisher-signed bootstrap contract against the public key packaged with this CLI, rehashes every
+remote L0 artifact, and writes provider-ready raw iPXE as mode 0600.
+
+```bash
+chutes-miner l0 prepare-boot \
+  --host-id l0-example \
+  --tee-type tdx \
+  --data-device /dev/nvme0n1 \
+  --data-device-id nvme-EXACT_DEVICE_ID \
+  --validator-ca-url https://objects.example/validator-ca.crt \
+  --hotkey ~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>.json \
+  --output ./enroll.ipxe
+
+chutes-miner l0 enrollment-status --host-id l0-example --hotkey <hotkey.json>
+
+chutes-miner l0 complete-enrollment \
+  --host-id l0-example \
+  --pcs-key-file /run/secrets/intel-pcs-key \
+  --hotkey <hotkey.json>
+```
+
+`prepare-boot --wait --steady-output ./steady.ipxe` waits for enrollment and PCS acknowledgement,
+then writes a voucher-free steady-state script. A wiped CHUTES_DATA disk requires a new voucher.
+
 ## `sync-kubeconfig`
 
 Fetches the merged kubeconfig for **all** nodes that have already been registered with the miner API.
