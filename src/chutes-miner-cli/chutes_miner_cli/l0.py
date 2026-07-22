@@ -15,7 +15,8 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from urllib.parse import urlencode, urlsplit
 
 import aiohttp
@@ -29,8 +30,6 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from substrateinterface import Keypair
-
 from chutes_miner_cli.constants import (
     HOTKEY_ENVVAR,
     HOTKEY_HEADER,
@@ -39,15 +38,21 @@ from chutes_miner_cli.constants import (
     VALIDATOR_API_ENVVAR,
 )
 
+if TYPE_CHECKING:
+    from substrateinterface import Keypair
+
 l0_app = typer.Typer(
     name="l0",
     help="Prepare and enroll seedless confidential-compute L0 hosts.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 
 SIG_VERSION_HEADER = "X-Chutes-Sig-Version"
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024**3
+DEFAULT_WAIT_TIMEOUT_SECONDS = 1800
+POLL_INTERVAL_SECONDS = 5
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CHANNEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -79,6 +84,8 @@ def canonical_json_bytes(value: Dict[str, Any]) -> bytes:
 
 
 def _load_hotkey(path: str) -> tuple[Dict[str, Any], Keypair]:
+    from substrateinterface import Keypair
+
     try:
         metadata = os.lstat(path)
         if (
@@ -151,8 +158,7 @@ async def _api_request(
 def _require_success(status_code: int, payload: Any, operation: str) -> Any:
     if 200 <= status_code < 300:
         return payload
-    detail = payload.get("detail") if isinstance(payload, dict) else payload
-    raise L0CliError(f"{operation} failed ({status_code}): {detail}")
+    raise L0CliError(f"{operation} failed with HTTP status {status_code}")
 
 
 def _validate_artifact_url(value: Any) -> str:
@@ -289,6 +295,11 @@ def verify_bootstrap(
     manifest_fields = set(manifest)
     if manifest_fields != required and manifest_fields != required | {"release_id"}:
         raise L0CliError("L0 bootstrap manifest fields are not canonical")
+    if "release_id" in manifest and (
+        not isinstance(manifest["release_id"], str)
+        or not _ID.fullmatch(manifest["release_id"])
+    ):
+        raise L0CliError("L0 bootstrap release_id must be absent or canonical")
     if (
         manifest.get("schema") != "chutes.l0-bootstrap"
         or manifest.get("version") != 1
@@ -638,6 +649,62 @@ async def _status(
     return _require_success(status_code, payload, "fetch enrollment status")
 
 
+async def _wait_for_ready(
+    session: aiohttp.ClientSession,
+    validator_api: str,
+    hotkey: str,
+    host_id: str,
+    *,
+    expected_generation: int,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise L0CliError("timed out waiting for enrollment readiness")
+        try:
+            status_payload = await asyncio.wait_for(
+                _status(session, validator_api, hotkey, host_id),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            raise L0CliError("timed out waiting for enrollment readiness") from exc
+        if status_payload is not None:
+            if not isinstance(status_payload, dict):
+                raise L0CliError("validator returned an invalid enrollment status")
+            generation = status_payload.get("enrollment_generation")
+            state = status_payload.get("provisioning_state")
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or state
+                not in {
+                    "persisting_identity",
+                    "awaiting_pcs",
+                    "ready",
+                    "revoked",
+                }
+            ):
+                raise L0CliError("validator returned an invalid enrollment status")
+            if state == "revoked":
+                raise L0CliError("host enrollment was revoked")
+            if generation > expected_generation:
+                raise L0CliError(
+                    "enrollment voucher generation is stale; a newer generation is active"
+                )
+            if generation == expected_generation and state == "ready":
+                return status_payload
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise L0CliError("timed out waiting for enrollment readiness")
+        await asyncio.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+
+
+def _print_cli_error(message: str) -> None:
+    typer.echo(f"Error: {message}", err=True)
+
+
 @l0_app.command("prepare-boot")
 def prepare_boot(
     host_id: str = typer.Option(..., "--host-id"),
@@ -653,7 +720,14 @@ def prepare_boot(
     bootif: str = typer.Option("", "--bootif"),
     rotate_identity: bool = typer.Option(False, "--rotate-identity"),
     wait: bool = typer.Option(False, "--wait"),
-    steady_output: Optional[Path] = typer.Option(None, "--steady-output"),
+    wait_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--wait-timeout-seconds",
+        min=1,
+        max=86400,
+        help="Finite readiness polling deadline; valid only with --wait.",
+    ),
+    steady_output: Path = typer.Option(..., "--steady-output"),
     hotkey: str = typer.Option(..., "--hotkey", envvar=HOTKEY_ENVVAR),
     validator_api: str = typer.Option(
         "https://api.chutes.ai", "--validator-api", envvar=VALIDATOR_API_ENVVAR
@@ -667,6 +741,22 @@ def prepare_boot(
             raise L0CliError("--tee-type must be tdx or sev-snp")
         if not _ID.fullmatch(host_id) or not _CHANNEL.fullmatch(channel):
             raise L0CliError("host id or channel has an invalid format")
+        if output.expanduser().absolute() == steady_output.expanduser().absolute():
+            raise L0CliError("--output and --steady-output must be different files")
+        if wait_timeout_seconds is not None and not wait:
+            raise L0CliError("--wait-timeout-seconds requires --wait")
+        for option_name, value, maximum in (
+            ("--provider", provider, 64),
+            ("--source", source, 128),
+        ):
+            if value is not None and (
+                not 1 <= len(value) <= maximum
+                or any(
+                    ord(character) < 0x20 or ord(character) > 0x7E
+                    for character in value
+                )
+            ):
+                raise L0CliError(f"{option_name} has an invalid format")
         if not re.fullmatch(
             r"/dev/[A-Za-z0-9._:+-]{1,128}", data_device
         ) or not re.fullmatch(r"[A-Za-z0-9._:+-]{1,255}", data_device_id):
@@ -706,10 +796,12 @@ def prepare_boot(
                 "tee_type": normalized_tee,
                 "channel": channel,
                 "expires_in_seconds": 900,
-                "provider": provider,
-                "source": source,
                 "source_metadata": {},
             }
+            if provider is not None:
+                request["provider"] = provider
+            if source is not None:
+                request["source"] = source
             target = "/hosts/enrollment-vouchers"
             status_code, voucher_result = await _api_request(
                 session, validator_api, hotkey, "POST", target, request
@@ -745,22 +837,7 @@ def prepare_boot(
                 cmdline=signed_cmdline,
             )
             write_private(output, enrollment_script.encode("ascii"))
-            typer.echo(str(output))
-            if not wait:
-                return
-            if steady_output is None:
-                raise L0CliError("--wait requires --steady-output")
             expected_generation = int(voucher_result["claims"]["enrollment_generation"])
-            while True:
-                status_payload = await _status(session, validator_api, hotkey, host_id)
-                if (
-                    status_payload is not None
-                    and status_payload.get("provisioning_state") == "ready"
-                    and status_payload.get("enrollment_generation")
-                    == expected_generation
-                ):
-                    break
-                await asyncio.sleep(5)
             steady_script = render_ipxe(
                 manifest,
                 manifest_signature=manifest_signature,
@@ -781,13 +858,34 @@ def prepare_boot(
                 cmdline=signed_cmdline,
             )
             write_private(steady_output, steady_script.encode("ascii"))
+            typer.echo(str(output))
             typer.echo(str(steady_output))
+            if wait:
+                await _wait_for_ready(
+                    session,
+                    validator_api,
+                    hotkey,
+                    host_id,
+                    expected_generation=expected_generation,
+                    timeout_seconds=(
+                        wait_timeout_seconds
+                        if wait_timeout_seconds is not None
+                        else DEFAULT_WAIT_TIMEOUT_SECONDS
+                    ),
+                )
+                typer.echo(f"Enrollment ready for {host_id}")
 
     try:
         asyncio.run(execute())
-    except (L0CliError, aiohttp.ClientError, OSError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1)
+    except L0CliError as exc:
+        _print_cli_error(str(exc))
+        raise typer.Exit(1) from None
+    except (aiohttp.ClientError, OSError):
+        _print_cli_error("local file or network operation failed")
+        raise typer.Exit(1) from None
+    except Exception:
+        _print_cli_error("prepare-boot failed unexpectedly")
+        raise typer.Exit(1) from None
 
 
 @l0_app.command("enrollment-status")
@@ -807,9 +905,15 @@ def enrollment_status(
 
     try:
         asyncio.run(execute())
-    except (L0CliError, aiohttp.ClientError, OSError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1)
+    except L0CliError as exc:
+        _print_cli_error(str(exc))
+        raise typer.Exit(1) from None
+    except (aiohttp.ClientError, OSError):
+        _print_cli_error("local file or network operation failed")
+        raise typer.Exit(1) from None
+    except Exception:
+        _print_cli_error("enrollment-status failed unexpectedly")
+        raise typer.Exit(1) from None
 
 
 def _pcs_envelope(
@@ -911,9 +1015,15 @@ def complete_enrollment(
 
     try:
         asyncio.run(execute())
-    except (L0CliError, aiohttp.ClientError, OSError, UnicodeDecodeError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1)
+    except L0CliError as exc:
+        _print_cli_error(str(exc))
+        raise typer.Exit(1) from None
+    except (aiohttp.ClientError, OSError, UnicodeDecodeError):
+        _print_cli_error("local file, network, or PCS input operation failed")
+        raise typer.Exit(1) from None
+    except Exception:
+        _print_cli_error("complete-enrollment failed unexpectedly")
+        raise typer.Exit(1) from None
 
 
 def register(app: typer.Typer) -> None:

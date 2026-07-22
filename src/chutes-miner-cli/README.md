@@ -30,7 +30,8 @@ chutes-miner l0 prepare-boot \
   --data-device-id nvme-EXACT_DEVICE_ID \
   --validator-ca-url https://objects.example/validator-ca.crt \
   --hotkey ~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>.json \
-  --output ./enroll.ipxe
+  --output ./enroll.ipxe \
+  --steady-output ./steady.ipxe
 
 chutes-miner l0 enrollment-status --host-id l0-example --hotkey <hotkey.json>
 
@@ -40,8 +41,47 @@ chutes-miner l0 complete-enrollment \
   --hotkey <hotkey.json>
 ```
 
-`prepare-boot --wait --steady-output ./steady.ipxe` waits for enrollment and PCS acknowledgement,
-then writes a voucher-free steady-state script. A wiped CHUTES_DATA disk requires a new voucher.
+`prepare-boot` always writes both the one-use enrollment script and the voucher-free steady-state
+script. Add `--wait` to poll readiness with a finite monotonic deadline; it does not delay either
+output. A wiped CHUTES_DATA disk requires a new voucher.
+
+### Latitude and OVH provider adapters
+
+Both adapters accept only an already verified mode-`0600` iPXE file. They never accept a wallet
+seed, PCS key, PCCS password, or provider credential as a command-line argument.
+
+Latitude reinstall erases CHUTES_DATA and therefore uses the enrollment script:
+
+```bash
+export LATITUDESH_BEARER_FILE=/run/secrets/latitude-api-token
+chutes-miner l0 latitude-reinstall \
+  --server-id sv_EXAMPLE \
+  --hostname l0-example \
+  --ipxe-file ./enroll.ipxe \
+  --wait
+```
+
+`LATITUDESH_BEARER` is also accepted from a protected process environment. The adapter submits the
+documented JSON:API reinstall request with `operating_system=ipxe`, then reports only the provider
+server status. `failed_deployment` fails immediately.
+
+OVH retains CHUTES_DATA across the normal custom-boot flow, so use the enrollment script once and
+the steady script on subsequent boots:
+
+```bash
+export OVH_BEARER_TOKEN_FILE=/run/secrets/ovh-access-token
+chutes-miner l0 ovh-boot \
+  --service-name nsXXXXXXX.ip-XXX-XXX-XXX.us \
+  --ipxe-file ./enroll.ipxe \
+  --reboot \
+  --wait
+```
+
+`OVH_BEARER_TOKEN` is also accepted from a protected process environment. The adapter writes the
+exact inline `bootScript`, reads it back byte-for-byte, then starts the documented hard-reboot task
+and reports only its ID, function, and status. Obtain the bearer token from an OVHcloud US service
+account with a policy limited to the target dedicated server. Generate a fresh enrollment script
+after a disk wipe or credential rotation.
 
 ## `sync-kubeconfig`
 

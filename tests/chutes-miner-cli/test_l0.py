@@ -1,9 +1,13 @@
+import asyncio
 import base64
 import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -103,6 +107,20 @@ def test_manifest_signature_tamper_and_expiry(monkeypatch):
         )
 
 
+def test_manifest_rejects_explicit_null_release_id(monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(l0, "_publisher_registry", lambda: _registry(private_key, now))
+    signed = _signed_manifest(private_key, now)
+    signed["manifest"]["release_id"] = None
+    signed["signature"] = base64.b64encode(
+        private_key.sign(l0.canonical_json_bytes(signed["manifest"]))
+    ).decode()
+
+    with pytest.raises(l0.L0CliError, match="absent or canonical"):
+        l0.verify_bootstrap(signed, tee_type="tdx", channel="stable", now=now)
+
+
 def test_missing_packaged_publisher_registry_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(l0.importlib.resources, "files", lambda _package: tmp_path)
     with pytest.raises(l0.L0CliError, match="release packaging is incomplete"):
@@ -149,6 +167,214 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
     output = tmp_path / "boot.ipxe"
     l0.write_private(output, script.encode())
     assert os.stat(output).st_mode & 0o777 == 0o600
+
+
+def test_prepare_boot_always_writes_enrollment_and_steady_scripts(
+    tmp_path, monkeypatch
+):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    signed = _signed_manifest(private_key, now)
+    voucher = {
+        "schema": "chutes.host-enrollment-voucher",
+        "version": 1,
+        "voucher": "voucher.secret",
+        "claims": {
+            "host_id": "host-1",
+            "enrollment_generation": 7,
+        },
+    }
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fetch = AsyncMock(
+        return_value=(
+            signed["manifest"],
+            "kvm_intel.tdx=1 nohibernate",
+            signed["signature"],
+        )
+    )
+    request = AsyncMock(return_value=(200, voucher))
+    monkeypatch.setattr(l0.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(l0, "_fetch_verified_bootstrap", fetch)
+    monkeypatch.setattr(l0, "_api_request", request)
+
+    enrollment = tmp_path / "enrollment.ipxe"
+    steady = tmp_path / "steady.ipxe"
+    l0.prepare_boot(
+        host_id="host-1",
+        tee_type="tdx",
+        data_device="/dev/nvme0n1",
+        data_device_id="nvme-test",
+        output=enrollment,
+        validator_ca_url="https://objects.example.com/validator-ca.crt",
+        socket_url="wss://ws.example.com",
+        channel="stable",
+        provider=None,
+        source=None,
+        bootif="",
+        rotate_identity=False,
+        wait=False,
+        wait_timeout_seconds=None,
+        steady_output=steady,
+        hotkey="/unused",
+        validator_api="https://api.example.com",
+    )
+
+    assert enrollment.is_file()
+    assert steady.is_file()
+    assert "voucher.secret" not in steady.read_text()
+    assert "chutes_data_initialize=true" in enrollment.read_text()
+    assert "chutes_data_initialize=false" in steady.read_text()
+    encoded = re.search(
+        r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
+        enrollment.read_text(),
+    ).group(1)
+    enrollment_config = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
+    assert enrollment_config["voucher"] == "voucher.secret"
+    mint_document = request.await_args.args[-1]
+    assert "provider" not in mint_document
+    assert "source" not in mint_document
+
+
+@pytest.mark.parametrize(
+    "status_payload, message",
+    [
+        (
+            {
+                "enrollment_generation": 4,
+                "provisioning_state": "revoked",
+            },
+            "revoked",
+        ),
+        (
+            {
+                "enrollment_generation": 5,
+                "provisioning_state": "ready",
+            },
+            "stale",
+        ),
+    ],
+)
+def test_wait_fails_immediately_for_revoked_or_newer_generation(
+    status_payload, message, monkeypatch
+):
+    monkeypatch.setattr(l0, "_status", AsyncMock(return_value=status_payload))
+    with pytest.raises(l0.L0CliError, match=message):
+        asyncio.run(
+            l0._wait_for_ready(
+                object(),
+                "https://api.example.com",
+                "/unused",
+                "host-1",
+                expected_generation=4,
+                timeout_seconds=30,
+            )
+        )
+
+
+def test_wait_uses_finite_monotonic_deadline(monkeypatch):
+    monkeypatch.setattr(l0, "_status", AsyncMock(return_value=None))
+    monotonic = iter((100.0, 100.0, 101.0))
+    monkeypatch.setattr(l0, "monotonic", lambda: next(monotonic))
+    sleep = AsyncMock()
+    monkeypatch.setattr(l0.asyncio, "sleep", sleep)
+
+    with pytest.raises(l0.L0CliError, match="timed out"):
+        asyncio.run(
+            l0._wait_for_ready(
+                object(),
+                "https://api.example.com",
+                "/unused",
+                "host-1",
+                expected_generation=1,
+                timeout_seconds=1,
+            )
+        )
+    sleep.assert_not_awaited()
+
+
+def test_wait_cancels_a_stalled_status_request(monkeypatch):
+    async def stalled_status(*_args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(l0, "_status", stalled_status)
+    with pytest.raises(l0.L0CliError, match="timed out"):
+        asyncio.run(
+            l0._wait_for_ready(
+                object(),
+                "https://api.example.com",
+                "/unused",
+                "host-1",
+                expected_generation=1,
+                timeout_seconds=0.01,
+            )
+        )
+
+
+def test_cli_exception_boundaries_never_render_secret_locals():
+    script = r"""
+from pathlib import Path
+from typer.testing import CliRunner
+from chutes_miner_cli import l0
+from chutes_miner_cli.cli import app
+
+runner = CliRunner()
+
+def bootstrap_failure(_value):
+    secretSeed = "SECRET_SEED_CANARY"
+    raise RuntimeError("bootstrap failure")
+
+l0._validate_artifact_url = bootstrap_failure
+first = runner.invoke(app, [
+    "l0", "prepare-boot",
+    "--host-id", "host-1",
+    "--tee-type", "tdx",
+    "--data-device", "/dev/nvme0n1",
+    "--data-device-id", "nvme-test",
+    "--output", "/tmp/enrollment.ipxe",
+    "--steady-output", "/tmp/steady.ipxe",
+    "--validator-ca-url", "https://objects.example.com/validator-ca.crt",
+    "--hotkey", "/unused",
+])
+print(first.output)
+
+def pcs_failure(_self):
+    pcs_plaintext = "PCS_PLAINTEXT_CANARY"
+    raise RuntimeError("pcs failure")
+
+Path.lstat = pcs_failure
+second = runner.invoke(app, [
+    "l0", "complete-enrollment",
+    "--host-id", "host-1",
+    "--pcs-key-file", "/tmp/pcs-key",
+    "--hotkey", "/unused",
+])
+print(second.output)
+raise SystemExit(0 if first.exit_code == 1 and second.exit_code == 1 else 1)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "SECRET_SEED_CANARY" not in combined
+    assert "PCS_PLAINTEXT_CANARY" not in combined
+    assert "Traceback" not in combined
 
 
 def test_pcs_envelope_interoperability(monkeypatch):
