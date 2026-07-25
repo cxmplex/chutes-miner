@@ -54,6 +54,5 @@ spec:
               mountPath: /data
       volumes:
         - name: redis-data
-          hostPath:
-            path: /var/snap/redis-data
-            type: DirectoryOrCreate
+          emptyDir:
+            sizeLimit: 2Gi

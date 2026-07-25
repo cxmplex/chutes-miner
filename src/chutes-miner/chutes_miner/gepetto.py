@@ -2,40 +2,42 @@
 Gepetto - coordinate all the things.
 """
 
-import random
-import aiohttp
 import asyncio
 import hashlib
+import math
+import random
+import re
+import traceback
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+import aiohttp
+import chutes_common.schemas.orms  # noqa: F401 - register validator_migrations table
+import chutes_miner.api.k8s as k8s
+import orjson as json
+from chutes_common.auth import sign_request
+from chutes_common.exceptions import AgentError
+from chutes_common.schemas import Base
+from chutes_common.schemas.chute import Chute
+from chutes_common.schemas.deployment import Deployment
+from chutes_common.schemas.gpu import GPU
+from chutes_common.schemas.server import Server
+from chutes_common.settings import Validator
+from chutes_miner.api.config import settings, validator_by_hotkey
+from chutes_miner.api.database import engine, get_session
+from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.api.k8s.util import (
     require_supported_chutes_version,
     resolve_deployment_validator,
 )
-from chutes_miner.api.server.util import clear_server_cache, stop_server_monitoring
-import orjson as json
-import traceback
-from copy import deepcopy
-from datetime import datetime, timedelta, timezone
-from loguru import logger
-from typing import Dict, Any, Optional
-from sqlalchemy import select, func, case, text, update
-from sqlalchemy.orm import selectinload
-from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.redis_pubsub import RedisListener
-from chutes_common.auth import sign_request
-from chutes_common.settings import Validator
-from chutes_miner.api.database import get_session, engine
-import chutes_common.schemas.orms  # noqa: F401 - register validator_migrations table
-from chutes_common.schemas import Base
-from chutes_common.schemas.chute import Chute
-from chutes_common.schemas.server import Server
-from chutes_common.schemas.gpu import GPU
-from chutes_common.schemas.deployment import Deployment
-from chutes_common.exceptions import AgentError
-from chutes_miner.api.exceptions import DeploymentFailure
+from chutes_miner.api.server.util import clear_server_cache, stop_server_monitoring
 from chutes_miner.validator_migrations import run_validator_migrations
-import chutes_miner.api.k8s as k8s
-
+from loguru import logger
+from sqlalchemy import case, func, select, text, update
+from sqlalchemy.orm import selectinload
 
 # When scaling up, randomly pick from up to this many of the tightest-fitting servers
 # (rather than always the single most-utilized one) to spread load and avoid repeatedly
@@ -88,6 +90,13 @@ class Gepetto:
         self.pubsub.on_event("job_deleted")(self.job_deleted)
         self.pubsub.on_event("chute_updated")(self.chute_updated)
 
+    @staticmethod
+    def _platform_managed(data: Any) -> bool:
+        return isinstance(data, dict) and (
+            data.get("management_mode") == "platform"
+            or data.get("gpu_management_mode") == "platform"
+        )
+
     async def run(self):
         """
         Main loop.
@@ -127,6 +136,8 @@ class Gepetto:
                     content = content_enc.decode()
                     if content.startswith("data: {"):
                         data = json.loads(content[6:])
+                        if Gepetto._platform_managed(data):
+                            continue
                         if forbidden := (forbidden_keys or frozenset()).intersection(data):
                             raise ValueError(
                                 f"Invalid response from {url}: forbidden fields {', '.join(sorted(forbidden))}"
@@ -208,6 +219,17 @@ class Gepetto:
             resolve_deployment_validator(chute, server)
         except ValueError as exc:
             raise DeploymentFailure(str(exc)) from exc
+        Gepetto._server_hourly_cost(server)
+
+    @staticmethod
+    def _server_hourly_cost(server: Server) -> float:
+        try:
+            cost = float(server.hourly_cost)
+        except (TypeError, ValueError) as exc:
+            raise DeploymentFailure("Server hourly cost is not a positive finite value") from exc
+        if not math.isfinite(cost) or cost <= 0:
+            raise DeploymentFailure("Server hourly cost is not a positive finite value")
+        return cost
 
     @staticmethod
     def _remote_chute_values(
@@ -294,9 +316,9 @@ class Gepetto:
                     validator.hotkey,
                     f"{validator.api}/miner/{clazz}/",
                     id_field,
-                    forbidden_keys=frozenset({"code", "filename"})
-                    if clazz == "chutes"
-                    else frozenset(),
+                    forbidden_keys=(
+                        frozenset({"code", "filename"}) if clazz == "chutes" else frozenset()
+                    ),
                 )
             # Also refresh global active instances for preemption decisions
             await self._refresh_global_active_instances(validator)
@@ -387,7 +409,78 @@ class Gepetto:
                 .scalar_one_or_none()
             )
 
-    async def get_launch_token(self, chute: Chute, job_id: str = None):
+    async def _register_registry_scope(
+        self,
+        validator: Validator,
+        server: Server,
+        payload: dict,
+    ) -> None:
+        if not settings.gpu_tee_only:
+            return
+        registry = payload["registry"]
+        body = {
+            "schema": "chutes.miner-registry-scope",
+            "version": 1,
+            "server_id": server.server_id,
+            "launch_config_id": payload["config_id"],
+            "repository": registry["repository"],
+            "manifest_digest": registry["manifest_digest"],
+        }
+        headers, serialized = sign_request(
+            payload=body,
+            purpose="registry",
+        )
+        service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
+        async with aiohttp.ClientSession(raise_for_status=False) as session:
+            async with session.post(
+                f"http://{service}/registry/scopes",
+                data=serialized,
+                headers=headers,
+            ) as response:
+                result = await response.json()
+                if (
+                    response.status != 200
+                    or not isinstance(result, dict)
+                    or set(result) != {"registered", "launch_config_id", "expires_at"}
+                    or result["registered"] is not True
+                    or result["launch_config_id"] != payload["config_id"]
+                ):
+                    raise DeploymentFailure(
+                        "Registry broker rejected the exact launch-config scope."
+                    )
+
+    async def _revoke_registry_scope(
+        self,
+        validator_hotkey: str,
+        launch_config_id: str,
+    ) -> None:
+        if not settings.gpu_tee_only:
+            return
+        validator = validator_by_hotkey(validator_hotkey)
+        if validator is None:
+            raise DeploymentFailure("Registry scope validator is unavailable.")
+        headers, _ = sign_request(purpose="registry")
+        service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
+        async with aiohttp.ClientSession(raise_for_status=False) as session:
+            async with session.delete(
+                f"http://{service}/registry/scopes/{launch_config_id}",
+                headers=headers,
+            ) as response:
+                result = await response.json()
+                if response.status != 200 or result != {
+                    "revoked": True,
+                    "launch_config_id": launch_config_id,
+                }:
+                    raise DeploymentFailure(
+                        "Registry broker did not revoke exact launch lifecycle."
+                    )
+
+    async def get_launch_token(
+        self,
+        chute: Chute,
+        server: Server,
+        job_id: str = None,
+    ):
         """
         Fetch the validator-issued launch config required to deliver source.
         """
@@ -397,7 +490,10 @@ class Gepetto:
         try:
             async with aiohttp.ClientSession(raise_for_status=False) as session:
                 headers, _ = sign_request(purpose="launch")
-                params = {"chute_id": chute.chute_id}
+                params = {
+                    "chute_id": chute.chute_id,
+                    "server_id": server.server_id,
+                }
                 if job_id:
                     params["job_id"] = job_id
                 async with session.get(
@@ -407,13 +503,15 @@ class Gepetto:
                 ) as resp:
                     if resp.status == 200:
                         payload = await resp.json()
-                        if not isinstance(payload, dict) or set(payload) != {
-                            "token",
-                            "config_id",
-                        }:
+                        required = (
+                            {"token", "config_id", "registry"}
+                            if settings.gpu_tee_only
+                            else {"token", "config_id"}
+                        )
+                        if not isinstance(payload, dict) or set(payload) != required:
                             raise DeploymentFailure(
                                 f"Invalid launch config response for {chute.chute_id}: "
-                                "expected exactly token and config_id."
+                                f"expected exactly {sorted(required)}."
                             )
                         if not all(
                             isinstance(payload[field], str) and payload[field]
@@ -422,6 +520,25 @@ class Gepetto:
                             raise DeploymentFailure(
                                 f"Invalid launch config response for {chute.chute_id}: "
                                 "token and config_id must be non-empty strings."
+                            )
+                        if settings.gpu_tee_only:
+                            registry = payload["registry"]
+                            if (
+                                not isinstance(registry, dict)
+                                or set(registry) != {"repository", "manifest_digest"}
+                                or not isinstance(registry["repository"], str)
+                                or not re.fullmatch(
+                                    r"sha256:[0-9a-f]{64}",
+                                    registry.get("manifest_digest", ""),
+                                )
+                            ):
+                                raise DeploymentFailure(
+                                    "Invalid descriptor-closed registry launch scope."
+                                )
+                            await self._register_registry_scope(
+                                validator,
+                                server,
+                                payload,
                             )
                         return payload
 
@@ -504,9 +621,8 @@ class Gepetto:
                     #    maximize the efficiency/value but may leave some incentive
                     #    on the table.
                     # Default strategy is to maximize value, i.e. highest multiplier per GPU/option 2.
-                    chute_value = effective_multiplier / (
-                        potential_server.hourly_cost * chute.gpu_count
-                    )
+                    hourly_cost = self._server_hourly_cost(potential_server)
+                    chute_value = effective_multiplier / (hourly_cost * chute.gpu_count)
                     # alternative
                     # chute_value = effective_multiplier
 
@@ -591,6 +707,7 @@ class Gepetto:
         # Clean up the database (safe now that preflight succeeded).
         chute_id = None
         validator_hotkey = None
+        config_id = None
         async with get_session() as session:
             deployment = (
                 (
@@ -606,6 +723,12 @@ class Gepetto:
                     instance_id = deployment.instance_id
                 chute_id = deployment.chute_id
                 validator_hotkey = deployment.validator
+                config_id = deployment.config_id
+                if config_id:
+                    await self._revoke_registry_scope(
+                        validator_hotkey,
+                        config_id,
+                    )
                 await session.delete(deployment)
                 await session.commit()
 
@@ -615,18 +738,20 @@ class Gepetto:
                 await self.purge_validator_instance(vali, chute_id, instance_id)
 
         # Purge in k8s if still there.
-        await k8s.undeploy(deployment_id)
+        await k8s.undeploy(deployment_id, config_id=config_id)
         logger.success(f"Removed {deployment_id=}")
 
     async def gpu_verified(self, event_data):
         """
         Validator has finished verifying a GPU, so it is ready for use.
         """
+        if self._platform_managed(event_data):
+            return
         logger.info(f"Received gpu_verified event: {event_data}")
         async with get_session() as session:
             await session.execute(
                 update(GPU)
-                .where(GPU.server_id == event_data.get("gpu_id"))
+                .where(GPU.hardware_uuid == event_data.get("gpu_id"))
                 .values({"verified": True})
             )
             await session.commit()
@@ -636,6 +761,8 @@ class Gepetto:
         """
         Instance has been created - only relevant when using new launch config system.
         """
+        if self._platform_managed(event_data):
+            return
         if event_data["miner_hotkey"] != settings.miner_ss58:
             return
         logger.info(f"Received instance_created event: {event_data}")
@@ -650,6 +777,8 @@ class Gepetto:
         """
         Validator has finished verifying an instance/deployment, so it should start receiving requests.
         """
+        if self._platform_managed(event_data):
+            return
         logger.info(f"Received instance_verified event: {event_data}")
         if event_data["miner_hotkey"] != settings.miner_ss58:
             return
@@ -688,7 +817,10 @@ class Gepetto:
                 logger.warning(f"No validator found? {chute.validator=}")
                 return []
             await self._remote_refresh_objects(
-                self.remote_chutes, chute.validator, f"{validator.api}/miner/chutes/", "chute_id"
+                self.remote_chutes,
+                chute.validator,
+                f"{validator.api}/miner/chutes/",
+                "chute_id",
             )
             chute_obj = self.remote_chutes.get(chute.validator, {}).get(chute.chute_id)
         if not chute_obj:
@@ -714,7 +846,12 @@ class Gepetto:
         return extra_services
 
     async def run_job(
-        self, chute: Chute, job_id: str, server: Server, validator: Validator, disk_gb: int = 10
+        self,
+        chute: Chute,
+        job_id: str,
+        server: Server,
+        validator: Validator,
+        disk_gb: int = 10,
     ):
         """
         Run a job on the specified server.
@@ -729,13 +866,21 @@ class Gepetto:
                 raise DeploymentFailure(
                     f"Job validator {validator.hotkey!r} does not match chute validator {chute.validator!r}."
                 )
-            launch_token = await self.get_launch_token(chute, job_id=job_id)
+            launch_token = await self.get_launch_token(
+                chute,
+                server,
+                job_id=job_id,
+            )
             extra_ports = await self._get_job_extra_services(chute)
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 server.server_id,
                 token=launch_token["token"],
                 config_id=launch_token["config_id"],
+                registry_repository=(launch_token.get("registry") or {}).get("repository"),
+                registry_manifest_digest=(launch_token.get("registry") or {}).get(
+                    "manifest_digest"
+                ),
                 job_id=job_id,
                 extra_labels={"chutes/job": "true"},
                 disk_gb=disk_gb,
@@ -757,6 +902,8 @@ class Gepetto:
         """
         Chute has been updated.
         """
+        if self._platform_managed(event_data):
+            return
         chute_id = event_data["chute_id"]
         version = event_data["version"]
         validator_hotkey = event_data["validator"]
@@ -824,6 +971,8 @@ class Gepetto:
                 there are benefits to accepting them (you get a bounty, compute multiplier
                 is semi-dynamic and may provide more compute units than a chute, etc).
         """
+        if self._platform_managed(event_data):
+            return
         chute_id = event_data["chute_id"]
         job_id = event_data["job_id"]
         gpu_count = event_data["gpu_count"]
@@ -861,6 +1010,8 @@ class Gepetto:
         """
         Job has been deleted.
         """
+        if self._platform_managed(event_data):
+            return
         async with get_session() as session:
             deployment = (
                 (
@@ -899,10 +1050,22 @@ class Gepetto:
             await self.scale_chute(chute, 1, preempt=True)
 
     @staticmethod
-    async def remove_gpu_from_validator(validator: Validator, gpu_id: str):
+    def require_generic_gpu_deletion(gpu_allocation_group_id: Optional[str]) -> None:
+        if gpu_allocation_group_id is not None:
+            raise ValueError(
+                "reservation-owned GPU requires exact teardown/reset, not generic deletion"
+            )
+
+    @staticmethod
+    async def remove_gpu_from_validator(
+        validator: Validator,
+        gpu_id: str,
+        gpu_allocation_group_id: Optional[str] = None,
+    ):
         """
         Purge a GPU from validator inventory.
         """
+        Gepetto.require_generic_gpu_deletion(gpu_allocation_group_id)
         try:
             async with aiohttp.ClientSession(raise_for_status=True) as http_session:
                 headers, _ = sign_request(purpose="nodes")
@@ -940,20 +1103,31 @@ class Gepetto:
                 or some such other rare event.  You may want to configure alerts or something
                 in this code block just in case.
         """
+        if self._platform_managed(event_data):
+            return
         gpu_id = event_data["gpu_id"]
         logger.info(f"Received gpu_deleted event for {gpu_id=}")
         async with get_session() as session:
             gpu = (
-                (await session.execute(select(GPU).where(GPU.gpu_id == gpu_id)))
+                (await session.execute(select(GPU).where(GPU.hardware_uuid == gpu_id)))
                 .unique()
                 .scalar_one_or_none()
             )
             if gpu:
+                try:
+                    self.require_generic_gpu_deletion(gpu.gpu_allocation_group_id)
+                except ValueError as exc:
+                    logger.error(f"Refusing gpu_deleted generic teardown for {gpu_id}: {exc}")
+                    return
                 if gpu.deployment:
                     await self.undeploy(gpu.deployment_id)
                 validator_hotkey = gpu.validator
                 if (validator := validator_by_hotkey(validator_hotkey)) is not None:
-                    await self.remove_gpu_from_validator(validator, gpu_id)
+                    await self.remove_gpu_from_validator(
+                        validator,
+                        gpu_id,
+                        gpu.gpu_allocation_group_id,
+                    )
                 await session.delete(gpu)
                 await session.commit()
         logger.info(f"Finished processing gpu_deleted event for {gpu_id=}")
@@ -962,6 +1136,8 @@ class Gepetto:
         """
         An instance has been marked as active (new chutes lib flow).
         """
+        if self._platform_managed(event_data):
+            return
         config_id = event_data["config_id"]
         logger.info(f"Received instance_activated event for {config_id=}")
         async with get_session() as session:
@@ -977,6 +1153,8 @@ class Gepetto:
         An instance was removed validator side, likely meaning there were too
         many consecutive failures in inference.
         """
+        if self._platform_managed(event_data):
+            return
         instance_id = event_data["instance_id"]
         logger.info(f"Received instance_deleted event for {instance_id=}")
         async with get_session() as session:
@@ -1000,6 +1178,8 @@ class Gepetto:
         MINERS: This will happen when you remove a node intentionally, but otherwise
                 should not really happen.  Also want to monitor this situation I think.
         """
+        if self._platform_managed(event_data):
+            return
         server_id = event_data["server_id"]
         logger.info(f"Received server_deleted event {server_id=}")
 
@@ -1081,6 +1261,8 @@ class Gepetto:
         """
         A chute (or specific version of a chute) was removed from validator inventory.
         """
+        if self._platform_managed(event_data):
+            return
         chute_id = event_data["chute_id"]
         version = event_data["version"]
         validator = event_data["validator"]
@@ -1115,6 +1297,8 @@ class Gepetto:
                 base mining code here *will* deploy the chute however, given
                 sufficient resources are available.
         """
+        if self._platform_managed(event_data):
+            return
         chute_id = event_data["chute_id"]
         version = event_data["version"]
         validator_hotkey = event_data["validator"]
@@ -1174,6 +1358,8 @@ class Gepetto:
         """
         A rolling update event, meaning we need to re-create a single instance.
         """
+        if self._platform_managed(event_data):
+            return
         async with self._scale_lock:
             chute_id = event_data["chute_id"]
             version = event_data["new_version"]
@@ -1191,6 +1377,7 @@ class Gepetto:
 
             # Remove the instance/deployment.
             server_id = None
+            server = None
             server_gpu_type = None
             server_validator = None
             async with get_session() as session:
@@ -1209,6 +1396,7 @@ class Gepetto:
                     .scalar_one_or_none()
                 )
                 if deployment:
+                    server = deployment.server
                     server_id = deployment.server.server_id
                     server_gpu_type = deployment.server.gpus[0].model_short_ref
                     server_is_tee = deployment.server.is_tee
@@ -1219,6 +1407,11 @@ class Gepetto:
                             f"{validator_hotkey!r} does not match server validator "
                             f"{server_validator!r}"
                         )
+                        return
+                    try:
+                        self._server_hourly_cost(server)
+                    except DeploymentFailure as exc:
+                        logger.error(f"Refusing rolling update for {instance_id=}: {exc}")
                         return
                     await self.undeploy(deployment.deployment_id)
 
@@ -1282,12 +1475,16 @@ class Gepetto:
                 logger.info(f"Attempting to deploy {chute.chute_id=} on {server_id=}")
                 deployment = None
                 try:
-                    launch_token = await self.get_launch_token(chute)
+                    launch_token = await self.get_launch_token(chute, server)
                     deployment, _ = await k8s.deploy_chute(
                         chute.chute_id,
                         server_id,
                         token=launch_token["token"],
                         config_id=launch_token["config_id"],
+                        registry_repository=(launch_token.get("registry") or {}).get("repository"),
+                        registry_manifest_digest=(launch_token.get("registry") or {}).get(
+                            "manifest_digest"
+                        ),
                         vm_version=self._server_vm_version(chute.validator, server_id),
                     )
                     logger.success(
@@ -1311,7 +1508,7 @@ class Gepetto:
             select(
                 Server.server_id,
                 func.count(GPU.gpu_id).label("total_gpus"),
-                func.sum(case((GPU.deployment_id != None, 1), else_=0)).label("used_gpus"),  # noqa
+                func.sum(case((GPU.deployment_id.is_not(None), 1), else_=0)).label("used_gpus"),  # noqa
             )
             .select_from(Server)
             .join(GPU)
@@ -1673,7 +1870,11 @@ class Gepetto:
         # because only one miner can claim a single job for example, so we don't want to undeploy if we
         # don't actually get the lock.
         try:
-            launch_token = await self.get_launch_token(chute, job_id=job_id)
+            launch_token = await self.get_launch_token(
+                chute,
+                target_server,
+                job_id=job_id,
+            )
         except DeploymentFailure:
             logger.warning(
                 f"Failed to obtain launch token, skipping pre-emption {chute.chute_id=} {job_id=}"
@@ -1703,6 +1904,10 @@ class Gepetto:
                 target_server.server_id,
                 token=launch_token["token"],
                 config_id=launch_token["config_id"],
+                registry_repository=(launch_token.get("registry") or {}).get("repository"),
+                registry_manifest_digest=(launch_token.get("registry") or {}).get(
+                    "manifest_digest"
+                ),
                 job_id=job_id,
                 disk_gb=disk_gb,
                 extra_service_ports=extra_ports,
@@ -1777,12 +1982,21 @@ class Gepetto:
                         deployment = None
                         try:
                             self._require_validator_match(chute, server)
-                            launch_token = await self.get_launch_token(chute)
+                            launch_token = await self.get_launch_token(
+                                chute,
+                                server,
+                            )
                             deployment, _ = await k8s.deploy_chute(
                                 chute.chute_id,
                                 server.server_id,
                                 token=launch_token["token"],
                                 config_id=launch_token["config_id"],
+                                registry_repository=(launch_token.get("registry") or {}).get(
+                                    "repository"
+                                ),
+                                registry_manifest_digest=(launch_token.get("registry") or {}).get(
+                                    "manifest_digest"
+                                ),
                                 vm_version=self._server_vm_version(
                                     chute.validator, server.server_id
                                 ),
@@ -2250,10 +2464,11 @@ class Gepetto:
             local_gpu_ids = set()
             async for row in (await session.stream(select(GPU))).unique():
                 gpu = row[0]
-                local_gpu_ids.add(gpu.gpu_id)
-                if gpu.gpu_id not in all_gpus:
+                local_gpu_ids.add(gpu.hardware_uuid)
+                if gpu.hardware_uuid not in all_gpus:
                     logger.warning(
-                        f"GPU {gpu.gpu_id} is no longer in validator {gpu.validator} inventory"
+                        f"GPU {gpu.hardware_uuid} is no longer in validator "
+                        f"{gpu.validator} inventory"
                     )
                     # XXX we need this reconciliation somehow, but API downtime is really problematic here...
                     # tasks.append(

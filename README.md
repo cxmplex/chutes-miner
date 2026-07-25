@@ -358,17 +358,9 @@ Now that all the configuration is setup, use ansible to setup your infrastructur
 Gepetto is the most important component as a miner.  It is responsible for selecting chutes to deploy, scale up, scale down, delete, etc.
 You'll want to thoroughly examine this code and make any changes that you think would gain you more total compute time.
 
-Once you are satisfied with the state of the `gepetto.py` file, you'll need to create a configmap object in kubernetes that stores your file (from inside the `src/chutes-miner/chutes_miner` directory in the repo):
-```bash
-kubectl create configmap gepetto-code --context chutes-miner-cpu-0 --from-file=gepetto.py -n chutes
-```
-
-Any time you wish to make further changes to gepetto, you need to re-create the configmap:
-```bash
-kubectl create configmap gepetto-code --from-file=gepetto.py -o yaml --dry-run=client | kubectl apply --context chutes-miner-cpu-0 -n chutes -f -
-```
-
-You must also restart the gepetto deployment after you make changes, but this will only work AFTER you have completed the rest of the setup guide (no need to run when you initially setup your miner):
+Gepetto runs from the source-built miner image. Rebuild that image after
+changing its strategy; ConfigMap or subPath source overrides are rejected.
+Restart the deployment after installing the new image:
 ```
 kubectl rollout restart deployment/gepetto --context chutes-miner-cpu-0 -n chutes
 ```

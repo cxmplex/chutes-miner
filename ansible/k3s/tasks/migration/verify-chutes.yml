@@ -68,51 +68,27 @@
       spec:
         suspend: true
 
-- name: Verify the gepetto-code configmap
+- name: Remove retired gepetto source override from MicroK8s
+  when: inventory_hostname in groups['microk8s']
   tags: verify-gepetto
-  block:
-    - name: Verify gepetto on micorK8s cluster
-      when: inventory_hostname in groups['microk8s']
-      kubernetes.core.k8s:
-        state: present # Ensures it exists and matches this definition. Updates if different.
-        context: default
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: gepetto-code
-            namespace: chutes
-          data:
-            gepetto.py: "{{ lookup('file', 'files/gepetto-microk8s.py') }}"
-      register: microk8s_configmap_result
+  kubernetes.core.k8s:
+    state: absent
+    context: default
+    api_version: v1
+    kind: ConfigMap
+    name: gepetto-code
+    namespace: chutes
 
-    - name: Restart gepetto deployment on micorK8s cluster
-      when: 
-        - inventory_hostname in groups['microk8s']
-        - microk8s_configmap_result.changed
-      ansible.builtin.shell: microk8s kubectl rollout restart deployment/gepetto -n chutes --context=default
-    
-
-    - name: Verify gepetto on k3s cluster
-      when: inventory_hostname in groups['control']
-      kubernetes.core.k8s:
-        kubeconfig: "{{ k3s_kubeconfig_path }}"
-        state: present # Ensures it exists and matches this definition. Updates if different.
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: gepetto-code
-            namespace: chutes
-          data:
-            gepetto.py: "{{ lookup('file', 'files/gepetto-k3s.py') }}"
-      register: k3s_configmap_result
-
-    - name: Restart gepetto deployment on k3s cluster
-      when: 
-        - inventory_hostname in groups['control']
-        - k3s_configmap_result.changed
-      ansible.builtin.shell: kubectl --kubeconfig {{ k3s_kubeconfig_path }} rollout restart deployment/gepetto -n chutes
+- name: Remove retired gepetto source override from k3s
+  when: inventory_hostname in groups['control']
+  tags: verify-gepetto
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k3s_kubeconfig_path }}"
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: gepetto-code
+    namespace: chutes
 
 - name: Verify miner secrets exist
   when: inventory_hostname == groups['control'][0]

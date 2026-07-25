@@ -1,0 +1,304 @@
+"""Adopt the registrar-created GPU server into the local miner inventory."""
+
+import math
+import uuid
+from datetime import datetime, timezone
+
+from chutes_common.schemas.gpu import GPU
+from chutes_common.schemas.server import Server, ServerNodeIdentity
+from chutes_miner.api.config import k8s_core_client, settings
+from chutes_miner.api.database import get_session
+from sqlalchemy import or_, select, text
+
+
+def _control_plane_node():
+    nodes = k8s_core_client().list_node().items
+    control_planes = [
+        node
+        for node in nodes
+        if node.metadata and "node-role.kubernetes.io/control-plane" in (node.metadata.labels or {})
+    ]
+    if len(control_planes) != 1:
+        raise RuntimeError(
+            "seedless GPU adoption requires exactly one Kubernetes control-plane node"
+        )
+    node = control_planes[0]
+    if (
+        not node.metadata.name
+        or not node.metadata.uid
+        or not node.status
+        or not node.status.capacity
+    ):
+        raise RuntimeError("seedless GPU Kubernetes node identity is incomplete")
+    ready = any(
+        condition.type == "Ready" and condition.status == "True"
+        for condition in (node.status.conditions or [])
+    )
+    if not ready:
+        raise RuntimeError("seedless GPU Kubernetes node is not ready")
+    return node
+
+
+def _node_resources(node) -> tuple[int, int, int]:
+    capacity = node.status.capacity
+    gpu_count = int(capacity.get("nvidia.com/gpu", "0"))
+    cpu_count = int(capacity.get("cpu", "0")) - 2
+    memory = capacity.get("memory", "")
+    if gpu_count < 1 or cpu_count < 1:
+        raise RuntimeError("seedless GPU Kubernetes capacity is invalid")
+    if memory.endswith("Ki"):
+        memory_gib = int(memory[:-2]) // 1024 // 1024
+    elif memory.endswith("Mi"):
+        memory_gib = int(memory[:-2]) // 1024
+    elif memory.endswith("Gi"):
+        memory_gib = int(memory[:-2])
+    else:
+        raise RuntimeError("seedless GPU Kubernetes memory capacity is invalid")
+    memory_gib -= 6
+    if memory_gib < 1:
+        raise RuntimeError("seedless GPU Kubernetes memory capacity is too small")
+    return (
+        gpu_count,
+        max(1, min(4, math.floor(cpu_count / gpu_count))),
+        max(1, math.floor(memory_gib * 0.8 / gpu_count)),
+    )
+
+
+async def adopt_seedless_gpu_server() -> str:
+    """Bind one K3s node UID to the authenticated logical validator server."""
+
+    identity = settings.seedless_gpu_identity
+    hourly_cost = settings.miner_hourly_cost
+    validator = identity["validator"]["hotkey"]
+    logical_server_id = identity["server_id"]
+    node = _control_plane_node()
+    node_uid = str(node.metadata.uid)
+    labels = dict(node.metadata.labels or {})
+    if labels.get("chutes/seedless-control-plane") != "true":
+        raise RuntimeError("seedless GPU node lacks the measured control-plane label")
+    bound_id = labels.get("chutes/logical-server-id")
+    if bound_id not in {None, logical_server_id}:
+        raise RuntimeError("Kubernetes node is bound to another logical GPU server")
+    if bound_id is None:
+        labels["chutes/logical-server-id"] = logical_server_id
+        node = k8s_core_client().patch_node(
+            node.metadata.name,
+            {"metadata": {"labels": labels}},
+        )
+        labels = dict(node.metadata.labels or labels)
+    gpu_count, cpu_per_gpu, memory_per_gpu = _node_resources(node)
+
+    async with get_session() as session:
+        candidates = (
+            (
+                await session.execute(
+                    select(Server)
+                    .where(
+                        or_(
+                            Server.server_id == logical_server_id,
+                            Server.kubernetes_node_uid == node_uid,
+                            Server.name == node.metadata.name,
+                        )
+                    )
+                    .with_for_update()
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+        logical = [item for item in candidates if item.server_id == logical_server_id]
+        legacy = [item for item in candidates if item.server_id != logical_server_id]
+        if len(logical) > 1 or len(legacy) > 1 or (logical and legacy):
+            raise RuntimeError(
+                "legacy and logical GPU server identities conflict in the persisted database"
+            )
+        if not logical and legacy:
+            old_server = legacy[0]
+            if (
+                old_server.kubernetes_node_uid not in {None, node_uid}
+                or old_server.name != node.metadata.name
+                or old_server.validator not in {None, validator}
+            ):
+                raise RuntimeError(
+                    "persisted legacy server does not exactly match this Kubernetes node"
+                )
+            old_server_id = old_server.server_id
+            session.expunge(old_server)
+            result = await session.execute(
+                text(
+                    "UPDATE servers SET server_id = :logical_server_id "
+                    "WHERE server_id = :old_server_id AND NOT EXISTS "
+                    "(SELECT 1 FROM servers WHERE server_id = :logical_server_id)"
+                ),
+                {
+                    "logical_server_id": logical_server_id,
+                    "old_server_id": old_server_id,
+                },
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("legacy local server rekey lost its transactional ownership")
+            server = (
+                (
+                    await session.execute(
+                        select(Server)
+                        .where(Server.server_id == logical_server_id)
+                        .with_for_update()
+                    )
+                )
+                .unique()
+                .scalar_one()
+            )
+        else:
+            server = logical[0] if logical else None
+        node_history_owner = (
+            await session.execute(
+                select(ServerNodeIdentity)
+                .where(ServerNodeIdentity.kubernetes_node_uid == node_uid)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if node_history_owner is not None and node_history_owner.server_id != logical_server_id:
+            raise RuntimeError(
+                "Kubernetes node UID was previously adopted by another logical server"
+            )
+        if (
+            node_history_owner is not None
+            and node_history_owner.server_id == logical_server_id
+            and node_history_owner.retired_at is not None
+        ):
+            raise RuntimeError("A retired Kubernetes node UID cannot be adopted again")
+        if (
+            server is not None
+            and server.kubernetes_node_uid not in {None, node_uid}
+            and server.registration_attestation_id == identity["attestation_id"]
+        ):
+            raise RuntimeError("Kubernetes node UID rotation requires a new registrar attestation")
+        if server is None:
+            server = Server(server_id=logical_server_id)
+            session.add(server)
+        current_node_identity = (
+            await session.execute(
+                select(ServerNodeIdentity)
+                .where(
+                    ServerNodeIdentity.server_id == logical_server_id,
+                    ServerNodeIdentity.retired_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if server.kubernetes_node_uid != node_uid:
+            if current_node_identity is not None:
+                current_node_identity.retired_at = datetime.now(timezone.utc)
+            generation = int(server.kubernetes_node_generation or 0) + 1
+            session.add(
+                ServerNodeIdentity(
+                    server_id=logical_server_id,
+                    generation=generation,
+                    kubernetes_node_uid=node_uid,
+                    registration_attestation_id=identity["attestation_id"],
+                )
+            )
+            server.kubernetes_node_generation = generation
+        elif current_node_identity is None:
+            generation = max(1, int(server.kubernetes_node_generation or 0))
+            session.add(
+                ServerNodeIdentity(
+                    server_id=logical_server_id,
+                    generation=generation,
+                    kubernetes_node_uid=node_uid,
+                    registration_attestation_id=identity["attestation_id"],
+                )
+            )
+            server.kubernetes_node_generation = generation
+        elif (
+            current_node_identity.generation != server.kubernetes_node_generation
+            or current_node_identity.kubernetes_node_uid != node_uid
+        ):
+            raise RuntimeError("Logical GPU node-incarnation metadata is inconsistent")
+        server.kubernetes_node_uid = node_uid
+        server.registration_attestation_id = identity["attestation_id"]
+        server.gpu_allocation_group_id = identity["allocation_group_id"]
+        server.gpu_allocation_group_generation = identity["allocation_group_generation"]
+        server.validator = validator
+        server.name = node.metadata.name
+        server.ip_address = labels.get("chutes/external-ip")
+        server.status = "Ready"
+        server.labels = labels
+        server.gpu_count = gpu_count
+        server.cpu_per_gpu = cpu_per_gpu
+        server.memory_per_gpu = memory_per_gpu
+        server.hourly_cost = hourly_cost
+        server.is_tee = True
+        assigned = set(identity["gpu_uuids"])
+        tracked = (
+            (await session.execute(select(GPU).where(GPU.server_id == logical_server_id)))
+            .unique()
+            .scalars()
+            .all()
+        )
+        for item in tracked:
+            device_info = item.device_info if isinstance(item.device_info, dict) else {}
+            hardware_uuid = (
+                item.hardware_uuid
+                or device_info.get("uuid")
+                or (item.gpu_id if item.gpu_id.startswith("GPU-") else None)
+            )
+            if hardware_uuid not in assigned:
+                raise RuntimeError(
+                    "Logical GPU server has local devices outside its registrar assignment"
+                )
+            item.hardware_uuid = hardware_uuid
+        for gpu_uuid, identifier in zip(
+            identity["gpu_uuids"],
+            identity["gpu_identifiers"],
+            strict=True,
+        ):
+            local_gpu_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"chutes:nvidia:{logical_server_id}:{gpu_uuid}",
+                )
+            )
+            gpu = (
+                await session.execute(select(GPU).where(GPU.hardware_uuid == gpu_uuid))
+            ).scalar_one_or_none()
+            if gpu is not None and gpu.server_id != logical_server_id:
+                raise RuntimeError("Registrar-assigned GPU belongs to another local logical server")
+            if gpu is None:
+                gpu = GPU(
+                    gpu_id=local_gpu_id,
+                    hardware_uuid=gpu_uuid,
+                    server_id=logical_server_id,
+                )
+                session.add(gpu)
+            elif gpu.gpu_id != local_gpu_id:
+                canonical_owner = (
+                    await session.execute(
+                        select(GPU).where(GPU.gpu_id == local_gpu_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if canonical_owner is not None and canonical_owner is not gpu:
+                    raise RuntimeError(
+                        "Canonical registrar GPU identity conflicts with another local row"
+                    )
+                gpu.gpu_id = local_gpu_id
+            gpu.validator = validator
+            gpu.device_info = {
+                "uuid": gpu_uuid,
+                "local_gpu_id": local_gpu_id,
+                "identifier": identifier,
+                "source": "attested_gpu_registration",
+            }
+            gpu.model_short_ref = identifier
+            gpu.verified = True
+            gpu.gpu_allocation_group_id = identity["allocation_group_id"]
+            gpu.gpu_allocation_group_generation = identity["allocation_group_generation"]
+        await session.commit()
+    if labels.get("chutes/seedless-adopted") != logical_server_id:
+        labels["chutes/seedless-adopted"] = logical_server_id
+        k8s_core_client().patch_node(
+            node.metadata.name,
+            {"metadata": {"labels": labels}},
+        )
+    return logical_server_id

@@ -1,4 +1,12 @@
-multiCluster: true
+seedlessStack:
+  image: ""
+  runtimeHostPath: /run/chutes-gpu
+  sessionEnvPath: /run/chutes-gpu/miner-session.env
+  sessionJsonPath: /run/chutes-gpu/miner-session.json
+  registrationPath: /run/chutes-gpu/registration.json
+  attestedCertPath: /run/chutes-tls/server.crt
+
+multiCluster: false
 
 validators:
   defaultRegistry: registry.chutes.ai
@@ -10,7 +18,7 @@ validators:
       socket: wss://ws.chutes.ai
 
 registry:
-  image: parachutes/nginx-proxy:latest
+  image: parachutes/nginx-proxy@sha256:af44ec89c18ed30caca38f08122d7cb091112cd01e3081b769e8172c86304a42
   imagePullPolicy: Always
   resources:
     requests:
@@ -26,7 +34,7 @@ registry:
     # BE SURE THIS MATCHES registry_port IN ANSIBLE!
     nodePort: 30500
   nodeSelector:
-    nvidia.com/gpu.present: "true"
+    chutes/seedless-control-plane: "true"
   config:
     workerProcesses: 1
     workerConnections: 1024
@@ -38,8 +46,7 @@ registry:
       defaultUpstream: "registry.chutes.ai"
 
 auth:
-  image: parachutes/registry:k3s-latest
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   resources:
     requests:
       cpu: 250m
@@ -50,8 +57,7 @@ auth:
   port: 8000
 
 agent:
-  image: parachutes/chutes-agent:k3s-latest
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   resources:
     requests:
       cpu: "500m"
@@ -64,18 +70,16 @@ agent:
     nodePort: 32000
     port: 8000
     targetPort: 8000
-  nodeSelector: {}
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
   affinity: {}
 
 failedChuteCleanup:
-  image: parachutes/failed-chute-cleanup:latest
+  image: parachutes/failed-chute-cleanup@sha256:2b90539e78e997254ee3a6f0c6d0f5e597e164503cd8a2620ce9f933b0450e28
   imagePullPolicy: Always
 
 # Miner credentials - These are provided via Ansible deployment
 # These values are automatically injected during deployment and should not be set manually
 # as they are sensitive values
 minerCredentials:
-  # SS58 address for the miner - provided by Ansible from hotkey file
-  ss58Address: "REPLACE_WITH_ANSIBLE_SS58_ADDRESS"
-  # Secret seed for the miner (hex prefix removed) - provided by Ansible from hotkey file  
-  secretSeed: "REPLACE_WITH_ANSIBLE_SECRET_SEED"
+  ownerSs58: "REPLACE_WITH_ATTESTED_OWNER_SS58"

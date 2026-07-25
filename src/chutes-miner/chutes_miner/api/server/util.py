@@ -29,6 +29,7 @@ from chutes_common.schemas.server import Server, ServerArgs
 from chutes_common.schemas.gpu import GPU
 from chutes_miner.api.exceptions import (
     DuplicateServer,
+    TEEBootstrapFailure,
     VerificationFailure,
 )
 import yaml
@@ -155,7 +156,11 @@ async def track_server(
 
     # Extract node information from kubernetes meta.
     name = node_object.metadata.name
-    server_id = node_object.metadata.uid
+    kubernetes_node_uid = str(node_object.metadata.uid)
+    logical_server_id = current_labels.get("chutes/logical-server-id")
+    if settings.gpu_tee_only and not logical_server_id:
+        raise ValueError("seedless GPU node has no adopted logical server identity")
+    server_id = logical_server_id or kubernetes_node_uid
     ip_address = node_object.metadata.labels.get("chutes/external-ip")
     is_tee = node_object.metadata.labels.get("chutes/tee", "false").lower() == "true"
 
@@ -195,7 +200,8 @@ async def track_server(
     # Track the server in our inventory.
     async with get_session() as session:
         server = Server(
-            server_id=node_object.metadata.uid,
+            server_id=server_id,
+            kubernetes_node_uid=kubernetes_node_uid,
             validator=validator,
             name=name,
             ip_address=ip_address,
@@ -230,6 +236,11 @@ async def bootstrap_server(
     """
     Bootstrap a server from start to finish, yielding SSEs for miner to track status.
     """
+    if settings.gpu_tee_only:
+        raise TEEBootstrapFailure(
+            "seedless GPU artifact disables legacy server bootstrap and adopts "
+            "the registrar-created logical identity"
+        )
     started_at = time.time()
     strategy = None
     success = False
@@ -241,7 +252,7 @@ async def bootstrap_server(
             logger.info(f"Stopped monitoring for {server_args.name}")
 
     yield sse_message(
-        f"attempting to add node server_id={node_object.metadata.uid} to inventory...",
+        f"attempting to add node {node_object.metadata.name} to inventory...",
     )
 
     try:
@@ -264,7 +275,8 @@ async def bootstrap_server(
 
         # Great, now it's in our database, but we need to startup resources so the validator can check the GPUs.
         yield sse_message(
-            f"server with server_id={node_object.metadata.uid} now tracked in database, provisioning verification resources...",
+            f"server with logical server_id={server.server_id} now tracked in database, "
+            "provisioning verification resources...",
         )
 
         if server_args.agent_api:
@@ -272,7 +284,7 @@ async def bootstrap_server(
             await start_server_monitoring(server_args.agent_api)
 
             yield sse_message(
-                f"Started monitoring server_id={node_object.metadata.uid}...",
+                f"Started monitoring logical server_id={server.server_id}...",
             )
 
         strategy = await VerificationStrategy.create(node, server_args, server)
@@ -287,9 +299,7 @@ async def bootstrap_server(
         # Astonishing, everything worked. Mark GPUs as verified.
         async with get_session() as session:
             await session.execute(
-                update(GPU)
-                .where(GPU.server_id == node_object.metadata.uid)
-                .values({"verified": True})
+                update(GPU).where(GPU.server_id == server.server_id).values({"verified": True})
             )
             await session.commit()
         yield sse_message(f"completed server bootstrapping in {time.time() - started_at} seconds!")

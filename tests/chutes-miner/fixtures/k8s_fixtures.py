@@ -152,7 +152,10 @@ def mock_k8s_api_client():
 
 @pytest.fixture
 def mock_k8s_client_manager(
-    mock_k8s_api_client, mock_k8s_core_client, mock_k8s_app_client, mock_k8s_batch_client
+    mock_k8s_api_client,
+    mock_k8s_core_client,
+    mock_k8s_app_client,
+    mock_k8s_batch_client,
 ):
     with patch(
         "chutes_miner.api.k8s.operator.KubernetesMultiClusterClientManager"
@@ -178,7 +181,12 @@ def sample_server():
         seed=12345,
         deployments=[],
         gpus=[
-            GPU(gpu_id=f"{uuid.uuid4()}", server_id="test-server-id", verified=True)
+            GPU(
+                gpu_id=f"{uuid.uuid4()}",
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="test-server-id",
+                verified=True,
+            )
             for i in range(4)
         ],
     )
@@ -319,7 +327,11 @@ def mock_pod():
         "memory": "32Gi",
         "nvidia.com/gpu": "2",
     }
-    pod.spec.containers[0].resources.limits = {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "2"}
+    pod.spec.containers[0].resources.limits = {
+        "cpu": "8",
+        "memory": "32Gi",
+        "nvidia.com/gpu": "2",
+    }
     pod.spec.volumes = [
         MagicMock(name="code"),
         MagicMock(name="cache"),
@@ -401,7 +413,9 @@ def mock_pod():
                 condition.status = "False"
 
     def set_error(
-        reason="CrashLoopBackOff", message="Back-off restarting failed container", exit_code=1
+        reason="CrashLoopBackOff",
+        message="Back-off restarting failed container",
+        exit_code=1,
     ):
         pod.status.phase = "Running"  # Pods in CrashLoopBackOff still have Running phase
         pod.status.container_statuses[0].ready = False
@@ -439,15 +453,21 @@ def mock_pod():
 
     # Define to_dict methods for state objects to match real K8s behavior
     pod.status.container_statuses[0].state.to_dict = lambda: {
-        "running": pod.status.container_statuses[0].state.running.to_dict()
-        if pod.status.container_statuses[0].state.running
-        else None,
-        "waiting": pod.status.container_statuses[0].state.waiting.to_dict()
-        if pod.status.container_statuses[0].state.waiting
-        else None,
-        "terminated": pod.status.container_statuses[0].state.terminated.to_dict()
-        if pod.status.container_statuses[0].state.terminated
-        else None,
+        "running": (
+            pod.status.container_statuses[0].state.running.to_dict()
+            if pod.status.container_statuses[0].state.running
+            else None
+        ),
+        "waiting": (
+            pod.status.container_statuses[0].state.waiting.to_dict()
+            if pod.status.container_statuses[0].state.waiting
+            else None
+        ),
+        "terminated": (
+            pod.status.container_statuses[0].state.terminated.to_dict()
+            if pod.status.container_statuses[0].state.terminated
+            else None
+        ),
     }
 
     if pod.status.container_statuses[0].state.running:
@@ -467,15 +487,21 @@ def mock_pod():
 
     # Same for last_state
     pod.status.container_statuses[0].last_state.to_dict = lambda: {
-        "running": pod.status.container_statuses[0].last_state.running.to_dict()
-        if pod.status.container_statuses[0].last_state.running
-        else None,
-        "waiting": pod.status.container_statuses[0].last_state.waiting.to_dict()
-        if pod.status.container_statuses[0].last_state.waiting
-        else None,
-        "terminated": pod.status.container_statuses[0].last_state.terminated.to_dict()
-        if pod.status.container_statuses[0].last_state.terminated
-        else None,
+        "running": (
+            pod.status.container_statuses[0].last_state.running.to_dict()
+            if pod.status.container_statuses[0].last_state.running
+            else None
+        ),
+        "waiting": (
+            pod.status.container_statuses[0].last_state.waiting.to_dict()
+            if pod.status.container_statuses[0].last_state.waiting
+            else None
+        ),
+        "terminated": (
+            pod.status.container_statuses[0].last_state.terminated.to_dict()
+            if pod.status.container_statuses[0].last_state.terminated
+            else None
+        ),
     }
 
     if (
@@ -511,7 +537,11 @@ def create_api_test_nodes():
                     },
                     "status": {
                         "phase": "Ready",
-                        "capacity": {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "2"},
+                        "capacity": {
+                            "cpu": "8",
+                            "memory": "32Gi",
+                            "nvidia.com/gpu": "2",
+                        },
                     },
                 }
             )
@@ -632,7 +662,10 @@ def create_api_test_pods():
                     "volumes": [
                         {
                             "name": "config-volume",
-                            "configMap": {"name": f"{base_name}-config", "defaultMode": 420},
+                            "configMap": {
+                                "name": f"{base_name}-config",
+                                "defaultMode": 420,
+                            },
                         }
                     ],
                 },
@@ -681,31 +714,37 @@ def create_api_test_pods():
                             "restartCount": random.randint(0, 3),
                             "started": phase == "Running",
                             "state": {
-                                "running": {"startedAt": current_time}
-                                if phase == "Running"
-                                else None,
-                                "terminated": {
-                                    "exitCode": 1,
-                                    "reason": "Error",
-                                    "startedAt": current_time,
-                                    "finishedAt": current_time,
-                                }
-                                if phase == "Failed"
-                                else None,
-                                "waiting": {"reason": "ContainerCreating"}
-                                if phase == "Pending"
-                                else None,
+                                "running": (
+                                    {"startedAt": current_time} if phase == "Running" else None
+                                ),
+                                "terminated": (
+                                    {
+                                        "exitCode": 1,
+                                        "reason": "Error",
+                                        "startedAt": current_time,
+                                        "finishedAt": current_time,
+                                    }
+                                    if phase == "Failed"
+                                    else None
+                                ),
+                                "waiting": (
+                                    {"reason": "ContainerCreating"} if phase == "Pending" else None
+                                ),
                             },
                             "lastState": {
                                 "running": None,
-                                "terminated": {
-                                    "exitCode": random.choice([0, 1]),
-                                    "reason": random.choice(["Completed", "Error", "OOMKilled"]),
-                                    "startedAt": current_time,
-                                    "finishedAt": current_time,
-                                }
-                                if random.random() > 0.5
-                                else None,
+                                "terminated": (
+                                    {
+                                        "exitCode": random.choice([0, 1]),
+                                        "reason": random.choice(
+                                            ["Completed", "Error", "OOMKilled"]
+                                        ),
+                                        "startedAt": current_time,
+                                        "finishedAt": current_time,
+                                    }
+                                    if random.random() > 0.5
+                                    else None
+                                ),
                                 "waiting": None,
                             },
                         }
@@ -792,7 +831,10 @@ def create_api_test_deployments():
                                     "terminationMessagePath": "/dev/termination-log",
                                     "terminationMessagePolicy": "File",
                                     "volumeMounts": [
-                                        {"mountPath": "/etc/config/", "name": "config-volume"}
+                                        {
+                                            "mountPath": "/etc/config/",
+                                            "name": "config-volume",
+                                        }
                                     ],
                                 }
                             ],
@@ -813,7 +855,10 @@ def create_api_test_deployments():
                             ],
                             "volumes": [
                                 {
-                                    "configMap": {"defaultMode": 420, "name": f"{app_name}-config"},
+                                    "configMap": {
+                                        "defaultMode": 420,
+                                        "name": f"{app_name}-config",
+                                    },
                                     "name": "config-volume",
                                 }
                             ],
@@ -911,7 +956,10 @@ def create_api_test_jobs():
                                     "terminationMessagePath": "/dev/termination-log",
                                     "terminationMessagePolicy": "File",
                                     "volumeMounts": [
-                                        {"mountPath": "/etc/config/", "name": "config-volume"}
+                                        {
+                                            "mountPath": "/etc/config/",
+                                            "name": "config-volume",
+                                        }
                                     ],
                                 }
                             ],
@@ -932,7 +980,10 @@ def create_api_test_jobs():
                             ],
                             "volumes": [
                                 {
-                                    "configMap": {"defaultMode": 420, "name": f"{app_name}-config"},
+                                    "configMap": {
+                                        "defaultMode": 420,
+                                        "name": f"{app_name}-config",
+                                    },
                                     "name": "config-volume",
                                 }
                             ],
@@ -947,9 +998,9 @@ def create_api_test_jobs():
                         {
                             "lastProbeTime": current_timestamp,
                             "lastTransitionTime": current_timestamp,
-                            "message": "Job completed successfully"
-                            if i % 3 == 1
-                            else "Job is running",
+                            "message": (
+                                "Job completed successfully" if i % 3 == 1 else "Job is running"
+                            ),
                             "reason": "Complete" if i % 3 == 1 else "Running",
                             "status": "True" if i % 3 == 1 else "False",
                             "type": "Complete",

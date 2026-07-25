@@ -1,41 +1,43 @@
+import hashlib
 import re
 from typing import Any, Optional
 
-from kubernetes.client import (
-    V1Service,
-    V1ObjectMeta,
-    V1PodTemplateSpec,
-    V1PodSpec,
-    V1PodSecurityContext,
-    V1Container,
-    V1ResourceRequirements,
-    V1ServiceSpec,
-    V1ServicePort,
-    V1Probe,
-    V1EnvVar,
-    V1Volume,
-    V1VolumeMount,
-    V1HostPathVolumeSource,
-    V1SecurityContext,
-    V1EmptyDirVolumeSource,
-    V1ExecAction,
-    V1Job,
-    V1JobSpec,
-)
-
 from chutes_common.schemas.chute import Chute
-from chutes_miner.api.k8s.constants import (
-    CHUTE_DEPLOY_PREFIX,
-    CHUTE_SVC_PREFIX,
-)
 from chutes_common.schemas.server import Server
 from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.exceptions import DeploymentFailure
+from chutes_miner.api.k8s.constants import CHUTE_DEPLOY_PREFIX, CHUTE_SVC_PREFIX
 from chutes_miner.api.util import semcomp
-
+from kubernetes.client import (
+    V1Container,
+    V1EmptyDirVolumeSource,
+    V1EnvVar,
+    V1ExecAction,
+    V1Job,
+    V1JobSpec,
+    V1LocalObjectReference,
+    V1ObjectMeta,
+    V1PodSecurityContext,
+    V1PodSpec,
+    V1PodTemplateSpec,
+    V1Probe,
+    V1ResourceRequirements,
+    V1SecurityContext,
+    V1Service,
+    V1ServicePort,
+    V1ServiceSpec,
+    V1Volume,
+    V1VolumeMount,
+)
 
 _VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
 MIN_SUPPORTED_CHUTES_VERSION = "0.3.61"
+
+
+def registry_pull_secret_name(config_id: str) -> str:
+    if not isinstance(config_id, str) or not config_id:
+        raise DeploymentFailure("launch config ID is absent")
+    return f"registry-scope-{hashlib.sha256(config_id.encode('utf-8')).hexdigest()[:40]}"
 
 
 def resolve_deployment_validator(chute: Chute, server: Server):
@@ -96,6 +98,8 @@ def build_chute_job(
     token: Optional[str] = None,
     job_id: Optional[str] = None,
     config_id: Optional[str] = None,
+    registry_repository: Optional[str] = None,
+    registry_manifest_digest: Optional[str] = None,
     disk_gb: int = 10,
     vm_version: Optional[str] = None,
 ) -> V1Job:
@@ -173,6 +177,19 @@ def build_chute_job(
     if chute.tee:
         extra_env += _tee_download_env(vm_version)
 
+    image = chute.image
+    if settings.gpu_tee_only:
+        if not registry_repository or not registry_manifest_digest:
+            raise DeploymentFailure(
+                f"Missing descriptor-closed registry scope for chute {chute.chute_id}."
+            )
+        image = f"{registry_repository}@{registry_manifest_digest}"
+    cache_size_gb = max(
+        1,
+        int(settings.cache_overrides.get(server.name, settings.cache_max_size_gb)),
+    )
+    ephemeral_storage_gb = int(disk_gb) + cache_size_gb
+
     return V1Job(
         metadata=V1ObjectMeta(
             name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}",
@@ -198,6 +215,11 @@ def build_chute_job(
                     termination_grace_period_seconds=settings.chute_shutdown_time_seconds,
                     node_name=server.name,  ## Start here
                     runtime_class_name=settings.nvidia_runtime,
+                    image_pull_secrets=(
+                        [V1LocalObjectReference(name=registry_pull_secret_name(config_id))]
+                        if settings.gpu_tee_only
+                        else None
+                    ),
                     security_context=V1PodSecurityContext(
                         run_as_user=1000,
                         run_as_group=1000,
@@ -205,16 +227,8 @@ def build_chute_job(
                     volumes=[
                         V1Volume(
                             name="cache",
-                            host_path=V1HostPathVolumeSource(
-                                path=f"/var/snap/cache/{chute.chute_id}",
-                                type="DirectoryOrCreate",
-                            ),
-                        ),
-                        V1Volume(
-                            name="raw-cache",
-                            host_path=V1HostPathVolumeSource(
-                                path="/var/snap/cache",
-                                type="DirectoryOrCreate",
+                            empty_dir=V1EmptyDirVolumeSource(
+                                size_limit=f"{cache_size_gb}Gi",
                             ),
                         ),
                         V1Volume(
@@ -226,54 +240,13 @@ def build_chute_job(
                             empty_dir=V1EmptyDirVolumeSource(medium="Memory", size_limit="16Gi"),
                         ),
                     ],
-                    init_containers=[
-                        V1Container(
-                            name="cache-init",
-                            image="parachutes/cache-cleaner:latest",
-                            image_pull_policy="Always",
-                            env=[
-                                V1EnvVar(
-                                    name="CLEANUP_EXCLUDE",
-                                    value=chute.chute_id,
-                                ),
-                                V1EnvVar(
-                                    name="HF_HOME",
-                                    value="/cache",
-                                ),
-                                V1EnvVar(
-                                    name="CIVITAI_HOME",
-                                    value="/cache/civitai",
-                                ),
-                                V1EnvVar(
-                                    name="CACHE_MAX_AGE_DAYS",
-                                    value=str(settings.cache_max_age_days),
-                                ),
-                                V1EnvVar(
-                                    name="CACHE_MAX_SIZE_GB",
-                                    value=str(
-                                        settings.cache_overrides.get(
-                                            server.name, settings.cache_max_size_gb
-                                        )
-                                    ),
-                                ),
-                                V1EnvVar(
-                                    name="NVIDIA_VISIBLE_DEVICES",
-                                    value=",".join(gpu_uuids),
-                                ),
-                            ],
-                            volume_mounts=[
-                                V1VolumeMount(name="raw-cache", mount_path="/cache"),
-                            ],
-                            security_context=V1SecurityContext(
-                                run_as_user=0,
-                                run_as_group=0,
-                            ),
-                        ),
-                    ],
                     containers=[
                         V1Container(
                             name="chute",
-                            image=f"{server.validator.lower()}.localregistry.chutes.ai:{settings.registry_proxy_port}/{chute.image}",
+                            image=(
+                                f"{server.validator.lower()}.localregistry.chutes.ai:"
+                                f"{settings.registry_proxy_port}/{image}"
+                            ),
                             image_pull_policy="Always",
                             env=[
                                 V1EnvVar(
@@ -346,12 +319,12 @@ def build_chute_job(
                                 requests={
                                     "cpu": cpu,
                                     "memory": ram,
-                                    "ephemeral-storage": f"{disk_gb}Gi",
+                                    "ephemeral-storage": f"{ephemeral_storage_gb}Gi",
                                 },
                                 limits={
                                     "cpu": cpu,
                                     "memory": ram,
-                                    "ephemeral-storage": f"{disk_gb}Gi",
+                                    "ephemeral-storage": f"{ephemeral_storage_gb}Gi",
                                 },
                             ),
                             volume_mounts=[

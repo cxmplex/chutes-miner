@@ -110,10 +110,12 @@ async def get_deployment_audit(start_time, end_time) -> list:
       it's part of a different audit entry.
     """
     async with get_session() as session:
-        query = text("""
+        query = text(
+            """
            SELECT * FROM deployment_audit
             WHERE deleted_at IS NULL OR (deleted_at >= :start_time AND deleted_at <= :end_time)
-        """)
+        """
+        )
         result = await session.execute(
             query,
             {
@@ -236,6 +238,11 @@ async def upload(report_data, block_number):
 
 
 async def main():
+    if settings.gpu_tee_only:
+        raise RuntimeError(
+            "seedless GPU audit export is disabled without an attested-session "
+            "commit/upload protocol"
+        )
     sha256, report_data = await generate_current_miner_audit_info()
 
     # Commit report checksum to our hotkey's metadata for this netuid.

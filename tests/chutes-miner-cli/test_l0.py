@@ -7,9 +7,10 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
+from chutes_miner_cli import l0
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -19,10 +20,32 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from chutes_miner_cli import l0
+
+def _storage_closure():
+    return {
+        "schema": "chutes.gpu-l0-storage-closure",
+        "version": 1,
+        "source_release_id": "cpu-storage-release",
+        "image_version": "1.10.0",
+        "image_sha256": "6" * 64,
+        "kernel_sha256": "7" * 64,
+        "initrd_sha256": "8" * 64,
+        "cmdline_sha256": "9" * 64,
+        "measurement_names": ["storage-baremetal-tdx-1.10.0-2vcpu-8g"],
+        "launch_contract": {
+            "role": "storage",
+            "qemu_binary": "qemu-system-x86_64",
+            "qemu_package": "qemu-system-x86",
+            "qemu_package_version": "1:10.1.0+ds-5ubuntu2.7",
+            "qemu_binary_sha256": "a" * 64,
+            "machine_type": "pc-q35-10.1",
+            "firmware_filename": "OVMF.inteltdx.fd",
+            "firmware_sha256": "b" * 64,
+        },
+    }
 
 
-def _signed_manifest(private_key, now):
+def _signed_manifest(private_key, now, *, compute_type="cpu"):
     def artifact(name, digit):
         return {
             "url": f"https://objects.example.com/l0/1/{name}",
@@ -32,7 +55,7 @@ def _signed_manifest(private_key, now):
 
     manifest = {
         "schema": "chutes.l0-bootstrap",
-        "version": 1,
+        "version": 2 if compute_type == "gpu" else 1,
         "tee_type": "tdx",
         "channel": "stable",
         "generation": 1,
@@ -47,11 +70,18 @@ def _signed_manifest(private_key, now):
         "issued_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
     }
+    if compute_type == "gpu":
+        manifest["compute_type"] = "gpu"
+        manifest["storage_closure"] = _storage_closure()
+        manifest["gpu_profile_id"] = "b200-8gpu"
+        manifest["gpu_qemu_sha256s"] = ["6" * 64]
+        manifest["gpu_tdvf_sha256s"] = ["7" * 64]
+        manifest["gpu_launch_public_key_id"] = "8" * 64
+        manifest["gpu_launch_public_key_epoch"] = 1
+        manifest["gpu_build_inputs_sha256"] = "9" * 64
     return {
         "manifest": manifest,
-        "signature": base64.b64encode(
-            private_key.sign(l0.canonical_json_bytes(manifest))
-        ).decode(),
+        "signature": base64.b64encode(private_key.sign(l0.canonical_json_bytes(manifest))).decode(),
     }
 
 
@@ -69,12 +99,8 @@ def _registry(private_key, now):
                         serialization.PublicFormat.Raw,
                     )
                 ).decode(),
-                "not_before": (now - timedelta(days=1))
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "not_after": (now + timedelta(days=30))
-                .isoformat()
-                .replace("+00:00", "Z"),
+                "not_before": (now - timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+                "not_after": (now + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
                 "enabled": True,
             }
         ],
@@ -87,12 +113,7 @@ def test_manifest_signature_tamper_and_expiry(monkeypatch):
     monkeypatch.setattr(l0, "_publisher_registry", lambda: _registry(private_key, now))
     signed = _signed_manifest(private_key, now)
 
-    assert (
-        l0.verify_bootstrap(signed, tee_type="tdx", channel="stable", now=now)[
-            "generation"
-        ]
-        == 1
-    )
+    assert l0.verify_bootstrap(signed, tee_type="tdx", channel="stable", now=now)["generation"] == 1
 
     tampered = json.loads(json.dumps(signed))
     tampered["manifest"]["generation"] = 2
@@ -104,6 +125,66 @@ def test_manifest_signature_tamper_and_expiry(monkeypatch):
             tee_type="tdx",
             channel="stable",
             now=now + timedelta(hours=2),
+        )
+
+
+def test_gpu_v2_manifest_is_strictly_compute_bound(monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(l0, "_publisher_registry", lambda: _registry(private_key, now))
+    gpu = _signed_manifest(private_key, now, compute_type="gpu")
+    cpu = _signed_manifest(private_key, now)
+
+    verified = l0.verify_bootstrap(
+        gpu,
+        tee_type="tdx",
+        channel="stable",
+        compute_type="gpu",
+        now=now,
+    )
+    assert verified["version"] == 2
+    assert verified["compute_type"] == "gpu"
+    assert verified["gpu_profile_id"] == "b200-8gpu"
+    with pytest.raises(l0.L0CliError):
+        l0.verify_bootstrap(
+            gpu,
+            tee_type="tdx",
+            channel="stable",
+            compute_type="cpu",
+            now=now,
+        )
+    missing_closure = _signed_manifest(private_key, now, compute_type="gpu")
+    del missing_closure["manifest"]["storage_closure"]
+    missing_closure["signature"] = base64.b64encode(
+        private_key.sign(l0.canonical_json_bytes(missing_closure["manifest"]))
+    ).decode()
+    with pytest.raises(l0.L0CliError, match="fields are not canonical"):
+        l0.verify_bootstrap(
+            missing_closure,
+            tee_type="tdx",
+            channel="stable",
+            compute_type="gpu",
+            now=now,
+        )
+    with pytest.raises(l0.L0CliError):
+        l0.verify_bootstrap(
+            cpu,
+            tee_type="tdx",
+            channel="stable",
+            compute_type="gpu",
+            now=now,
+        )
+    gpu["manifest"]["tee_type"] = "sev-snp"
+    gpu["signature"] = base64.b64encode(
+        private_key.sign(l0.canonical_json_bytes(gpu["manifest"]))
+    ).decode()
+    with pytest.raises(l0.L0CliError):
+        l0.verify_bootstrap(
+            gpu,
+            tee_type="sev-snp",
+            channel="stable",
+            compute_type="gpu",
+            now=now,
         )
 
 
@@ -135,6 +216,10 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
         manifest,
         manifest_signature=base64.b64encode(b"s" * 64).decode(),
         validator_api="https://api.example.com",
+        data_device_serial=None,
+        gpu_l0_profile=None,
+        storage_data_size_gb=None,
+        gpu_infra_size_gb=None,
         socket_url="wss://ws.example.com",
         validator_ca_url="https://objects.example.com/validator-ca.crt",
         host_id="host-1",
@@ -157,21 +242,84 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
     assert "chutes_l0_enrollment_b64=" in script
     assert "chutes_l0_manifest_url=" in script
     encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
-    boot_config = json.loads(
-        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    )
+    boot_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     assert boot_config["voucher"] == "voucher.secret"
     assert boot_config["enrollment_generation"] == 1
     assert boot_config["rotate_identity"] is False
+    assert boot_config["version"] == 1
+    assert "compute_type" not in boot_config
 
     output = tmp_path / "boot.ipxe"
     l0.write_private(output, script.encode())
     assert os.stat(output).st_mode & 0o777 == 0o600
 
+    gpu_manifest = _signed_manifest(
+        private_key,
+        now,
+        compute_type="gpu",
+    )["manifest"]
+    gpu_script = l0.render_ipxe(
+        gpu_manifest,
+        manifest_signature=base64.b64encode(b"s" * 64).decode(),
+        validator_api="https://api.example.com",
+        socket_url="wss://ws.example.com",
+        validator_ca_url="https://objects.example.com/validator-ca.crt",
+        host_id="gpu-host-1",
+        tee_type="tdx",
+        channel="stable",
+        data_device="/dev/nvme0n1",
+        data_device_id="nvme-gpu",
+        bootif="",
+        voucher="voucher.secret",
+        enrollment_generation=1,
+        rotate_identity=False,
+        cmdline="kvm_intel.tdx=1 nohibernate",
+        compute_type="gpu",
+        data_device_serial="GPU-SERIAL",
+        gpu_l0_profile="b200-8gpu",
+        storage_data_size_gb=500,
+        gpu_infra_size_gb=100,
+    )
+    encoded = re.search(
+        r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
+        gpu_script,
+    ).group(1)
+    gpu_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    assert gpu_config["version"] == 2
+    assert gpu_config["compute_type"] == "gpu"
+    assert gpu_config["storage_enabled"] is True
+    assert gpu_config["data_device_serial"] == "GPU-SERIAL"
+    assert gpu_config["gpu_l0_profile"] == "b200-8gpu"
+    assert gpu_config["storage_data_size_gb"] == 500
+    assert gpu_config["gpu_infra_size_gb"] == 100
+    assert "chutes_compute_type=gpu" in gpu_script
+    assert "chutes_data_device_serial=GPU-SERIAL" in gpu_script
+    with pytest.raises(l0.L0CliError, match="publisher-signed GPU L0 profile"):
+        l0.render_ipxe(
+            gpu_manifest,
+            manifest_signature=base64.b64encode(b"s" * 64).decode(),
+            validator_api="https://api.example.com",
+            socket_url="wss://ws.example.com",
+            validator_ca_url="https://objects.example.com/validator-ca.crt",
+            host_id="gpu-host-1",
+            tee_type="tdx",
+            channel="stable",
+            data_device="/dev/nvme0n1",
+            data_device_id="nvme-gpu",
+            bootif="",
+            voucher="voucher.secret",
+            enrollment_generation=1,
+            rotate_identity=False,
+            cmdline="kvm_intel.tdx=1 nohibernate",
+            compute_type="gpu",
+            data_device_serial="GPU-SERIAL",
+            gpu_l0_profile="b200-xeon6-8gpu-qemu10-2-numa",
+            storage_data_size_gb=500,
+            gpu_infra_size_gb=100,
+        )
 
-def test_prepare_boot_always_writes_enrollment_and_steady_scripts(
-    tmp_path, monkeypatch
-):
+
+def test_prepare_boot_always_writes_enrollment_and_steady_scripts(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
     signed = _signed_manifest(private_key, now)
@@ -212,8 +360,13 @@ def test_prepare_boot_always_writes_enrollment_and_steady_scripts(
     l0.prepare_boot(
         host_id="host-1",
         tee_type="tdx",
+        compute_type="cpu",
         data_device="/dev/nvme0n1",
         data_device_id="nvme-test",
+        data_device_serial=None,
+        gpu_l0_profile=None,
+        storage_data_size_gb=None,
+        gpu_infra_size_gb=None,
         output=enrollment,
         validator_ca_url="https://objects.example.com/validator-ca.crt",
         socket_url="wss://ws.example.com",
@@ -238,13 +391,127 @@ def test_prepare_boot_always_writes_enrollment_and_steady_scripts(
         r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
         enrollment.read_text(),
     ).group(1)
-    enrollment_config = json.loads(
-        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    )
+    enrollment_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     assert enrollment_config["voucher"] == "voucher.secret"
     mint_document = request.await_args.args[-1]
     assert "provider" not in mint_document
     assert "source" not in mint_document
+    assert mint_document["version"] == 1
+    assert "compute_type" not in mint_document
+
+
+def test_prepare_boot_uses_gpu_v2_manifest_and_enrollment(tmp_path, monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    signed = _signed_manifest(private_key, now, compute_type="gpu")
+    voucher = {
+        "schema": "chutes.host-enrollment-voucher",
+        "version": 2,
+        "voucher": "voucher.secret",
+        "claims": {
+            "host_id": "gpu-host-1",
+            "tee_type": "tdx",
+            "compute_type": "gpu",
+            "storage_enabled": True,
+            "enrollment_generation": 3,
+        },
+    }
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fetch = AsyncMock(
+        return_value=(
+            signed["manifest"],
+            "kvm_intel.tdx=1 nohibernate",
+            signed["signature"],
+        )
+    )
+    request = AsyncMock(return_value=(200, voucher))
+    monkeypatch.setattr(l0.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(l0, "_fetch_verified_bootstrap", fetch)
+    monkeypatch.setattr(l0, "_api_request", request)
+    enrollment = tmp_path / "gpu-enrollment.ipxe"
+    steady = tmp_path / "gpu-steady.ipxe"
+
+    l0.prepare_boot(
+        host_id="gpu-host-1",
+        tee_type="tdx",
+        compute_type="gpu",
+        data_device="/dev/nvme0n1",
+        data_device_id="nvme-gpu",
+        data_device_serial="GPU-SERIAL",
+        gpu_l0_profile="b200-8gpu",
+        storage_data_size_gb=500,
+        gpu_infra_size_gb=100,
+        output=enrollment,
+        validator_ca_url="https://objects.example.com/validator-ca.crt",
+        socket_url="wss://ws.example.com",
+        channel="stable",
+        provider=None,
+        source=None,
+        bootif="",
+        rotate_identity=False,
+        wait=False,
+        wait_timeout_seconds=None,
+        steady_output=steady,
+        hotkey="/unused",
+        validator_api="https://api.example.com",
+    )
+
+    fetch.assert_awaited_once_with(
+        ANY,
+        "https://api.example.com",
+        "/unused",
+        "tdx",
+        "stable",
+        "gpu",
+        "https://objects.example.com/validator-ca.crt",
+    )
+    mint_document = request.await_args.args[-1]
+    assert mint_document["version"] == 2
+    assert mint_document["compute_type"] == "gpu"
+    assert mint_document["storage_enabled"] is True
+    encoded = re.search(
+        r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
+        enrollment.read_text(),
+    ).group(1)
+    boot_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    assert boot_config["version"] == 2
+    assert boot_config["compute_type"] == "gpu"
+    assert boot_config["storage_enabled"] is True
+
+
+def test_gpu_boot_renderer_rejects_missing_public_disk_contract():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    manifest = _signed_manifest(private_key, now, compute_type="gpu")["manifest"]
+    with pytest.raises(l0.L0CliError, match="requires serial"):
+        l0.render_ipxe(
+            manifest,
+            manifest_signature=base64.b64encode(b"s" * 64).decode(),
+            validator_api="https://api.example.com",
+            socket_url="wss://ws.example.com",
+            validator_ca_url="https://objects.example.com/validator-ca.crt",
+            host_id="gpu-host",
+            tee_type="tdx",
+            channel="stable",
+            data_device="/dev/nvme0n1",
+            data_device_id="nvme-gpu",
+            bootif="",
+            voucher="voucher.secret",
+            enrollment_generation=1,
+            rotate_identity=False,
+            cmdline="kvm_intel.tdx=1 nohibernate",
+            compute_type="gpu",
+        )
 
 
 @pytest.mark.parametrize(
@@ -396,11 +663,11 @@ def test_pcs_envelope_interoperability(monkeypatch):
         def sign(_payload):
             return b"s" * 64
 
-    monkeypatch.setattr(
-        l0, "_load_hotkey", lambda _path: ({"ss58Address": "owner"}, SigningKey())
-    )
+    monkeypatch.setattr(l0, "_load_hotkey", lambda _path: ({"ss58Address": "owner"}, SigningKey()))
     plaintext = b"pcs-subscription-key"
     envelope = l0._pcs_envelope("/unused", status, plaintext)
+    assert envelope["version"] == 1
+    assert "compute_type" not in envelope["aad"]
     aad = l0.canonical_json_bytes(envelope["aad"])
     peer = X25519PublicKey.from_public_bytes(
         base64.b64decode(envelope["sender_ephemeral_public_key"])
@@ -419,3 +686,118 @@ def test_pcs_envelope_interoperability(monkeypatch):
         )
         == plaintext
     )
+
+    gpu_status = {
+        **status,
+        "version": 2,
+        "tee_type": "tdx",
+        "compute_type": "gpu",
+        "storage_enabled": True,
+    }
+    gpu_envelope = l0._pcs_envelope("/unused", gpu_status, plaintext)
+    assert gpu_envelope["version"] == 2
+    assert gpu_envelope["aad"]["compute_type"] == "gpu"
+    gpu_aad = l0.canonical_json_bytes(gpu_envelope["aad"])
+    gpu_peer = X25519PublicKey.from_public_bytes(
+        base64.b64decode(gpu_envelope["sender_ephemeral_public_key"])
+    )
+    gpu_key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=hashlib.sha256(gpu_aad).digest(),
+        info=b"chutes/model-b/pcs-mailbox/v2",
+    ).derive(recipient_private.exchange(gpu_peer))
+    assert (
+        ChaCha20Poly1305(gpu_key).decrypt(
+            base64.b64decode(gpu_envelope["nonce"]),
+            base64.b64decode(gpu_envelope["ciphertext"]),
+            gpu_aad,
+        )
+        == plaintext
+    )
+
+
+def test_gpu_start_uses_validator_owned_server_and_process_identity(monkeypatch, capsys):
+    claims = {
+        "schema": "chutes.gpu-launch-reservation",
+        "version": 1,
+        "management_mode": "miner",
+        "host_id": "gpu-host",
+        "server_id": "gpu-miner-validator-owned",
+        "reservation_id": "reservation-1",
+        "process_incarnation": "process-validator-owned",
+        "allocation_group_id": "group-1",
+        "allocation_group_generation": 3,
+    }
+    request = AsyncMock(
+        return_value=(
+            200,
+            {
+                "schema": "chutes.gpu-launch-reservation-result",
+                "version": 1,
+                "token": "redacted-launch-capability",
+                "claims": claims,
+                "claims_sha256": "a" * 64,
+            },
+        )
+    )
+    monkeypatch.setattr(l0, "_api_request", request)
+
+    l0.gpu_start(
+        host_id="gpu-host",
+        gpu_identifier="b200",
+        gpu_count=8,
+        minimum_vram_mib=196608,
+        miner_hourly_cost=12.5,
+        legacy_vm_name=None,
+        hotkey="/hotkey",
+        validator_api="https://validator.example",
+    )
+
+    body = request.await_args.args[5]
+    assert set(body) == {
+        "schema",
+        "version",
+        "gpu_identifier",
+        "gpu_count",
+        "minimum_vram_mib",
+        "miner_hourly_cost",
+    }
+    assert body["miner_hourly_cost"] == 12.5
+    assert "server_id" not in body
+    assert "process_incarnation" not in body
+    output = json.loads(capsys.readouterr().out)
+    assert output["server_id"] == "gpu-miner-validator-owned"
+    assert "redacted-launch-capability" not in output.values()
+
+
+def test_gpu_stop_requests_whole_fabric_teardown_without_seed(monkeypatch, capsys):
+    request = AsyncMock(
+        return_value=(
+            200,
+            {
+                "schema": "chutes.gpu-miner-stop-result",
+                "version": 1,
+                "server_id": "gpu-miner-validator-owned",
+                "reservation_id": "reservation-1",
+                "status": "teardown_requested",
+            },
+        )
+    )
+    monkeypatch.setattr(l0, "_api_request", request)
+
+    l0.gpu_stop(
+        server_id="gpu-miner-validator-owned",
+        reason="operator stop",
+        hotkey="/hotkey",
+        validator_api="https://validator.example",
+    )
+
+    body = request.await_args.args[5]
+    assert body == {
+        "schema": "chutes.gpu-miner-stop-request",
+        "version": 1,
+        "reason": "operator stop",
+    }
+    assert "seed" not in json.dumps(body).lower()
+    assert json.loads(capsys.readouterr().out)["status"] == "teardown_requested"

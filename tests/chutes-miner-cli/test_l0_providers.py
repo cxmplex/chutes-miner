@@ -89,9 +89,7 @@ def test_latitude_adapter_applies_private_ipxe_and_reports_only_state(
     assert ipxe.read_text(encoding="ascii") not in json.dumps(result)
 
 
-def test_ovh_adapter_verifies_exact_script_before_hard_reboot(
-    tmp_path, monkeypatch, capsys
-):
+def test_ovh_adapter_verifies_exact_script_before_hard_reboot(tmp_path, monkeypatch, capsys):
     ipxe = _private_ipxe(tmp_path)
     script = ipxe.read_text(encoding="ascii")
     token = "OVH_TOKEN_CANARY"
@@ -115,9 +113,7 @@ def test_ovh_adapter_verifies_exact_script_before_hard_reboot(
         timeout_seconds=30,
     )
 
-    server_url = (
-        "https://api.us.ovhcloud.com/v1/dedicated/server/ns1030904.ip-40-160-16.us"
-    )
+    server_url = "https://api.us.ovhcloud.com/v1/dedicated/server/ns1030904.ip-40-160-16.us"
     assert [(call.args[1], call.args[2]) for call in request.await_args_list] == [
         ("PUT", server_url),
         ("GET", server_url),

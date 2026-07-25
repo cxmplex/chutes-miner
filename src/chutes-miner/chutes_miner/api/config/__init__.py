@@ -96,6 +96,7 @@ class Settings(CommonSettings):
     monitor_api: str = str(os.getenv("MONITOR_API", ""))
 
     reconcile_clusters: bool = os.getenv("RECONCILE_CLUSTERS", "false").lower() == "true"
+    gpu_tee_only: bool = os.getenv("GPU_TEE_ONLY", "false").lower() == "true"
 
     service_account_token_path: str = os.getenv(
         "SERVICE_ACCOUNT_TOKEN_PATH",

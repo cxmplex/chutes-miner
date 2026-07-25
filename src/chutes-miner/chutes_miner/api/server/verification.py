@@ -4,12 +4,17 @@ from contextlib import asynccontextmanager
 import json
 import ssl
 import time
+import uuid
 
 import aiohttp
 import backoff
 from chutes_common.settings import Validator
 from chutes_miner.api.config import settings
-from chutes_miner.api.server.schemas import MultiNodeArgsRequest, NodeArgs, ServerArgsRequest
+from chutes_miner.api.server.schemas import (
+    MultiNodeArgsRequest,
+    NodeArgs,
+    ServerArgsRequest,
+)
 import chutes_common.constants as cst
 from chutes_common.auth import sign_request
 from chutes_common.k8s import WatchEventType
@@ -91,6 +96,10 @@ class VerificationStrategy(ABC):
     @classmethod
     async def create(cls, node: V1Node, server_args: ServerArgs, server: Server):
         """Async factory method."""
+        if settings.gpu_tee_only:
+            raise TEEBootstrapFailure(
+                "GPU TEE 1.11 uses registrar adoption and cannot activate legacy verification."
+            )
         is_tee = node.metadata.labels.get("chutes/tee", "false").lower() == "true"
 
         if is_tee:
@@ -167,7 +176,13 @@ class VerificationStrategy(ABC):
                 gpu = GPU(
                     server_id=server_id,
                     validator=validator,
-                    gpu_id=device_info["uuid"],
+                    gpu_id=str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"chutes:nvidia:{server_id}:{device_info['uuid']}",
+                        )
+                    ),
+                    hardware_uuid=device_info["uuid"],
                     device_info=device_info,
                     model_short_ref=gpu_short_ref,
                     verified=False,
@@ -231,7 +246,11 @@ class GravalVerificationStrategy(VerificationStrategy):
         await self.emit_message("graval bootstrap job/service created, gathering device info...")
 
     async def _deploy_graval(
-        self, node_object: V1Node, validator_hotkey: str, cpu_per_gpu: int, memory_per_gpu: int
+        self,
+        node_object: V1Node,
+        validator_hotkey: str,
+        cpu_per_gpu: int,
+        memory_per_gpu: int,
     ):
         """
         Create a job of the GraVal base validation service on a node.
@@ -417,6 +436,10 @@ class GravalVerificationStrategy(VerificationStrategy):
         """
         Query the GraVal bootstrap API for device info.
         """
+        if settings.gpu_tee_only:
+            raise TEEBootstrapFailure(
+                "GPU TEE 1.11 cannot use miner-keypair GraVal authentication."
+            )
         nonce = str(int(time.time()))
         headers = {
             cst.MINER_HEADER: settings.miner_ss58,
@@ -498,13 +521,14 @@ class GravalVerificationStrategy(VerificationStrategy):
                 f"validators produced differing seeds {seed} vs {validator_nodes[0]['seed']}"
             )
         await self.emit_message(
-            f"successfully advertised node {self.node.metadata.uid} to validator {validator.hotkey}, received seed: {seed}"
+            f"successfully advertised node for logical server {self.server.server_id} "
+            f"to validator {validator.hotkey}, received legacy seed"
         )
 
         async with get_session() as session:
             await session.execute(
                 update(Server)
-                .where(Server.server_id == self.node.metadata.uid)
+                .where(Server.server_id == self.server.server_id)
                 .values({"seed": seed})
             )
             await session.commit()
@@ -621,7 +645,11 @@ class GravalVerificationStrategy(VerificationStrategy):
 
             async with get_session() as session:
                 server = (
-                    (await session.execute(select(Server).where(Server.server_id == node_uid)))
+                    (
+                        await session.execute(
+                            select(Server).where(Server.kubernetes_node_uid == node_uid)
+                        )
+                    )
                     .unique()
                     .scalar_one_or_none()
                 )
@@ -836,7 +864,11 @@ class TEEVerificationStrategy(VerificationStrategy):
             async with get_session() as session:
                 server_id = None
                 server = (
-                    (await session.execute(select(Server).where(Server.server_id == node_uid)))
+                    (
+                        await session.execute(
+                            select(Server).where(Server.kubernetes_node_uid == node_uid)
+                        )
+                    )
                     .unique()
                     .scalar_one_or_none()
                 )

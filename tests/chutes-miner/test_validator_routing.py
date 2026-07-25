@@ -164,7 +164,10 @@ async def test_get_launch_token_rejects_unsupported_runtime_before_request(
 ):
     gepetto = _gepetto()
     with pytest.raises(DeploymentFailure, match="Unsupported chutes runtime version"):
-        await gepetto.get_launch_token(_chute(chutes_version="0.3.60"))
+        await gepetto.get_launch_token(
+            _chute(chutes_version="0.3.60"),
+            _server(),
+        )
     mock_aiohttp_response.json.assert_not_awaited()
 
 
@@ -177,7 +180,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "config_id": "config-1",
     }
 
-    assert await gepetto.get_launch_token(_chute()) == {
+    assert await gepetto.get_launch_token(_chute(), _server()) == {
         "token": "launch-token",
         "config_id": "config-1",
     }
@@ -187,8 +190,41 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "config_id": "config-1",
         "code": "print('legacy placeholder')",
     }
-    with pytest.raises(DeploymentFailure, match="expected exactly token and config_id"):
-        await gepetto.get_launch_token(_chute())
+    with pytest.raises(DeploymentFailure, match="expected exactly"):
+        await gepetto.get_launch_token(_chute(), _server())
+
+    mock_aiohttp_response.json.return_value = {
+        "token": "launch-token",
+        "config_id": "config-1",
+        "storage_session": "must-arrive-only-after-verified-launch",
+    }
+    with pytest.raises(DeploymentFailure, match="expected exactly"):
+        await gepetto.get_launch_token(_chute(), _server())
+
+
+@pytest.mark.asyncio
+async def test_seedless_launch_token_registers_exact_descriptor_scope(
+    monkeypatch,
+    mock_aiohttp_response,
+):
+    gepetto = _gepetto()
+    gepetto._register_registry_scope = AsyncMock()
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    root = f"sha256:{'a' * 64}"
+    mock_aiohttp_response.status = 200
+    mock_aiohttp_response.json.return_value = {
+        "token": "launch-token",
+        "config_id": "config-1",
+        "registry": {
+            "repository": "owner/image",
+            "manifest_digest": root,
+        },
+    }
+    server = _server()
+    result = await gepetto.get_launch_token(_chute(), server)
+    assert result["registry"]["manifest_digest"] == root
+    gepetto._register_registry_scope.assert_awaited_once()
+    assert gepetto._register_registry_scope.await_args.args[1] is server
 
 
 @pytest.mark.parametrize(
@@ -335,6 +371,26 @@ async def test_scale_up_candidate_selection_rejects_unknown_validator():
 
 
 @pytest.mark.asyncio
+async def test_normal_scale_up_skips_nonpositive_hourly_cost():
+    chute = _chute()
+    invalid = _server(hourly_cost=0.0)
+    with (
+        patch.object(
+            gepetto_module,
+            "get_session",
+            _session_factory([_ScalarResult(scalars=[invalid])]),
+        ),
+        patch.object(
+            gepetto_module.k8s,
+            "check_node_has_disk_available",
+            new=AsyncMock(return_value=True),
+        ) as disk_check,
+    ):
+        assert await Gepetto.optimal_scale_up_server(chute) is None
+    disk_check.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_job_propagates_version_and_launch_context():
     gepetto = _gepetto()
     chute = _chute()
@@ -363,6 +419,20 @@ async def test_run_job_propagates_version_and_launch_context():
     assert deploy.await_args.kwargs["token"] == "launch-jwt"
     assert deploy.await_args.kwargs["config_id"] == "config-1"
     assert deploy.await_args.kwargs["job_id"] == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_job_path_rejects_nonpositive_hourly_cost_before_token_fetch():
+    gepetto = _gepetto()
+    chute = _chute()
+    server = _server(hourly_cost=0.0)
+    gepetto.get_launch_token = AsyncMock()
+    gepetto.release_job = AsyncMock()
+    with patch.object(gepetto_module.k8s, "deploy_chute", new=AsyncMock()) as deploy:
+        await gepetto.run_job(chute, "job-1", server, settings.validators[0])
+    gepetto.get_launch_token.assert_not_awaited()
+    deploy.assert_not_awaited()
+    gepetto.release_job.assert_awaited_once_with(chute, "job-1")
 
 
 @pytest.mark.asyncio
@@ -473,6 +543,37 @@ async def test_preemption_rejects_cross_validator_candidate_before_token_fetch()
 
 
 @pytest.mark.asyncio
+async def test_preemption_skips_nonpositive_hourly_cost_candidate():
+    gepetto = _gepetto()
+    chute = _chute()
+    gepetto.remote_chutes[VALIDATOR][chute.chute_id] = {
+        "effective_compute_multiplier": 2.0
+    }
+    invalid = _server(hourly_cost=0.0)
+    with (
+        patch.object(
+            gepetto_module,
+            "get_session",
+            _session_factory(
+                [
+                    _ScalarResult(scalar=None),
+                    _ScalarResult(scalars=[invalid]),
+                ]
+            ),
+        ),
+        patch.object(
+            gepetto_module.k8s,
+            "check_node_has_disk_available",
+            new=AsyncMock(return_value=True),
+        ) as disk_check,
+        patch.object(gepetto_module.k8s, "deploy_chute", new=AsyncMock()) as deploy,
+    ):
+        assert not await gepetto.preempting_deploy(chute)
+    disk_check.assert_not_awaited()
+    deploy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rolling_update_propagates_version_on_matching_server():
     gepetto = _gepetto()
     gepetto._scale_lock = __import__("asyncio").Lock()
@@ -512,6 +613,36 @@ async def test_rolling_update_propagates_version_on_matching_server():
 
     assert deploy.await_args.kwargs["vm_version"] == "1.8.0"
     gepetto.undeploy.assert_awaited_once_with("deployment-old")
+
+
+@pytest.mark.asyncio
+async def test_rolling_update_preserves_existing_deployment_with_invalid_hourly_cost():
+    gepetto = _gepetto()
+    gepetto._scale_lock = __import__("asyncio").Lock()
+    server = _server(hourly_cost=0.0)
+    deployment = SimpleNamespace(deployment_id="deployment-old", server=server)
+    gepetto.undeploy = AsyncMock()
+    gepetto.load_chute = AsyncMock()
+    gepetto.get_launch_token = AsyncMock()
+    with (
+        patch.object(
+            gepetto_module,
+            "get_session",
+            _session_factory([_ScalarResult(scalar=deployment)]),
+        ),
+        patch.object(gepetto_module.k8s, "deploy_chute", new=AsyncMock()) as deploy,
+    ):
+        await gepetto.rolling_update(
+            {
+                "chute_id": "chute-1",
+                "new_version": "2.0.0",
+                "validator": VALIDATOR,
+                "instance_id": "instance-1",
+            }
+        )
+    gepetto.undeploy.assert_not_awaited()
+    gepetto.get_launch_token.assert_not_awaited()
+    deploy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -583,6 +714,7 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
         gpus=[
             GPU(
                 gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
                 server_id="server-1",
                 verified=True,
                 deployment_id=None,
@@ -610,6 +742,7 @@ async def test_atomic_gpu_claim_fails_on_partial_contention():
         gpus=[
             GPU(
                 gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
                 server_id="server-1",
                 verified=True,
                 deployment_id=None,

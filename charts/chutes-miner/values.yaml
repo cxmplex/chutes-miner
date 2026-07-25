@@ -1,5 +1,14 @@
+seedlessStack:
+  image: ""
+  runtimeHostPath: /run/chutes-gpu
+  sessionEnvPath: /run/chutes-gpu/miner-session.env
+  sessionJsonPath: /run/chutes-gpu/miner-session.json
+  registrationPath: /run/chutes-gpu/registration.json
+  attestedCertPath: /run/chutes-tls/server.crt
+  kubectlImage: bitnamilegacy/kubectl@sha256:cd354d5b25562b195b277125439c23e4046902d7f1abc0dc3c75aad04d298c17
+
 # Set this value to true if oeprating a mutli cluster k3s environment
-multiCluster: true
+multiCluster: false
 
 calico: true
 
@@ -25,8 +34,7 @@ validators:
       socket: wss://ws.chutes.ai
 
 minerApi:
-  image: parachutes/miner:k3s-latest
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   resources:
     requests:
       cpu: "250m"
@@ -39,21 +47,14 @@ minerApi:
     nodePort: 32000
     port: 8000
     targetPort: 8000
-  nodeSelector: {}
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: nvidia.com/gpu.present
-            operator: NotIn
-            values: ["true"]
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
+  affinity: {}
   tolerations: []
 
 
 gepetto:
-  image: parachutes/miner:k3s-latest
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   # Enable validator migrations (run on Gepetto startup). Default true in charts.
   validatorMigrationsEnabled: true
   # Seconds to wait for a new deployment to appear in the pod cache after job creation.
@@ -65,19 +66,13 @@ gepetto:
     limits:
       cpu: "1"
       memory: "2Gi"
-  nodeSelector: {}
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: nvidia.com/gpu.present
-            operator: NotIn
-            values: ["true"]
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
+  affinity: {}
   tolerations: []
 
 postgres:
-  image: postgres:16
+  image: postgres@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
   imagePullPolicy: IfNotPresent
   persistence:
     enabled: true
@@ -96,31 +91,18 @@ postgres:
     type: ClusterIP
     port: 5432
     targetPort: 5432
-  nodeSelector: {}
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: kubernetes.io/hostname
-            operator: In
-            values:
-            - chutes-miner-cpu-0
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
+  affinity: {}
   tolerations: []
 
 redis:
-  image: redis:7
+  image: redis@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
   imagePullPolicy: IfNotPresent
   replicaCount: 1
-  nodeSelector: {}
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: nvidia.com/gpu.present
-            operator: NotIn
-            values: ["true"]
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
+  affinity: {}
   tolerations: []
   resources:
     requests:
@@ -143,13 +125,12 @@ registry:
     nodePort: 30500
 
 auditExporter:
-  image: parachutes/miner:k3s-latest
-  nodeSelector:
-    kubernetes.io/hostname: chutes-miner-cpu-0
+  enabled: false
+  nodeSelector: {}
 
 monitor:
-  image: parachutes/chutes-monitor:k3s-latest
-  imagePullPolicy: Always
+  enabled: false
+  imagePullPolicy: IfNotPresent
   # Interval in seconds for the monitoring reconciliation loop (cache sync + reinitiate unhealthy clusters)
   reconciliationIntervalSeconds: 60
   # Minimum seconds between reinitiate attempts per cluster (throttle for reinitiate-unhealthy)
@@ -166,14 +147,12 @@ monitor:
     nodePort: 32001
     port: 8000
     targetPort: 8000
-  nodeSelector: {}
+  nodeSelector:
+    chutes/seedless-control-plane: "true"
   affinity: {}
 
 # Miner credentials - These are provided via Ansible deployment
 # These values are automatically injected during deployment and should not be set manually
 # as they are sensitive values
 minerCredentials:
-  # SS58 address for the miner - provided by Ansible from hotkey file
-  ss58Address: "REPLACE_WITH_ANSIBLE_SS58_ADDRESS"
-  # Secret seed for the miner (hex prefix removed) - provided by Ansible from hotkey file  
-  secretSeed: "REPLACE_WITH_ANSIBLE_SECRET_SEED"
+  ownerSs58: "REPLACE_WITH_ATTESTED_OWNER_SS58"

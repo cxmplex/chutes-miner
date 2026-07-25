@@ -37,21 +37,31 @@ spec:
       priorityClassName: critical-priority
       containers:
         - name: agent
-          image: "{{ .Values.agent.image }}"
+          image: "{{ .Values.seedlessStack.image }}"
           imagePullPolicy: {{ .Values.agent.imagePullPolicy }}
+          command:
+            - python
+            - -m
+            - uvicorn
+            - --host
+            - 0.0.0.0
+            - --port
+            - "{{ .Values.agent.service.targetPort }}"
+            - chutes_agent.api.main:app
           env:
-            - name: MINER_SS58
+            - name: MINER_OWNER_SS58
               valueFrom:
                 secretKeyRef:
                   name: miner-credentials
-                  key: ss58
-            - name: MINER_SEED
-              valueFrom:
-                secretKeyRef:
-                  name: miner-credentials
-                  key: seed
-            - name: VALIDATORS
-              value: {{ .Values.validators | toJson | quote }}
+                  key: owner
+            - name: CHUTES_ATTESTED_SESSION_FILE
+              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
+            - name: CHUTES_VALIDATORS_FILE
+              value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
+            - name: CHUTES_GPU_REGISTRATION_FILE
+              value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: GPU_TEE_ONLY
+              value: "true"
             - name: CLUSTER_NAME
               valueFrom:
                 fieldRef:
@@ -65,6 +75,9 @@ spec:
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
           volumeMounts:
+            - name: chutes-gpu-runtime
+              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+              readOnly: true
             - name: chutes-agent-state
               mountPath: /app/state
               readOnly: false
@@ -85,6 +98,10 @@ spec:
             timeoutSeconds: 3        # Shorter timeout
             failureThreshold: 3      # Fail after 3 consecutive failures
       volumes:
+        - name: chutes-gpu-runtime
+          hostPath:
+            path: {{ .Values.seedlessStack.runtimeHostPath }}
+            type: Directory
         - name: chutes-agent-state
           hostPath:
             path: /var/lib/chutes/agent

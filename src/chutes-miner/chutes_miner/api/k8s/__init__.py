@@ -50,12 +50,20 @@ async def wait_for_deletion(label_selector: str, timeout_seconds: int = 120):
     return await K8sOperator().wait_for_deletion(label_selector, timeout_seconds)
 
 
-async def undeploy(deployment_id: str, timeout_seconds: int | None = None):
+async def undeploy(
+    deployment_id: str,
+    timeout_seconds: int | None = None,
+    config_id: str | None = None,
+):
     """
     Delete a deployment, and associated service.
     Uses chute_shutdown_time_seconds when timeout not specified.
     """
-    return await K8sOperator().undeploy(deployment_id, timeout_seconds=timeout_seconds)
+    return await K8sOperator().undeploy(
+        deployment_id,
+        timeout_seconds=timeout_seconds,
+        config_id=config_id,
+    )
 
 
 async def delete_preflight(deployment_id: str, timeout_seconds: int = 120) -> bool:
@@ -69,6 +77,8 @@ async def deploy_chute(
     token: str = None,
     job_id: str = None,
     config_id: str = None,
+    registry_repository: str = None,
+    registry_manifest_digest: str = None,
     disk_gb: int = 10,
     extra_labels: dict[str, str] = {},
     extra_service_ports: list[dict[str, Any]] = [],
@@ -80,13 +90,15 @@ async def deploy_chute(
     return await K8sOperator().deploy_chute(
         chute_id,
         server_id,
-        token,
-        job_id,
-        config_id,
-        disk_gb,
-        extra_labels,
-        extra_service_ports,
-        vm_version,
+        token=token,
+        job_id=job_id,
+        config_id=config_id,
+        registry_repository=registry_repository,
+        registry_manifest_digest=registry_manifest_digest,
+        disk_gb=disk_gb,
+        extra_labels=extra_labels,
+        extra_service_ports=extra_service_ports,
+        vm_version=vm_version,
     )
 
 

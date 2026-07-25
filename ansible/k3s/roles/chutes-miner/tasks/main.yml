@@ -1,4 +1,61 @@
 ---
+- name: Create legacy cutover helper directory
+  ansible.builtin.file:
+    path: /usr/local/libexec/chutes
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install legacy K3s admin preparation helper
+  ansible.builtin.copy:
+    src: prepare-legacy-kubeconfig.py
+    dest: /usr/local/libexec/chutes/prepare-legacy-kubeconfig
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install ephemeral legacy K3s admin preparation service
+  ansible.builtin.copy:
+    src: chutes-legacy-kubeconfig-prepare.service
+    dest: /etc/systemd/system/chutes-legacy-kubeconfig-prepare.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install one-use legacy GPU cutover service
+  ansible.builtin.copy:
+    src: chutes-legacy-gpu-cutover.service
+    dest: /etc/systemd/system/chutes-legacy-gpu-cutover.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create k3s post-start drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/k3s-post-start.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Order legacy admin preparation before normal purge
+  ansible.builtin.copy:
+    src: legacy-cutover-kubeconfig.conf
+    dest: /etc/systemd/system/k3s-post-start.service.d/legacy-cutover-kubeconfig.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd for legacy GPU cutover service
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable ephemeral legacy K3s admin preparation
+  ansible.builtin.systemd:
+    name: chutes-legacy-kubeconfig-prepare.service
+    enabled: true
+
 - name: Setup monitoring
   ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/charts/deploy_monitoring.yml"
   tags: monitoring

@@ -1,6 +1,7 @@
 from collections import namedtuple
 import pytest
 import asyncio
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest_asyncio
@@ -111,4 +112,7 @@ async def resource_monitor(
 
     yield monitor
     monitor.stop = original_stop
-    await monitor.stop()
+    from chutes_agent.exceptions import InvalidOperationError
+
+    with suppress(InvalidOperationError, TypeError):
+        await monitor.stop()

@@ -37,9 +37,9 @@ spec:
       {{- end }}
       containers:
         - name: api
-          image: "{{ .Values.gepetto.image }}"
+          image: "{{ .Values.seedlessStack.image }}"
           imagePullPolicy: {{ .Values.gepetto.imagePullPolicy }}
-          command: ["python", "gepetto.py"]
+          command: ["python", "-m", "chutes_miner.gepetto"]
           env:
             - name: CACHE_MAX_AGE_DAYS
               value: "{{ .Values.cache.max_age_days }}"
@@ -49,16 +49,13 @@ spec:
             - name: CACHE_OVERRIDES
               value: {{ .Values.cache.overrides | toJson | quote }}
             {{- end }}
-            - name: MINER_SS58
+            - name: MINER_OWNER_SS58
               valueFrom:
                 secretKeyRef:
                   name: miner-credentials
-                  key: ss58
-            - name: MINER_SEED
-              valueFrom:
-                secretKeyRef:
-                  name: miner-credentials
-                  key: seed
+                  key: owner
+            - name: CHUTES_ATTESTED_SESSION_FILE
+              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -73,8 +70,12 @@ spec:
               value: {{ include "postgresql.url" . }}
             - name: REDIS_URL
               value: {{ include "redis.url" . }}
-            - name: VALIDATORS
-              value: {{ .Values.validators | toJson | quote }}
+            - name: CHUTES_VALIDATORS_FILE
+              value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
+            - name: CHUTES_GPU_REGISTRATION_FILE
+              value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: GPU_TEE_ONLY
+              value: "true"
             - name: REGISTRY_PROXY_PORT
               value: "{{ .Values.registry.service.nodePort }}"
             - name: VALIDATOR_MIGRATIONS_ENABLED
@@ -93,10 +94,11 @@ spec:
           resources:
             {{- toYaml .Values.gepetto.resources | nindent 12 }}
           volumeMounts:
-            - name: gepetto-code
-              mountPath: /app/gepetto.py
-              subPath: gepetto.py
+            - name: chutes-gpu-runtime
+              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+              readOnly: true
       volumes:
-        - name: gepetto-code
-          configMap:
-            name: gepetto-code
+        - name: chutes-gpu-runtime
+          hostPath:
+            path: {{ .Values.seedlessStack.runtimeHostPath }}
+            type: Directory

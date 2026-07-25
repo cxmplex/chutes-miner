@@ -18,18 +18,16 @@
       ansible.builtin.include_role:
         name: chutes-miner
 
-    - name: Create gepetto-cm on control cluster
+    - name: Remove retired gepetto source override
       kubernetes.core.k8s:
         kubeconfig: "{{ k3s_kubeconfig_path }}"
-        state: present # Ensures it exists and matches this definition. Updates if different.
+        state: absent
         definition:
           apiVersion: v1
           kind: ConfigMap
           metadata:
             name: gepetto-code
             namespace: chutes
-          data:
-            gepetto.py: "{{ lookup('file', '{{ playbook_dir }}/../tasks/migration/files/gepetto-k3s.py') }}"
 
     - name: Ensure ansible directory exists
       ansible.builtin.file:

@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "chutes-seedless-stack"
+version = "1.11.0"
+description = "Locked dependencies for the unpublished TDX miner stack image"
+authors = ["Chutes <support@chutes.ai>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+chutes-miner = {path = "../../src/chutes-miner"}
+chutes-agent = {path = "../../src/chutes-agent"}
+chutes-monitor = {path = "../../src/chutes-monitor"}
+chutes-registry = {path = "../../src/chutes-registry"}
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

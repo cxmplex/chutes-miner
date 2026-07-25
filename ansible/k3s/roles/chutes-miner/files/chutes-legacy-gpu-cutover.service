@@ -1,0 +1,22 @@
+[Unit]
+Description=One-use legacy GPU custody cutover
+Requires=chutes-legacy-kubeconfig-prepare.service
+After=network-online.target k3s.service chutes-legacy-kubeconfig-prepare.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml
+ExecStart=/usr/local/bin/chutes-miner l0 gpu-legacy-cutover-run --bundle-path /run/chutes/legacy-gpu-cutover.json
+ExecStopPost=/usr/bin/rm -f /run/chutes/legacy-k3s-admin.yaml
+RemainAfterExit=no
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/run/chutes /cache/storage /var/snap /var/lib/rancher /var/lib/kubelet /var/lib/chutes /etc/rancher /etc/admission-controller
+NoNewPrivileges=yes
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

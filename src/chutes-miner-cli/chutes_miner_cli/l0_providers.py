@@ -237,10 +237,7 @@ async def _ovh_task(
     payload = await _request_json(
         session,
         "GET",
-        (
-            f"{OVH_US_API_BASE}/dedicated/server/{quote(service_name, safe='')}"
-            f"/task/{task_id}"
-        ),
+        (f"{OVH_US_API_BASE}/dedicated/server/{quote(service_name, safe='')}/task/{task_id}"),
         token=token,
         expected_status=200,
     )
@@ -366,9 +363,7 @@ def ovh_boot(
             raise L0CliError("--reboot is required before any provider side effect")
         ipxe_script = _read_private_ipxe(ipxe_file)
         token = _read_private_value("OVH_BEARER_TOKEN")
-        server_url = (
-            f"{OVH_US_API_BASE}/dedicated/server/{quote(service_name, safe='')}"
-        )
+        server_url = f"{OVH_US_API_BASE}/dedicated/server/{quote(service_name, safe='')}"
         timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             response = await _request_json(

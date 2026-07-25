@@ -1,10 +1,15 @@
+# ruff: noqa: E402,F403
 import json
 import os
+from pathlib import Path
+
 
 def pytest_configure(config):
     """Set up environment variables before any modules are imported."""
-    os.environ["MINER_SS58"] = "5E6xfU3oNU7y1a7pQwoc31fmUjwBZ2gKcNCw8EXsdtCQieUQ"
-    os.environ["MINER_SEED"] = "0xe031170f32b4cda05df2f3cf6bc8d7687b683bbce23d9fa960c0b3fc21641b8a"
+    os.environ["MINER_OWNER_SS58"] = "5E6xfU3oNU7y1a7pQwoc31fmUjwBZ2gKcNCw8EXsdtCQieUQ"
+    session_file = Path("/tmp/chutes-monitor-pytest-session.env")
+    session_file.write_text("CHUTES_ATTESTED_SESSION=test-attested-session\n")
+    os.environ["CHUTES_ATTESTED_SESSION_FILE"] = str(session_file)
 
     validators_json = {
         "supported": [

@@ -13,6 +13,7 @@ spec:
       labels:
         {{- include "registry.labels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -26,22 +27,40 @@ spec:
       # the pod's lifetime instead of exiting after init.
       initContainers:
         - name: auth
-          image: "{{ .Values.auth.image }}"
+          image: "{{ .Values.seedlessStack.image }}"
           imagePullPolicy: {{ .Values.auth.imagePullPolicy }}
           restartPolicy: Always
+          command:
+            - python
+            - -m
+            - uvicorn
+            - --host
+            - 0.0.0.0
+            - --port
+            - "{{ .Values.auth.port }}"
+            - chutes_registry.main:app
           env:
-            - name: MINER_SS58
+            - name: MINER_OWNER_SS58
               valueFrom:
                 secretKeyRef:
                   name: miner-credentials
-                  key: ss58
-            - name: MINER_SEED
-              valueFrom:
-                secretKeyRef:
-                  name: miner-credentials
-                  key: seed
-            - name: VALIDATORS
-              value: {{ .Values.validators | toJson | quote }}
+                  key: owner
+            - name: CHUTES_ATTESTED_SESSION_FILE
+              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
+            - name: CHUTES_VALIDATORS_FILE
+              value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
+            - name: CHUTES_GPU_REGISTRATION_FILE
+              value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: CHUTES_ATTESTED_CERT_FILE
+              value: {{ .Values.seedlessStack.attestedCertPath | quote }}
+            - name: GPU_TEE_ONLY
+              value: "true"
+            - name: CHUTES_ATTESTED_CERT_FILE
+              value: /run/chutes-tls/server.crt
+            - name: CHUTES_ATTESTED_KEY_FILE
+              value: /run/chutes-tls/server.key
+            - name: CHUTES_REGISTRY_SCOPES_FILE
+              value: /var/lib/chutes-registry/scopes.json
           ports:
             - name: auth
               containerPort: {{ .Values.auth.port }}
@@ -54,6 +73,15 @@ spec:
             failureThreshold: 60
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
+          volumeMounts:
+            - name: chutes-gpu-runtime
+              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+              readOnly: true
+            - name: chutes-registry-tls
+              mountPath: /run/chutes-tls
+              readOnly: true
+            - name: chutes-registry-scopes
+              mountPath: /var/lib/chutes-registry
       containers:
         - name: registry
           image: "{{ .Values.registry.image }}"
@@ -68,7 +96,20 @@ spec:
             - name: registry-nginx-config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+            - name: chutes-registry-tls
+              mountPath: /run/chutes-tls
+              readOnly: true
       volumes:
+        - name: chutes-gpu-runtime
+          hostPath:
+            path: {{ .Values.seedlessStack.runtimeHostPath }}
+            type: Directory
         - name: registry-nginx-config
           configMap:
             name: registry-nginx-config
+        - name: chutes-registry-tls
+          hostPath:
+            path: /run/chutes-gpu/registry-tls
+            type: Directory
+        - name: chutes-registry-scopes
+          emptyDir: {}

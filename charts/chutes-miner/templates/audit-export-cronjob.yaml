@@ -6,6 +6,7 @@ redis://:$(REDIS_PASSWORD)@redis:6379
 postgresql+asyncpg://{{ .Values.postgres.database.user }}:$(POSTGRES_PASSWORD)@postgres:5432/{{ .Values.postgres.database.name }}
 {{- end }}
 
+{{- if .Values.auditExporter.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -36,20 +37,17 @@ spec:
           {{- end }}
           containers:
           - name: audit-export
-            image: {{ .Values.auditExporter.image }}
-            imagePullPolicy: Always
+            image: {{ .Values.seedlessStack.image }}
+            imagePullPolicy: IfNotPresent
             command: ["python", "chutes-miner/chutes_miner/audit_exporter.py"]
             env:
-              - name: MINER_SS58
+              - name: MINER_OWNER_SS58
                 valueFrom:
                   secretKeyRef:
                     name: miner-credentials
-                    key: ss58
-              - name: MINER_SEED
-                valueFrom:
-                  secretKeyRef:
-                    name: miner-credentials
-                    key: seed
+                    key: owner
+              - name: CHUTES_ATTESTED_SESSION_FILE
+                value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
               - name: REDIS_PASSWORD
                 valueFrom:
                   secretKeyRef:
@@ -64,10 +62,24 @@ spec:
                 value: {{ include "postgresql.url" . }}
               - name: REDIS_URL
                 value: {{ include "redis.url" . }}
-              - name: VALIDATORS
-                value: {{ .Values.validators | toJson | quote }}
+              - name: CHUTES_VALIDATORS_FILE
+                value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
+              - name: CHUTES_GPU_REGISTRATION_FILE
+                value: {{ .Values.seedlessStack.registrationPath | quote }}
+              - name: GPU_TEE_ONLY
+                value: "true"
               {{ if .Values.multiCluster }}
               - name: MONITORING_NAMESPACE
                 value: "monitoring"
               {{- end }}
+            volumeMounts:
+              - name: chutes-gpu-runtime
+                mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+                readOnly: true
+          volumes:
+            - name: chutes-gpu-runtime
+              hostPath:
+                path: {{ .Values.seedlessStack.runtimeHostPath }}
+                type: Directory
           restartPolicy: OnFailure
+{{- end }}

@@ -1,14 +1,21 @@
+import abc
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+import base64
 import json
 import math
-import time
-import uuid
-import traceback
-import abc
+import re
 import threading
+import time
+import traceback
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+
+import yaml
+import aiohttp
 from aiohttp import ConnectionTimeoutError
+from chutes_common.k8s import WatchEvent, WatchEventType
 from chutes_common.monitoring.messages import (
     ClusterChangeMessage,
     ClusterReconnetMessage,
@@ -16,57 +23,58 @@ from chutes_common.monitoring.messages import (
 )
 from chutes_common.monitoring.models import ResourceType
 from chutes_common.redis import MonitoringRedisClient
+from chutes_common.schemas.chute import Chute
+from chutes_common.schemas.deployment import Deployment
+from chutes_common.schemas.gpu import GPU
+from chutes_common.schemas.server import Server
+from chutes_miner.api.config import (
+    k8s_api_client,
+    k8s_app_client,
+    k8s_batch_client,
+    k8s_core_client,
+    settings,
+    validator_by_hotkey,
+)
+from chutes_miner.api.database import get_session, get_sync_session
+from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.client import KubernetesMultiClusterClientManager
 from chutes_miner.api.k8s.config import KubeConfig
-from loguru import logger
-from typing import Callable, Generator, List, Dict, Any, Optional, Tuple, Union
-from kubernetes import watch
-from kubernetes.client import (
-    V1Deployment,
-    V1Pod,
-    V1Service,
-    V1Node,
-    V1NodeList,
-    V1PodList,
-    V1DeploymentList,
-    V1ConfigMap,
-    V1Job,
-    V1JobList,
-    V1ConfigMapList,
-)
-from kubernetes.client.rest import ApiException
-from kubernetes.client import CoreV1Api
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-from chutes_miner.api.exceptions import DeploymentFailure
-from chutes_miner.api.database import get_session, get_sync_session
 from chutes_miner.api.k8s.constants import (
     CHUTE_DEPLOY_PREFIX,
     CHUTE_SVC_PREFIX,
     GRAVAL_JOB_PREFIX,
     GRAVAL_SVC_PREFIX,
 )
-from chutes_common.k8s import WatchEvent, WatchEventType
 from chutes_miner.api.k8s.util import (
     build_chute_job,
     build_chute_service,
+    registry_pull_secret_name,
     require_supported_chutes_version,
     resolve_deployment_validator,
 )
-from chutes_common.schemas.server import Server
-from chutes_common.schemas.chute import Chute
-from chutes_common.schemas.deployment import Deployment
-from chutes_common.schemas.gpu import GPU
-from chutes_miner.api.config import (
-    k8s_api_client,
-    k8s_core_client,
-    k8s_app_client,
-    k8s_batch_client,
-    settings,
+from kubernetes import watch
+from kubernetes.client import (
+    CoreV1Api,
+    V1ConfigMap,
+    V1ConfigMapList,
+    V1Deployment,
+    V1DeploymentList,
+    V1Job,
+    V1JobList,
+    V1Node,
+    V1NodeList,
+    V1ObjectMeta,
+    V1Pod,
+    V1PodList,
+    V1Secret,
+    V1Service,
 )
+from kubernetes.client.rest import ApiException
+from loguru import logger
 from redis.client import PubSub
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from urllib3.exceptions import MaxRetryError
-import yaml
 
 # Cache disk stats.
 _disk_info_cache: dict[str, tuple[dict[str, float], datetime]] = {}
@@ -484,6 +492,11 @@ class K8sOperator(abc.ABC):
             instance = super().__new__(cls)
             return instance
 
+        if settings.gpu_tee_only:
+            logger.debug("Creating mandatory single-cluster operator for seedless GPU mode")
+            cls._instance = super().__new__(SingleClusterK8sOperator)
+            return cls._instance
+
         # Otherwise, determine which implementation to use
         try:
             # Detection logic
@@ -533,31 +546,43 @@ class K8sOperator(abc.ABC):
             pod_info = {
                 "name": pod.metadata.name,
                 "phase": pod.status.phase,
-                "restart_count": pod.status.container_statuses[0].restart_count
-                if pod.status.container_statuses
-                else 0,
-                "state": {
-                    "running": state.running.to_dict() if state and state.running else None,
-                    "terminated": state.terminated.to_dict()
-                    if state and state.terminated
-                    else None,
-                    "waiting": state.waiting.to_dict() if state and state.waiting else None,
-                }
-                if state
-                else None,
-                "last_state": {
-                    "running": last_state.running.to_dict()
-                    if last_state and last_state.running
-                    else None,
-                    "terminated": last_state.terminated.to_dict()
-                    if last_state and last_state.terminated
-                    else None,
-                    "waiting": last_state.waiting.to_dict()
-                    if last_state and last_state.waiting
-                    else None,
-                }
-                if last_state
-                else None,
+                "restart_count": (
+                    pod.status.container_statuses[0].restart_count
+                    if pod.status.container_statuses
+                    else 0
+                ),
+                "state": (
+                    {
+                        "running": (state.running.to_dict() if state and state.running else None),
+                        "terminated": (
+                            state.terminated.to_dict() if state and state.terminated else None
+                        ),
+                        "waiting": (state.waiting.to_dict() if state and state.waiting else None),
+                    }
+                    if state
+                    else None
+                ),
+                "last_state": (
+                    {
+                        "running": (
+                            last_state.running.to_dict()
+                            if last_state and last_state.running
+                            else None
+                        ),
+                        "terminated": (
+                            last_state.terminated.to_dict()
+                            if last_state and last_state.terminated
+                            else None
+                        ),
+                        "waiting": (
+                            last_state.waiting.to_dict()
+                            if last_state and last_state.waiting
+                            else None
+                        ),
+                    }
+                    if last_state
+                    else None
+                ),
             }
             deploy_info["pods"].append(pod_info)
             deploy_info["node"] = pod.spec.node_name
@@ -625,31 +650,43 @@ class K8sOperator(abc.ABC):
             pod_info = {
                 "name": pod.metadata.name,
                 "phase": pod.status.phase,
-                "restart_count": pod.status.container_statuses[0].restart_count
-                if pod.status.container_statuses
-                else 0,
-                "state": {
-                    "running": state.running.to_dict() if state and state.running else None,
-                    "terminated": state.terminated.to_dict()
-                    if state and state.terminated
-                    else None,
-                    "waiting": state.waiting.to_dict() if state and state.waiting else None,
-                }
-                if state
-                else None,
-                "last_state": {
-                    "running": last_state.running.to_dict()
-                    if last_state and last_state.running
-                    else None,
-                    "terminated": last_state.terminated.to_dict()
-                    if last_state and last_state.terminated
-                    else None,
-                    "waiting": last_state.waiting.to_dict()
-                    if last_state and last_state.waiting
-                    else None,
-                }
-                if last_state
-                else None,
+                "restart_count": (
+                    pod.status.container_statuses[0].restart_count
+                    if pod.status.container_statuses
+                    else 0
+                ),
+                "state": (
+                    {
+                        "running": (state.running.to_dict() if state and state.running else None),
+                        "terminated": (
+                            state.terminated.to_dict() if state and state.terminated else None
+                        ),
+                        "waiting": (state.waiting.to_dict() if state and state.waiting else None),
+                    }
+                    if state
+                    else None
+                ),
+                "last_state": (
+                    {
+                        "running": (
+                            last_state.running.to_dict()
+                            if last_state and last_state.running
+                            else None
+                        ),
+                        "terminated": (
+                            last_state.terminated.to_dict()
+                            if last_state and last_state.terminated
+                            else None
+                        ),
+                        "waiting": (
+                            last_state.waiting.to_dict()
+                            if last_state and last_state.waiting
+                            else None
+                        ),
+                    }
+                    if last_state
+                    else None
+                ),
             }
             job_info["pods"].append(pod_info)
         return job_info
@@ -750,10 +787,14 @@ class K8sOperator(abc.ABC):
         # Get disk space information
         disk_info = await self.get_node_disk_info(node.metadata.name)
 
+        logical_server_id = node.metadata.labels.get("chutes/logical-server-id")
+        if settings.gpu_tee_only and not logical_server_id:
+            raise RuntimeError("seedless GPU Kubernetes node has no adopted logical server label")
         node_info = {
             "name": node.metadata.name,
             "validator": node.metadata.labels.get("chutes/validator"),
-            "server_id": node.metadata.uid,
+            "server_id": logical_server_id or node.metadata.uid,
+            "kubernetes_node_uid": str(node.metadata.uid),
             "status": node.status.phase,
             "ip_address": node.metadata.labels.get("chutes/external-ip"),
             "cpu_per_gpu": cpus_per_gpu,
@@ -869,6 +910,7 @@ class K8sOperator(abc.ABC):
                 )
         except Exception as e:
             logger.error(f"Failed to get legacy deployments: {e}")
+            raise
         return deployments
 
     @abc.abstractmethod
@@ -909,7 +951,12 @@ class K8sOperator(abc.ABC):
 
         await asyncio.to_thread(_sync_wait)
 
-    async def undeploy(self, deployment_id: str, timeout_seconds: int | None = None) -> None:
+    async def undeploy(
+        self,
+        deployment_id: str,
+        timeout_seconds: int | None = None,
+        config_id: str | None = None,
+    ) -> None:
         """
         Delete a job, and associated service.
         """
@@ -929,13 +976,15 @@ class K8sOperator(abc.ABC):
         try:
             if node_name:
                 self._delete_job(
-                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}", namespace=settings.namespace
+                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}",
+                    namespace=settings.namespace,
                 )
             else:
                 # Handle fallback to cleaning up old deployments, from instances
                 # Created before the 2025-07-17 upgrade.
                 self._delete_deployment(
-                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}", namespace=settings.namespace
+                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}",
+                    namespace=settings.namespace,
                 )
         except Exception as exc:
             logger.warning(f"Error deleting deployment from k8s: {exc}")
@@ -953,6 +1002,8 @@ class K8sOperator(abc.ABC):
 
         if node_name:
             self.invalidate_node_disk_cache(node_name)
+        if settings.gpu_tee_only and config_id:
+            self._delete_registry_pull_secret(config_id)
 
     async def delete_preflight(self, deployment_id: str, timeout_seconds: int = 120) -> bool:
         """Hook for subclasses to veto undeploy when cache data is stale."""
@@ -998,7 +1049,11 @@ class K8sOperator(abc.ABC):
 
     @abc.abstractmethod
     async def _deploy_config_map(
-        self, config_map: V1ConfigMap, namespace=settings.namespace, timeout_seconds=60, force=False
+        self,
+        config_map: V1ConfigMap,
+        namespace=settings.namespace,
+        timeout_seconds=60,
+        force=False,
     ):
         raise NotImplementedError()
 
@@ -1009,6 +1064,8 @@ class K8sOperator(abc.ABC):
         token: str = None,
         job_id: str = None,
         config_id: str = None,
+        registry_repository: str = None,
+        registry_manifest_digest: str = None,
         disk_gb: int = 10,
         extra_labels: dict[str, str] = {},
         extra_service_ports: list[dict[str, Any]] = [],
@@ -1019,6 +1076,7 @@ class K8sOperator(abc.ABC):
         job = None
         deployment_id = None
         chute_version = None
+        server = None
         try:
             # Backwards compatible types...
             if isinstance(chute_id, Chute):
@@ -1035,12 +1093,29 @@ class K8sOperator(abc.ABC):
                         f"Missing required launch config for chute {chute.chute_id}; "
                         "source is delivered only through a validator-issued launch token."
                     )
+                if settings.gpu_tee_only and (
+                    not registry_repository
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}",
+                        registry_manifest_digest or "",
+                    )
+                ):
+                    raise DeploymentFailure(
+                        "Seedless GPU deployment requires an exact registry descriptor scope."
+                    )
                 server = await self._get_server(session, server_id)
                 resolve_deployment_validator(chute, server)
                 available_gpus = self._verify_gpus(chute, server)
                 await self._verify_disk_space(server, disk_gb)
                 deployment_id, gpu_uuids = await self._track_deployment(
-                    session, chute, server, available_gpus, job_id, config_id
+                    session,
+                    chute,
+                    server,
+                    available_gpus,
+                    job_id,
+                    config_id,
+                    registry_repository,
+                    registry_manifest_digest,
                 )
 
             # Build the service that exposes it.
@@ -1058,6 +1133,8 @@ class K8sOperator(abc.ABC):
                 token=token,
                 job_id=job_id,
                 config_id=config_id,
+                registry_repository=registry_repository,
+                registry_manifest_digest=registry_manifest_digest,
                 disk_gb=disk_gb,
                 vm_version=vm_version,
             )
@@ -1068,6 +1145,17 @@ class K8sOperator(abc.ABC):
             self.invalidate_node_disk_cache(server.name)
             return deployment, job
         except Exception as exc:
+            if settings.gpu_tee_only and config_id and server is not None:
+                try:
+                    await self._revoke_registry_scope(
+                        server.validator,
+                        config_id,
+                    )
+                except Exception as revoke_exc:  # noqa: BLE001
+                    logger.error(
+                        "Failed deployment left registry scope revocation unconfirmed: "
+                        f"{revoke_exc}"
+                    )
             if deployment_id:
                 await self._clear_deployment(deployment_id)
 
@@ -1136,6 +1224,8 @@ class K8sOperator(abc.ABC):
         available_gpus,
         job_id: str = None,
         config_id: str = None,
+        registry_repository: str = None,
+        registry_manifest_digest: str = None,
     ):
         # Immediately track this deployment (before actually creating it) to avoid allocation contention.
         deployment_id = str(uuid.uuid4())
@@ -1143,7 +1233,12 @@ class K8sOperator(abc.ABC):
             : chute.gpu_count
         ]
         gpu_ids = [gpu.gpu_id for gpu in gpu_candidates]
-        gpu_uuids = [f"GPU-{str(uuid.UUID(gid))}" for gid in gpu_ids]
+        gpu_uuids = [gpu.hardware_uuid for gpu in gpu_candidates]
+        if any(
+            not isinstance(hardware_uuid, str) or not hardware_uuid.startswith("GPU-")
+            for hardware_uuid in gpu_uuids
+        ):
+            raise DeploymentFailure("selected GPU lacks a canonical NVIDIA hardware UUID")
         logger.info(
             f"Assigning {len(gpu_uuids)} GPUs [{gpu_uuids}] to {chute.chute_id=} on {server.name=}"
         )
@@ -1158,6 +1253,8 @@ class K8sOperator(abc.ABC):
             stub=True,
             job_id=job_id,
             config_id=config_id,
+            registry_repository=registry_repository,
+            registry_manifest_digest=registry_manifest_digest,
             preemptible=chute.preemptible,
         )
         session.add(deployment)
@@ -1196,6 +1293,8 @@ class K8sOperator(abc.ABC):
                 .scalar_one_or_none()
             )
             if deployment:
+                if settings.gpu_tee_only and deployment.config_id:
+                    self._delete_registry_pull_secret(deployment.config_id)
                 await session.delete(deployment)
                 await session.commit()
 
@@ -1244,7 +1343,13 @@ class K8sOperator(abc.ABC):
             async with get_session() as session:
                 result = await session.execute(
                     update(Server)
-                    .where(Server.server_id == node.metadata.uid)
+                    .where(
+                        Server.server_id
+                        == (
+                            (node.metadata.labels or {}).get("chutes/logical-server-id")
+                            or str(node.metadata.uid)
+                        )
+                    )
                     .values(verification_port=created_service.spec.ports[0].node_port)
                     .returning(Server.verification_port)
                 )
@@ -1452,10 +1557,14 @@ class K8sOperator(abc.ABC):
         token: Optional[str] = None,
         job_id: Optional[str] = None,
         config_id: Optional[str] = None,
+        registry_repository: Optional[str] = None,
+        registry_manifest_digest: Optional[str] = None,
         disk_gb: int = 10,
         vm_version: Optional[str] = None,
     ) -> V1Job:
         probe_port = self._get_probe_port(chute)
+        if settings.gpu_tee_only:
+            self._create_registry_pull_secret(config_id, server.validator)
         job = build_chute_job(
             deployment_id,
             chute,
@@ -1466,6 +1575,8 @@ class K8sOperator(abc.ABC):
             token=token,
             job_id=job_id,
             config_id=config_id,
+            registry_repository=registry_repository,
+            registry_manifest_digest=registry_manifest_digest,
             disk_gb=disk_gb,
             vm_version=vm_version,
         )
@@ -1473,11 +1584,110 @@ class K8sOperator(abc.ABC):
         try:
             created_job = self._deploy_job_for_deployment(job, server_name=server.name)
         except Exception:
+            if settings.gpu_tee_only:
+                self._delete_registry_pull_secret(config_id)
             raise DeploymentFailure(
                 f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
             )
 
         return created_job
+
+    @staticmethod
+    def _registry_pull_secret_name(config_id: str) -> str:
+        if not isinstance(config_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+            config_id,
+        ):
+            raise DeploymentFailure("launch config ID is invalid for registry scope secret")
+        return registry_pull_secret_name(config_id)
+
+    def _create_registry_pull_secret(self, config_id: str, validator: str) -> None:
+        name = self._registry_pull_secret_name(config_id)
+        host = f"{validator.lower()}.localregistry.chutes.ai:{settings.registry_proxy_port}"
+        credential = base64.b64encode(f"{config_id}:chutes-registry-scope".encode("ascii")).decode(
+            "ascii"
+        )
+        docker_config = json.dumps(
+            {
+                "auths": {
+                    host: {
+                        "username": config_id,
+                        "password": "chutes-registry-scope",
+                        "auth": credential,
+                    }
+                }
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        body = V1Secret(
+            metadata=V1ObjectMeta(
+                name=name,
+                labels={
+                    "chutes/registry-scope": "true",
+                    "chutes/launch-config-id": config_id,
+                },
+            ),
+            type="kubernetes.io/dockerconfigjson",
+            data={".dockerconfigjson": base64.b64encode(docker_config).decode("ascii")},
+        )
+        try:
+            k8s_core_client().create_namespaced_secret(
+                namespace=settings.namespace,
+                body=body,
+            )
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            current = k8s_core_client().read_namespaced_secret(
+                name=name,
+                namespace=settings.namespace,
+            )
+            if (
+                current.type != body.type
+                or current.data != body.data
+                or (current.metadata.labels or {}).get("chutes/launch-config-id") != config_id
+            ):
+                raise DeploymentFailure(
+                    "existing registry scope secret conflicts with launch lifecycle"
+                ) from exc
+
+    def _delete_registry_pull_secret(self, config_id: str) -> None:
+        name = self._registry_pull_secret_name(config_id)
+        try:
+            k8s_core_client().delete_namespaced_secret(
+                name=name,
+                namespace=settings.namespace,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    @staticmethod
+    async def _revoke_registry_scope(
+        validator_hotkey: str,
+        config_id: str,
+    ) -> None:
+        validator = validator_by_hotkey(validator_hotkey)
+        if validator is None:
+            raise DeploymentFailure("registry scope validator is unavailable")
+        service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
+        async with aiohttp.ClientSession(raise_for_status=False) as session:
+            async with session.delete(
+                f"http://{service}/registry/scopes/{config_id}",
+                headers={
+                    "X-Chutes-Attested-Session": settings.attested_session,
+                },
+            ) as response:
+                result = await response.json()
+                if response.status != 200 or result != {
+                    "revoked": True,
+                    "launch_config_id": config_id,
+                }:
+                    raise DeploymentFailure(
+                        "registry scope revocation failed for aborted deployment"
+                    )
 
 
 # Legacy single-cluster implementation
@@ -1699,7 +1909,11 @@ class SingleClusterK8sOperator(K8sOperator):
         return jobs_list
 
     def _deploy_service(
-        self, service, server_name=None, namespace=settings.namespace, timeout_seconds: int = 60
+        self,
+        service,
+        server_name=None,
+        namespace=settings.namespace,
+        timeout_seconds: int = 60,
     ):
         return k8s_core_client().create_namespaced_service(
             namespace=namespace, body=service, _request_timeout=timeout_seconds
@@ -1753,7 +1967,11 @@ class SingleClusterK8sOperator(K8sOperator):
         )
 
     async def _deploy_config_map(
-        self, config_map: V1ConfigMap, namespace=settings.namespace, timeout_seconds=60, force=False
+        self,
+        config_map: V1ConfigMap,
+        namespace=settings.namespace,
+        timeout_seconds=60,
+        force=False,
     ):
         try:
             k8s_core_client().create_namespaced_config_map(
@@ -1768,7 +1986,9 @@ class SingleClusterK8sOperator(K8sOperator):
                         _request_timeout=timeout_seconds,
                     )
                     k8s_core_client().create_namespaced_config_map(
-                        namespace=namespace, body=config_map, _request_timeout=timeout_seconds
+                        namespace=namespace,
+                        body=config_map,
+                        _request_timeout=timeout_seconds,
                     )
             else:
                 raise
@@ -2040,7 +2260,9 @@ class MultiClusterK8sOperator(K8sOperator):
         # We can assume the node name is the same as the context, if this changes this will break
         client = self._manager.get_core_client(context_name=name)
         client.patch_node(
-            name=name, body=body, _request_timeout=self._get_request_timeout(timeout_seconds)
+            name=name,
+            body=body,
+            _request_timeout=self._get_request_timeout(timeout_seconds),
         )
 
         return self.get_node(name)
@@ -2177,7 +2399,8 @@ class MultiClusterK8sOperator(K8sOperator):
 
         if not found:
             raise ApiException(
-                status=404, reason=f"Failed to find deployment {label_selector} in cache."
+                status=404,
+                reason=f"Failed to find deployment {label_selector} in cache.",
             )
 
     def _delete_deployment(self, name, namespace=settings.namespace, timeout_seconds: int = 120):
@@ -2210,7 +2433,11 @@ class MultiClusterK8sOperator(K8sOperator):
                 raise
 
     def _deploy_service(
-        self, service, server_name, namespace=settings.namespace, timeout_seconds: int = 60
+        self,
+        service,
+        server_name,
+        namespace=settings.namespace,
+        timeout_seconds: int = 60,
     ):
         # If the server isn't healthy don't deploy
         self._verify_node_health(server_name)

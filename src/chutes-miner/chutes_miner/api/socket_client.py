@@ -2,6 +2,8 @@
 Miner websockets.
 """
 
+import asyncio
+
 import orjson as json
 from socketio import AsyncClient
 from loguru import logger
@@ -101,24 +103,28 @@ class SocketClient:
         try:
             headers, _ = sign_request(purpose="sockets")
             await self.sio.emit("authenticate", headers)
-            logger.debug(f"Sent authentication request: {headers=}")
+            logger.debug("Sent attested miner authentication request")
         except Exception as e:
             logger.error(f"Authentication error: {e}")
             await self.sio.disconnect()
 
     async def connect_and_run(self):
         """
-        Connect to server and run the client
+        Reconnect after expiry so each socket authenticates with the latest session.
         """
-        try:
-            await self.sio.connect(
-                self.url,
-                wait_timeout=10,
-                wait=True,
-                transports=["websocket"],
-            )
-            await self.sio.wait()
-        except Exception as e:
-            logger.error(f"Client error: {e}")
-        finally:
-            await self.sio.disconnect()
+        while True:
+            try:
+                await self.sio.connect(
+                    self.url,
+                    wait_timeout=10,
+                    wait=True,
+                    transports=["websocket"],
+                )
+                await self.sio.wait()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Client error: {e}")
+            finally:
+                await self.sio.disconnect()
+            await asyncio.sleep(5)

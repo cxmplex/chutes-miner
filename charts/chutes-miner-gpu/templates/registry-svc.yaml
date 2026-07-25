@@ -1,4 +1,7 @@
 {{- $root := . -}}
+{{- if ne (len .Values.validators.supported) 1 }}
+{{- fail "seedless GPU artifact requires exactly one validator" }}
+{{- end }}
 {{- range .Values.validators.supported }}
 apiVersion: v1
 kind: Service

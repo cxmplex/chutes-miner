@@ -40,12 +40,8 @@ cd ..
 
 ### Update gepetto
 
-Be sure to update gepetto imports to use the new code structure.  If you have customn gepetto and intend to use the `K8sOperator` instead of the methods exposed via the `chutes_miner.api.k8s` module just use `K8sOperator()` directly as this class is a singleton and instantiates the correct concrete class based on the cluster.
-
-**NOTE** This assumes you are storing gepetto in the same `~/chutes` directory alongside the values and inventory.  If not just adjust the `--from-file` path.
-```bash
-kubectl create configmap gepetto-code --from-file=$HOME/chutes/gepetto.py -o yaml --dry-run=client | kubectl apply -n chutes -f -
-```
+Build Gepetto into the miner image. Migration removes the retired source
+ConfigMap so stale cluster state cannot override image code.
 
 **NOTE** Ensure you have the correct context set if you have multiple contexts in your kubeconfig.  Helm will use whatever the current context is when it runs.  Optionally you can set the context directly using the `--kube-context` flag for helm.  See `helm --help` for details.
 

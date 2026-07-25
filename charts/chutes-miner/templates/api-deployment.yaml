@@ -7,6 +7,12 @@ postgresql+asyncpg://{{ .Values.postgres.database.user }}:$(POSTGRES_PASSWORD)@p
 {{- end }}
 
 
+{{- if .Values.multiCluster }}
+{{- fail "seedless whole-fabric mode requires the single-cluster operator" }}
+{{- end }}
+{{- if not (regexMatch "^chutes[.]local/seedless-stack@sha256:[0-9a-f]{64}$" .Values.seedlessStack.image) }}
+{{- fail "seedless stack image must be the measured digest reference" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +45,7 @@ spec:
       {{ if .Values.multiCluster }}
       initContainers:
         - name: get-node-ip
-          image: bitnamilegacy/kubectl:latest
+          image: "{{ .Values.seedlessStack.kubectlImage }}"
           env:
             - name: NODE_NAME
               valueFrom:
@@ -60,7 +66,7 @@ spec:
       {{- end }}
       containers:
         - name: api
-          image: "{{ .Values.minerApi.image }}"
+          image: "{{ .Values.seedlessStack.image }}"
           imagePullPolicy: {{ .Values.minerApi.imagePullPolicy }}
           {{ if .Values.multiCluster }}
           command:
@@ -73,16 +79,13 @@ spec:
           command: ["python", "-m", "uvicorn", "--host", "0.0.0.0", "--port", "{{ .Values.minerApi.service.targetPort }}", "--workers", "4", "chutes_miner.api.main:app"]
           {{- end }}
           env:
-            - name: MINER_SS58
+            - name: MINER_OWNER_SS58
               valueFrom:
                 secretKeyRef:
                   name: miner-credentials
-                  key: ss58
-            - name: MINER_SEED
-              valueFrom:
-                secretKeyRef:
-                  name: miner-credentials
-                  key: seed
+                  key: owner
+            - name: CHUTES_ATTESTED_SESSION_FILE
+              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -97,8 +100,12 @@ spec:
               value: {{ include "postgresql.url" . }}
             - name: REDIS_URL
               value: {{ include "redis.url" . }}
-            - name: VALIDATORS
-              value: {{ .Values.validators | toJson | quote }}
+            - name: CHUTES_VALIDATORS_FILE
+              value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
+            - name: CHUTES_GPU_REGISTRATION_FILE
+              value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: GPU_TEE_ONLY
+              value: "true"
             - name: REGISTRY_PROXY_PORT
               value: "{{ .Values.registry.service.nodePort }}"
             {{- if not .Values.multiCluster }}
@@ -113,8 +120,11 @@ spec:
             - name: SERVICE_ACCOUNT_CA_PATH
               value: "/var/run/secrets/chutes-sa-token/ca.crt"
             {{- end }}
-          {{ if .Values.multiCluster }}
           volumeMounts:
+            - name: chutes-gpu-runtime
+              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+              readOnly: true
+          {{ if .Values.multiCluster }}
             - name: shared-data
               mountPath: /shared
             - name: chutes-token
@@ -127,8 +137,12 @@ spec:
               protocol: TCP
           resources:
             {{- toYaml .Values.minerApi.resources | nindent 12 }}
-      {{ if .Values.multiCluster }}
       volumes:
+        - name: chutes-gpu-runtime
+          hostPath:
+            path: {{ .Values.seedlessStack.runtimeHostPath }}
+            type: Directory
+      {{ if .Values.multiCluster }}
         - name: shared-data
           emptyDir: {}
         - name: chutes-token

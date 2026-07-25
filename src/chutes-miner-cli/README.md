@@ -26,6 +26,7 @@ remote L0 artifact, and writes provider-ready raw iPXE as mode 0600.
 chutes-miner l0 prepare-boot \
   --host-id l0-example \
   --tee-type tdx \
+  --compute-type cpu \
   --data-device /dev/nvme0n1 \
   --data-device-id nvme-EXACT_DEVICE_ID \
   --validator-ca-url https://objects.example/validator-ca.crt \
@@ -40,6 +41,30 @@ chutes-miner l0 complete-enrollment \
   --pcs-key-file /run/secrets/intel-pcs-key \
   --hotkey <hotkey.json>
 ```
+
+GPU V2 adds the required public disk contract:
+`--compute-type gpu --data-device-serial <serial> --gpu-l0-profile <profile>
+--storage-data-size-gb <GiB> --gpu-infra-size-gb <GiB>`.
+
+Once the GPU host and its ChuteFS sibling are ready, `chutes-miner l0
+gpu-start` reserves and dispatches the miner-managed whole fabric. The
+validator returns the stable logical server ID. `chutes-miner l0 gpu-stop
+--server-id <id>` seals gpu-infra before the exact QEMU/device reset lifecycle
+releases the fabric.
+
+An installed legacy GPU guest can initiate its one-use cutover locally as root:
+
+```bash
+sudo chutes-miner l0 gpu-legacy-cutover \
+  --host-id <target-l0-host-id> \
+  --legacy-server-id <legacy-validator-server-id> \
+  --hotkey <operator-hotkey-json>
+```
+
+The command starts the packaged cutover service. Use
+`gpu-legacy-cutover-retry` if the transfer response is interrupted after the
+mappings close, or `gpu-legacy-recover` to reboot through unchanged legacy key
+release when custody was not transferred.
 
 `prepare-boot` always writes both the one-use enrollment script and the voucher-free steady-state
 script. Add `--wait` to poll readiness with a finite monotonic deadline; it does not delay either

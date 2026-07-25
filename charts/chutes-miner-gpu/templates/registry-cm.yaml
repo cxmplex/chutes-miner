@@ -1,3 +1,16 @@
+{{- if ne (len .Values.validators.supported) 1 }}
+{{- fail "seedless GPU artifact requires exactly one validator" }}
+{{- end }}
+{{- if .Values.multiCluster }}
+{{- fail "seedless GPU artifact forbids multi-cluster mode" }}
+{{- end }}
+{{- if not (regexMatch "^chutes[.]local/seedless-stack@sha256:[0-9a-f]{64}$" .Values.seedlessStack.image) }}
+{{- fail "seedless stack image must be the measured digest reference" }}
+{{- end }}
+{{- $validator := index .Values.validators.supported 0 }}
+{{- if ne .Values.validators.defaultRegistry $validator.registry }}
+{{- fail "seedless GPU registry must match its sole validator" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -23,6 +36,10 @@ data:
             {{ .hotkey | lower }}.registry.chutes.svc.cluster.local {{ .registry }};
             {{- end }}
         }
+        map $chutes_authorized_uri $registry_upstream_uri {
+            "" $request_uri;
+            default $chutes_authorized_uri;
+        }
         log_format main '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" '
                         '"$http_user_agent" "$http_x_forwarded_for" "upstream=$upstream_host"';
         access_log  /var/log/nginx/access.log  main;
@@ -33,17 +50,31 @@ data:
             resolver 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4;
             listen {{ .Values.registry.service.targetPort }};
             location /v2/ {
-                limit_except GET {
+                limit_except GET HEAD {
                     deny all;
                 }
                 auth_request /auth;
                 auth_request_set $chutes_signature $upstream_http_x_chutes_signature;
                 auth_request_set $chutes_hotkey $upstream_http_x_chutes_hotkey;
                 auth_request_set $chutes_nonce $upstream_http_x_chutes_nonce;
+                auth_request_set $chutes_registry_session $upstream_http_x_chutes_registry_session;
+                auth_request_set $chutes_authorized_uri $upstream_http_x_chutes_registry_upstream_uri;
+                auth_request_set $chutes_launch_config_id $upstream_http_x_chutes_launch_config_id;
                 proxy_set_header X-Chutes-Hotkey $chutes_hotkey;
                 proxy_set_header X-Chutes-Nonce $chutes_nonce;
                 proxy_set_header X-Chutes-Signature $chutes_signature;
-                proxy_pass https://$upstream_host;
+                proxy_set_header X-Chutes-Registry-Session $chutes_registry_session;
+                proxy_set_header X-Chutes-Attested-Session "";
+                proxy_set_header X-Chutes-Registry-Method $request_method;
+                proxy_set_header X-Chutes-Registry-Uri $request_uri;
+                proxy_set_header X-Chutes-Launch-Config-ID $chutes_launch_config_id;
+                proxy_pass https://$upstream_host$registry_upstream_uri;
+                proxy_ssl_certificate /run/chutes-tls/server.crt;
+                proxy_ssl_certificate_key /run/chutes-tls/server.key;
+                proxy_ssl_server_name on;
+                proxy_ssl_name $upstream_host;
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
                 proxy_set_header Host $upstream_host;
                 proxy_set_header X-Real-IP $remote_addr;
                 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -55,9 +86,29 @@ data:
                 proxy_set_header X-Chutes-Hotkey $http_x_chutes_hotkey;
                 proxy_set_header X-Chutes-Signature $http_x_chutes_signature;
                 proxy_set_header X-Chutes-Nonce $http_x_chutes_nonce;
+                proxy_set_header X-Chutes-Registry-Method $request_method;
+                proxy_set_header X-Chutes-Registry-Uri $request_uri;
+                proxy_set_header Authorization $http_authorization;
                 proxy_pass_request_body off;
                 proxy_set_header Content-Length "";
                 error_page 401 403 500 502 503 504 = @block;
+            }
+            location = /registry/scopes {
+                limit_except POST {
+                    deny all;
+                }
+                proxy_pass http://127.0.0.1:{{ .Values.auth.port }}/registry/scopes;
+                proxy_set_header X-Chutes-Attested-Session $http_x_chutes_attested_session;
+                proxy_set_header Content-Type application/json;
+            }
+            location ^~ /registry/scopes/ {
+                limit_except DELETE {
+                    deny all;
+                }
+                proxy_pass http://127.0.0.1:{{ .Values.auth.port }};
+                proxy_set_header X-Chutes-Attested-Session $http_x_chutes_attested_session;
+                proxy_pass_request_body off;
+                proxy_set_header Content-Length "";
             }
             location @block {
                 return 401;

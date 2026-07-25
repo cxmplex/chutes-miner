@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,6 +9,7 @@ from kubernetes.client import ApiClient, V1Service, V1ServicePort, V1ServiceSpec
 
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.util import build_chute_job
+from cross_repo_tests import repository_root
 
 
 def _make_service() -> V1Service:
@@ -19,8 +19,12 @@ def _make_service() -> V1Service:
             selector={"app": "chute"},
             external_traffic_policy="Local",
             ports=[
-                V1ServicePort(port=8000, target_port=8000, node_port=30080, protocol="TCP"),
-                V1ServicePort(port=8001, target_port=8001, node_port=30081, protocol="TCP"),
+                V1ServicePort(
+                    port=8000, target_port=8000, node_port=30080, protocol="TCP"
+                ),
+                V1ServicePort(
+                    port=8001, target_port=8001, node_port=30081, protocol="TCP"
+                ),
             ],
         )
     )
@@ -157,7 +161,9 @@ def _make_tee_service(include_extra_port: bool = False) -> V1Service:
         V1ServicePort(port=8002, target_port=8002, node_port=30082, protocol="TCP"),
     ]
     if include_extra_port:
-        ports.append(V1ServicePort(port=9000, target_port=9000, node_port=30900, protocol="TCP"))
+        ports.append(
+            V1ServicePort(port=9000, target_port=9000, node_port=30900, protocol="TCP")
+        )
     return V1Service(
         spec=V1ServiceSpec(
             type="NodePort",
@@ -192,11 +198,42 @@ def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
     assert "CHUTES_HOST_ID" not in env
     assert env["CHUTES_API_URL"] == "http://test-api"
     assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
+    assert "CHUTES_API_KEY" not in env
+    assert "CHUTEFS_VOLUME_ID" not in env
+    assert "CHUTEFS_STORAGE_SESSION" not in env
+    assert "CHUTEFS_STORAGE_REFRESH" not in env
     assert env["CHUTES_EXTERNAL_HOST"] == "10.0.0.10"
     assert job.spec.template.spec.containers[0].security_context.capabilities == {
         "add": ["IPC_LOCK"]
     }
     assert job.spec.template.spec.automount_service_account_token is False
+
+
+def test_seedless_job_uses_exact_registry_root_digest(monkeypatch):
+    from chutes_miner.api.k8s import util
+
+    chute, server, _ = _make_inputs("0.8.0", tee=True)
+    service = _make_tee_service()
+    monkeypatch.setattr(util.settings, "gpu_tee_only", True)
+    monkeypatch.setattr(
+        util,
+        "resolve_deployment_validator",
+        lambda _chute, _server: SimpleNamespace(api="http://test-api"),
+    )
+    root = f"sha256:{'a' * 64}"
+    job = build_chute_job(
+        deployment_id="deploy-scoped",
+        chute=chute,
+        server=server,
+        service=service,
+        gpu_uuids=["GPU-UUID-1"],
+        probe_port=8000,
+        token="launch-token",
+        config_id="config-1",
+        registry_repository="owner/image",
+        registry_manifest_digest=root,
+    )
+    assert job.spec.template.spec.containers[0].image.endswith(f"/owner/image@{root}")
 
 
 def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim():
@@ -217,6 +254,10 @@ def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim()
     assert env["CHUTES_LAUNCH_JWT"] == "launch-token"
     assert env["CHUTES_EXTERNAL_HOST"] == "10.0.0.10"
     assert "CHUTES_HOST_ID" not in env
+    assert "CHUTES_API_KEY" not in env
+    assert "CHUTEFS_VOLUME_ID" not in env
+    assert "CHUTEFS_STORAGE_SESSION" not in env
+    assert "CHUTEFS_STORAGE_REFRESH" not in env
 
 
 @pytest.mark.parametrize(
@@ -229,7 +270,9 @@ def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim()
         ("unknown", "default"),
     ],
 )
-def test_build_tee_job_combines_vm_environment_with_launch_context(vm_version, download_mode):
+def test_build_tee_job_combines_vm_environment_with_launch_context(
+    vm_version, download_mode
+):
     chute, server, _ = _make_inputs("0.8.0", tee=True)
     job = build_chute_job(
         deployment_id="deploy-gpu",
@@ -264,15 +307,9 @@ def test_build_tee_job_combines_vm_environment_with_launch_context(vm_version, d
 
 
 def _measured_policy_dir() -> Path:
-    configured_root = os.environ.get("SEK8S_ROOT")
-    sek8s_root = (
-        Path(configured_root)
-        if configured_root
-        else Path(__file__).resolve().parents[2].parent / "sek8s"
-    )
+    sek8s_root = repository_root("sek8s", start=Path(__file__))
     policy_dir = sek8s_root / "ansible/guest/roles/admission-controller/files/policies"
-    if not policy_dir.is_dir():
-        pytest.skip("sek8s policy worktree unavailable; set SEK8S_ROOT")
+    assert policy_dir.is_dir(), f"measured policy directory is missing: {policy_dir}"
     return policy_dir
 
 

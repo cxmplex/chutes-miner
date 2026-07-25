@@ -4,6 +4,7 @@ Authentication helpers.
 
 import time
 import hashlib
+import hmac
 import secrets
 import orjson as json
 from loguru import logger
@@ -42,7 +43,12 @@ def _nonce_timestamp(nonce: str) -> int:
 
 
 def build_v2_message_mgmt(
-    miner: str, validator: str, method: str, target: str, nonce: str, body_sha256: str | None
+    miner: str,
+    validator: str,
+    method: str,
+    target: str,
+    nonce: str,
+    body_sha256: str | None,
 ) -> str:
     """4-part v2 signed message binding method + path (see the sek8s backend fix plan, Phase 2)."""
     return f"v2:{miner}:{validator}:{method.upper()}:{target}:{nonce}:{body_sha256 or ''}"
@@ -79,6 +85,7 @@ def authorize(allow_miner=False, allow_validator=False, purpose: str = None, req
         nonce: str | None = Header(None, alias=NONCE_HEADER),
         signature: str | None = Header(None, alias=SIGNATURE_HEADER),
         sig_version: str | None = Header(None, alias=SIG_VERSION_HEADER),
+        attested_session: str | None = Header(None, alias="X-Chutes-Attested-Session"),
     ):
         """
         Verify the authenticity of a request.
@@ -87,6 +94,21 @@ def authorize(allow_miner=False, allow_validator=False, purpose: str = None, req
         HTTP method + path (so a captured read signature cannot be replayed to a same-purpose
         destructive endpoint); legacy v1 is still accepted unless ``require_v2``.
         """
+        if isinstance(attested_session, str) and attested_session:
+            expected_session = miner_settings.attested_session
+            if (
+                not allow_miner
+                or miner != miner_settings.miner_ss58
+                or validator != miner_settings.miner_ss58
+                or not hmac.compare_digest(attested_session, expected_session)
+                or nonce
+                or signature
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="invalid attested miner session",
+                )
+            return
         allowed_signers = []
         if allow_miner:
             allowed_signers.append(miner_settings.miner_ss58)
@@ -173,18 +195,10 @@ def sign_request(
     method: str = None,
     path: str = None,
 ):
-    """
-    Generate a signed request (for miner requests to validators).
-
-    When ``method`` and ``path`` are supplied, emit a v2 signature binding the HTTP method + path
-    (dropping ``purpose``) with a single-use nonce and the ``X-Chutes-Sig-Version: 2`` header;
-    otherwise emit the legacy v1 signature.
-    """
-    use_v2 = path is not None
-    nonce = generate_v2_nonce() if use_v2 else str(int(time.time()))
+    """Build a request using the short-lived attested GPU runtime session."""
     headers = {
         HOTKEY_HEADER: miner_settings.miner_ss58,
-        NONCE_HEADER: nonce,
+        "X-Chutes-Attested-Session": miner_settings.attested_session,
     }
     payload_string = None
     if payload is not None:
@@ -193,44 +207,8 @@ def sign_request(
             payload_string = json.dumps(payload)
         else:
             payload_string = payload
-
-    if use_v2:
-        body_sha256 = (
-            hashlib.sha256(
-                payload_string.encode() if isinstance(payload_string, str) else payload_string
-            ).hexdigest()
-            if payload_string
-            else None
-        )
-        resolved_method = (method or ("POST" if payload_string else "GET")).upper()
-        # management => 4-part (miner acting toward a validator); else 3-part (single signer).
-        if management:
-            signature_string = build_v2_message_mgmt(
-                miner_settings.miner_ss58,
-                miner_settings.miner_ss58,
-                resolved_method,
-                path,
-                nonce,
-                body_sha256,
-            )
-        else:
-            signature_string = f"v2:{miner_settings.miner_ss58}:{resolved_method}:{path}:{nonce}:{body_sha256 or ''}"
-        headers[SIG_VERSION_HEADER] = SIG_VERSION_V2
-    else:
-        if payload is not None:
-            signature_string = get_signing_message(
-                miner_settings.miner_ss58, nonce, payload_str=payload_string, purpose=None
-            )
-        else:
-            signature_string = get_signing_message(
-                miner_settings.miner_ss58, nonce, payload_str=None, purpose=purpose
-            )
-        if management:
-            signature_string = miner_settings.miner_ss58 + ":" + signature_string
-
     if management:
         headers[MINER_HEADER] = headers.pop(HOTKEY_HEADER)
         headers[VALIDATOR_HEADER] = headers[MINER_HEADER]
-    logger.debug(f"Signing message: {signature_string}")
-    headers[SIGNATURE_HEADER] = miner_settings.miner_keypair.sign(signature_string.encode()).hex()
+
     return headers, payload_string

@@ -2,17 +2,10 @@
 Deployment ORM.
 """
 
-from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
-from sqlalchemy import (
-    Column,
-    String,
-    DateTime,
-    Boolean,
-    ForeignKey,
-    Integer,
-)
 from chutes_common.schemas import Base
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
 
 
 class Deployment(Base):
@@ -24,7 +17,11 @@ class Deployment(Base):
     host = Column(String)
     port = Column(Integer)
     chute_id = Column(String, ForeignKey("chutes.chute_id", ondelete="CASCADE"), nullable=False)
-    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+    )
     version = Column(String, nullable=False)
     active = Column(Boolean, default=False)
     verified_at = Column(DateTime(timezone=True))
@@ -32,6 +29,8 @@ class Deployment(Base):
     stub = Column(Boolean, default=False)
     job_id = Column(String, nullable=True)
     config_id = Column(String, nullable=True)
+    registry_repository = Column(String, nullable=True)
+    registry_manifest_digest = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     preemptible = Column(Boolean, default=True)
 

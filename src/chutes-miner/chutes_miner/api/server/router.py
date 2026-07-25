@@ -68,6 +68,14 @@ async def create_server(
     Add a new server/kubernetes cluster to our inventory.  This is a very
     slow/long-running response via SSE, since it needs to do a lot of things.
     """
+    if settings.gpu_tee_only:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Legacy server creation is disabled; the seedless GPU server "
+                "is adopted from authenticated registrar state."
+            ),
+        )
     server_kubeconfig: Optional[KubeConfig] = None
     if server_args.agent_api:
         server_kubeconfig = await get_server_kubeconfig(server_args.agent_api)
