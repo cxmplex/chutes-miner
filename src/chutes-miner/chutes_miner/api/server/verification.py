@@ -22,6 +22,7 @@ from chutes_common.schemas.gpu import GPU
 from chutes_common.schemas.server import Server, ServerArgs
 from chutes_miner.api.config import validator_by_hotkey
 from chutes_miner.api.database import get_session
+from chutes_miner.api.deployment.teardown import DeploymentTeardownCoordinator
 from chutes_miner.api.exceptions import (
     GPUlessServer,
     BootstrapFailure,
@@ -640,7 +641,6 @@ class GravalVerificationStrategy(VerificationStrategy):
             node_uid = node_object.metadata.uid
             node_name = node_object.metadata.name
             logger.info(f"Purging failed server: {node_name=} {node_uid=}")
-            validator = self.validator
             server_id = None
 
             async with get_session() as session:
@@ -655,27 +655,19 @@ class GravalVerificationStrategy(VerificationStrategy):
                 )
                 if server:
                     server_id = server.server_id
-                    await session.delete(server)
-                await session.commit()
-
-            if server_id:
-                try:
-                    async with aiohttp.ClientSession(raise_for_status=True) as http_session:
-                        headers, _ = sign_request(purpose="tee")
-                        async with http_session.delete(
-                            f"{validator.api}/servers/{server_id}", headers=headers
-                        ) as resp:
-                            logger.success(
-                                f"Successfully purged {server_id=} from validator={validator.hotkey}: {await resp.json()}"
-                            )
-                except Exception as exc:
-                    logger.warning(
-                        f"Error purging {server_id=} from validator={validator.hotkey}: {exc}"
-                    )
-            else:
+            if not server_id:
                 logger.warning(
                     "Unable to purge validator server entry because server record was not found",
                 )
+                return
+            coordinator = DeploymentTeardownCoordinator()
+            operation_id = await coordinator.request_parent(
+                "server",
+                server_id,
+                "failed_gpu_verification",
+            )
+            if operation_id:
+                await coordinator.run_parent(operation_id)
 
 
 class TEEVerificationStrategy(VerificationStrategy):
@@ -860,7 +852,6 @@ class TEEVerificationStrategy(VerificationStrategy):
         if delete_node:
             node_uid = node_object.metadata.uid
             logger.info(f"Purging failed server: {self.server.name=} {node_uid=}")
-            validator = self.validator
             async with get_session() as session:
                 server_id = None
                 server = (
@@ -874,19 +865,12 @@ class TEEVerificationStrategy(VerificationStrategy):
                 )
                 if server:
                     server_id = server.server_id
-                    await session.delete(server)
-                await session.commit()
-
-                try:
-                    async with aiohttp.ClientSession(raise_for_status=True) as http_session:
-                        headers, _ = sign_request(purpose="tee")
-                        async with http_session.delete(
-                            f"{validator.api}/servers/{server_id}", headers=headers
-                        ) as resp:
-                            logger.success(
-                                f"Successfully purged {server_id=} from validator={validator.hotkey}: {await resp.json()}"
-                            )
-                except Exception as exc:
-                    logger.warning(
-                        f"Error purging {server_id=} from validator={validator.hotkey}: {exc}"
-                    )
+            if server_id:
+                coordinator = DeploymentTeardownCoordinator()
+                operation_id = await coordinator.request_parent(
+                    "server",
+                    server_id,
+                    "failed_tee_verification",
+                )
+                if operation_id:
+                    await coordinator.run_parent(operation_id)

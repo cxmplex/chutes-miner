@@ -612,7 +612,10 @@ async def test_rolling_update_propagates_version_on_matching_server():
         )
 
     assert deploy.await_args.kwargs["vm_version"] == "1.8.0"
-    gepetto.undeploy.assert_awaited_once_with("deployment-old")
+    gepetto.undeploy.assert_awaited_once_with(
+        "deployment-old",
+        reason="rolling_update",
+    )
 
 
 @pytest.mark.asyncio

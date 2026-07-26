@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS deployment_teardown_operations (
     pods_absent_at TIMESTAMPTZ,
     pull_secret_deletion_ack JSONB,
     pull_secret_deleted_at TIMESTAMPTZ,
+    lineage_conflict_at TIMESTAMPTZ,
     last_failure TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS deployment_teardown_k8s_resources (
     owner_kind TEXT,
     owner_name TEXT,
     owner_uid TEXT,
+    node_name TEXT,
     labels JSONB NOT NULL,
     labels_sha256 TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'observed',
@@ -163,6 +165,7 @@ CREATE TABLE IF NOT EXISTS kubernetes_orphan_tombstones (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     immutable_labels JSONB NOT NULL,
     last_failure TEXT,
+    lineage_conflict_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     CONSTRAINT ck_kubernetes_orphan_tombstone_phase CHECK (
@@ -190,6 +193,7 @@ CREATE TABLE IF NOT EXISTS kubernetes_orphan_tombstone_resources (
     owner_kind TEXT,
     owner_name TEXT,
     owner_uid TEXT,
+    node_name TEXT,
     labels JSONB NOT NULL,
     labels_sha256 TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'observed',
@@ -240,7 +244,9 @@ BEGIN
         SELECT 1
         FROM deployment_teardown_operations op
         WHERE op.deployment_id = OLD.deployment_id
+          AND op.operation_id = OLD.teardown_operation_id
           AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
           AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
           AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
           AND op.controllers_absent_at IS NOT NULL
@@ -268,9 +274,13 @@ BEGIN
     END IF;
     IF NOT EXISTS (
         SELECT 1
-        FROM deployment_teardown_operations op
-        WHERE op.deployment_id = OLD.deployment_id
+        FROM deployments deployment
+        JOIN deployment_teardown_operations op
+          ON op.operation_id = deployment.teardown_operation_id
+        WHERE deployment.deployment_id = OLD.deployment_id
+          AND op.deployment_id = OLD.deployment_id
           AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
           AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
           AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
           AND op.controllers_absent_at IS NOT NULL
@@ -299,6 +309,21 @@ BEGIN
         WHERE op.parent_type = expected_type
           AND op.parent_id = expected_id
           AND op.phase IN ('finalizing', 'completed')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM parent_deletion_children child
+              JOIN deployment_teardown_operations teardown
+                ON teardown.operation_id = child.child_operation_id
+              WHERE child.parent_operation_id = op.operation_id
+                AND teardown.phase <> 'completed'
+          )
+          AND (
+              expected_type <> 'server'
+              OR (
+                  op.monitor_stop_ack IS NOT NULL
+                  AND op.validator_server_deletion_ack IS NOT NULL
+              )
+          )
     ) THEN
         RAISE EXCEPTION '% % has no durable parent deletion', expected_type, expected_id
             USING ERRCODE = '23503';

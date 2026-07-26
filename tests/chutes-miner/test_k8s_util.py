@@ -194,6 +194,7 @@ def test_build_chute_job_gpu_keeps_nvidia_runtime_and_env():
     assert job.spec.template.spec.runtime_class_name == "nvidia"
     env = _container_env(job)
     assert env["NVIDIA_VISIBLE_DEVICES"] == "GPU-UUID-1"
+    assert env["CHUTES_NVIDIA_DEVICES"] == "GPU-UUID-1"
     assert env["NCCL_P2P_DISABLE"] == "1"
     assert "CHUTES_HOST_ID" not in env
     assert env["CHUTES_API_URL"] == "http://test-api"

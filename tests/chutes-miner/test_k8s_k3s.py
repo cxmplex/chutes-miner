@@ -555,33 +555,38 @@ async def test_wait_for_deletion_with_timeout(mock_redis_client, create_api_test
 # Tests for undeploy
 @pytest.mark.asyncio
 async def test_undeploy_success(mock_k8s_core_client, mock_k8s_app_client):
-    """Test successful undeployment of a chute."""
-    # Setup mocks
-    with patch("chutes_miner.api.k8s.operator.K8sOperator.wait_for_deletion") as mock_wait:
-        # Call the function
-        await k8s.undeploy("test-deployment-id")
-
-        # Assertions
-        mock_k8s_core_client.delete_namespaced_service.assert_called_once()
-        mock_k8s_app_client.delete_namespaced_deployment.assert_called_once()
-        mock_wait.assert_called_once()
+    """K3s undeploy advances the durable teardown journal."""
+    with patch(
+        "chutes_miner.api.deployment.teardown."
+        "DeploymentTeardownCoordinator.request_and_run",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as request_and_run:
+        assert await k8s.undeploy("test-deployment-id") is True
+    request_and_run.assert_awaited_once_with(
+        "test-deployment-id",
+        "kubernetes_undeploy",
+    )
+    mock_k8s_core_client.delete_namespaced_service.assert_not_called()
+    mock_k8s_app_client.delete_namespaced_deployment.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_undeploy_with_service_error(mock_k8s_core_client, mock_k8s_app_client):
-    """Test undeployment when service deletion fails."""
-    # Setup service deletion to fail
-    mock_k8s_core_client.delete_namespaced_service.side_effect = Exception("Service error")
-
-    # Setup remaining mocks
-    with patch("chutes_miner.api.k8s.operator.K8sOperator.wait_for_deletion") as mock_wait:
-        # Call the function - should not raise exception
-        await k8s.undeploy("test-deployment-id")
-
-        # Assertions
-        mock_k8s_core_client.delete_namespaced_service.assert_called_once()
-        mock_k8s_app_client.delete_namespaced_deployment.assert_called_once()
-        mock_wait.assert_called_once()
+    """An incomplete K3s teardown remains journaled and is reported to the caller."""
+    with patch(
+        "chutes_miner.api.deployment.teardown."
+        "DeploymentTeardownCoordinator.request_and_run",
+        new_callable=AsyncMock,
+        return_value=False,
+    ) as request_and_run:
+        assert await k8s.undeploy("test-deployment-id") is False
+    request_and_run.assert_awaited_once_with(
+        "test-deployment-id",
+        "kubernetes_undeploy",
+    )
+    mock_k8s_core_client.delete_namespaced_service.assert_not_called()
+    mock_k8s_app_client.delete_namespaced_deployment.assert_not_called()
 
 
 # Tests for deploy_chute
@@ -733,7 +738,15 @@ async def test_deploy_chute_deployment_disappeared(
     mock_redis_client.get_resources.side_effect = get_mock_get_resources_side_effect(responses)
 
     # Call the function and expect exception
-    with patch("chutes_miner.api.k8s.operator.uuid.uuid4", return_value=deployment_id):
+    with (
+        patch("chutes_miner.api.k8s.operator.uuid.uuid4", return_value=deployment_id),
+        patch.object(
+            K8sOperator,
+            "_clear_deployment",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as rollback,
+    ):
         with pytest.raises(DeploymentFailure, match="Deployment disappeared mid-flight"):
             await k8s.deploy_chute(
                 sample_chute,
@@ -741,8 +754,7 @@ async def test_deploy_chute_deployment_disappeared(
                 token="launch-token",
                 config_id="config-1",
             )
-
-    # Add assertions for PP cleanup
+    rollback.assert_awaited_once_with(deployment_id)
 
 
 @pytest.mark.asyncio
@@ -788,16 +800,21 @@ async def test_deploy_chute_api_exception(
     mock_redis_client.get_resources.side_effect = get_mock_get_resources_side_effect(responses)
 
     # Call the function and expect exception
-    with pytest.raises(DeploymentFailure, match="Failed to deploy chute"):
-        await k8s.deploy_chute(
-            sample_chute,
-            sample_server,
-            token="launch-token",
-            config_id="config-1",
-        )
-
-    # Verify cleanup was attempted
-    mock_k8s_core_client.delete_namespaced_service.assert_called_once()
+    with patch.object(
+        K8sOperator,
+        "_clear_deployment",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as rollback:
+        with pytest.raises(DeploymentFailure, match="Failed to deploy chute"):
+            await k8s.deploy_chute(
+                sample_chute,
+                sample_server,
+                token="launch-token",
+                config_id="config-1",
+            )
+    rollback.assert_awaited_once()
+    mock_k8s_core_client.delete_namespaced_service.assert_not_called()
 
 
 # Tests for deploy_chute

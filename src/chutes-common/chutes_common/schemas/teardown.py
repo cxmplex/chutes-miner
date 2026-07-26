@@ -62,6 +62,7 @@ class DeploymentTeardownOperation(Base):
     pods_absent_at = Column(DateTime(timezone=True), nullable=True)
     pull_secret_deletion_ack = Column(JSONB, nullable=True)
     pull_secret_deleted_at = Column(DateTime(timezone=True), nullable=True)
+    lineage_conflict_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -143,6 +144,7 @@ class DeploymentTeardownK8sResource(Base):
     owner_kind = Column(String, nullable=True)
     owner_name = Column(String, nullable=True)
     owner_uid = Column(String, nullable=True)
+    node_name = Column(String, nullable=True)
     labels = Column(JSONB, nullable=False)
     labels_sha256 = Column(String, nullable=False)
     state = Column(String, nullable=False, default="observed", server_default="observed")
@@ -285,6 +287,7 @@ class KubernetesOrphanTombstone(Base):
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     immutable_labels = Column(JSONB, nullable=False)
     last_failure = Column(Text, nullable=True)
+    lineage_conflict_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -335,6 +338,7 @@ class KubernetesOrphanTombstoneResource(Base):
     owner_kind = Column(String, nullable=True)
     owner_name = Column(String, nullable=True)
     owner_uid = Column(String, nullable=True)
+    node_name = Column(String, nullable=True)
     labels = Column(JSONB, nullable=False)
     labels_sha256 = Column(String, nullable=False)
     state = Column(String, nullable=False, default="observed", server_default="observed")

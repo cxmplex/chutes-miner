@@ -956,54 +956,18 @@ class K8sOperator(abc.ABC):
         deployment_id: str,
         timeout_seconds: int | None = None,
         config_id: str | None = None,
-    ) -> None:
-        """
-        Delete a job, and associated service.
-        """
-        wait_timeout = (
-            timeout_seconds if timeout_seconds is not None else settings.chute_shutdown_time_seconds
+    ) -> bool:
+        """Advance the durable UID-scoped teardown for a deployment."""
+        del timeout_seconds, config_id
+        from chutes_miner.api.deployment.teardown import (
+            DeploymentTeardownCoordinator,
+            DirectKubernetesClosure,
         )
 
-        node_name = None
-        try:
-            # TODO: This is problematic, if the job is deleted from k8s manually
-            # cache doesn't return it and we get no node name, so cache can't be invalidated
-            job = await self.get_deployment(deployment_id=deployment_id)
-            node_name = job.get("node", None)
-        except Exception:
-            pass
-
-        try:
-            if node_name:
-                self._delete_job(
-                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}",
-                    namespace=settings.namespace,
-                )
-            else:
-                # Handle fallback to cleaning up old deployments, from instances
-                # Created before the 2025-07-17 upgrade.
-                self._delete_deployment(
-                    name=f"{CHUTE_DEPLOY_PREFIX}-{deployment_id}",
-                    namespace=settings.namespace,
-                )
-        except Exception as exc:
-            logger.warning(f"Error deleting deployment from k8s: {exc}")
-
-        try:
-            self._delete_service(f"{CHUTE_SVC_PREFIX}-{deployment_id}")
-        except Exception as exc:
-            logger.warning(
-                f"Error removing primary service {CHUTE_SVC_PREFIX}-{deployment_id}: {exc}"
-            )
-
-        await self.wait_for_deletion(
-            f"chutes/deployment-id={deployment_id}", timeout_seconds=wait_timeout
+        coordinator = DeploymentTeardownCoordinator(
+            kubernetes=DirectKubernetesClosure(operator=self)
         )
-
-        if node_name:
-            self.invalidate_node_disk_cache(node_name)
-        if settings.gpu_tee_only and config_id:
-            self._delete_registry_pull_secret(config_id)
+        return await coordinator.request_and_run(deployment_id, "kubernetes_undeploy")
 
     async def delete_preflight(self, deployment_id: str, timeout_seconds: int = 120) -> bool:
         """Hook for subclasses to veto undeploy when cache data is stale."""
@@ -1145,31 +1109,12 @@ class K8sOperator(abc.ABC):
             self.invalidate_node_disk_cache(server.name)
             return deployment, job
         except Exception as exc:
-            if settings.gpu_tee_only and config_id and server is not None:
-                try:
-                    await self._revoke_registry_scope(
-                        server.validator,
-                        config_id,
-                    )
-                except Exception as revoke_exc:  # noqa: BLE001
-                    logger.error(
-                        "Failed deployment left registry scope revocation unconfirmed: "
-                        f"{revoke_exc}"
-                    )
             if deployment_id:
-                await self._clear_deployment(deployment_id)
-
-            try:
-                if service:
-                    self._delete_service(service.metadata.name)
-            except Exception:
-                ...
-
-            try:
-                if job:
-                    self._delete_job(job.metadata.name)
-            except Exception:
-                ...
+                rollback_completed = await self._clear_deployment(deployment_id)
+                if not rollback_completed:
+                    raise DeploymentFailure(
+                        f"Deployment failed and durable rollback remains pending: {exc}"
+                    ) from exc
 
             logger.warning(
                 f"Deployment of {chute_id=} on {server_id=} with {deployment_id=} {job_id=} failed, cleaning up service...: {exc=}"
@@ -1281,22 +1226,16 @@ class K8sOperator(abc.ABC):
 
         return deployment_id, gpu_uuids
 
-    async def _clear_deployment(self, deployment_id: str):
-        async with get_session() as session:
-            deployment = (
-                (
-                    await session.execute(
-                        select(Deployment).where(Deployment.deployment_id == deployment_id)
-                    )
-                )
-                .unique()
-                .scalar_one_or_none()
-            )
-            if deployment:
-                if settings.gpu_tee_only and deployment.config_id:
-                    self._delete_registry_pull_secret(deployment.config_id)
-                await session.delete(deployment)
-                await session.commit()
+    async def _clear_deployment(self, deployment_id: str) -> bool:
+        from chutes_miner.api.deployment.teardown import (
+            DeploymentTeardownCoordinator,
+            DirectKubernetesClosure,
+        )
+
+        coordinator = DeploymentTeardownCoordinator(
+            kubernetes=DirectKubernetesClosure(operator=self)
+        )
+        return await coordinator.request_and_run(deployment_id, "launch_rollback")
 
     async def _update_deployment(self, deployment_id: str, server: Server, service: V1Service):
         deployment_port = service.spec.ports[0].node_port

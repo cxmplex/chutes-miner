@@ -42,10 +42,21 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "pods_absent_at",
         "pull_secret_deletion_ack",
         "pull_secret_deleted_at",
+        "lineage_conflict_at",
     }.issubset(operation.c.keys())
     assert "parent_deletion_children" in Base.metadata.tables
     resource = Base.metadata.tables["deployment_teardown_k8s_resources"]
-    assert {"owner_kind", "owner_name", "owner_uid"}.issubset(resource.c.keys())
+    assert {"owner_kind", "owner_name", "owner_uid", "node_name"}.issubset(
+        resource.c.keys()
+    )
+    unique_columns = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in resource.constraints
+        if constraint.name == "deployment_teardown_resource_uid_key"
+    }
+    assert unique_columns == {
+        ("operation_id", "cluster_context", "namespace", "kind", "uid")
+    }
 
 
 def test_migration_guards_release_and_has_migration_specific_down_guard():
@@ -67,4 +78,8 @@ def test_orphan_tombstone_binds_cluster_and_node_lineage():
         "cluster_context_sha256",
         "kubernetes_node_uid",
         "kubernetes_node_generation",
+        "lineage_conflict_at",
     }.issubset(table.c.keys())
+    assert "lineage_conflict_at" not in Base.metadata.tables[
+        "parent_deletion_operations"
+    ].c

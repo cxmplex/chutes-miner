@@ -17,7 +17,6 @@ import chutes_common.schemas.orms  # noqa: F401 - register validator_migrations 
 import chutes_miner.api.k8s as k8s
 import orjson as json
 from chutes_common.auth import sign_request
-from chutes_common.exceptions import AgentError
 from chutes_common.schemas import Base
 from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
@@ -26,6 +25,7 @@ from chutes_common.schemas.server import Server
 from chutes_common.settings import Validator
 from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.database import engine, get_session
+from chutes_miner.api.deployment.teardown import DeploymentTeardownCoordinator
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.api.k8s.util import (
@@ -33,11 +33,9 @@ from chutes_miner.api.k8s.util import (
     resolve_deployment_validator,
 )
 from chutes_miner.api.redis_pubsub import RedisListener
-from chutes_miner.api.server.util import clear_server_cache, stop_server_monitoring
 from chutes_miner.validator_migrations import run_validator_migrations
 from loguru import logger
 from sqlalchemy import case, func, select, text, update
-from sqlalchemy.orm import selectinload
 
 # When scaling up, randomly pick from up to this many of the tightest-fitting servers
 # (rather than always the single most-utilized one) to spread load and avoid repeatedly
@@ -66,6 +64,7 @@ class Gepetto:
         }
         self._scale_lock = asyncio.Lock()
         self._restart_lock = asyncio.Lock()
+        self.teardown = DeploymentTeardownCoordinator()
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -105,6 +104,7 @@ class Gepetto:
             await conn.run_sync(Base.metadata.create_all)
         if settings.validator_migrations_enabled:
             await run_validator_migrations()
+        await self.teardown.resume_pending()
         await k8s.purge_legacy_source_config_maps()
         await self.reconcile()
         asyncio.create_task(self.autoscaler())
@@ -691,55 +691,52 @@ class Gepetto:
         except Exception as exc:
             logger.warning(f"Error purging {instance_id=} from {vali.hotkey=}: {exc}")
 
-    async def undeploy(self, deployment_id: str, instance_id: str = None):
-        """
-        Delete a deployment.
-        """
-        logger.info(f"Removing all traces of deployment: {deployment_id}")
-
-        preflight_ok = await k8s.delete_preflight(deployment_id)
-        if not preflight_ok:
+    async def undeploy(
+        self,
+        deployment_id: str,
+        instance_id: str = None,
+        *,
+        reason: str = "requested",
+    ) -> bool:
+        """Request and advance the restartable teardown for a Deployment."""
+        del instance_id  # The durable operation snapshots the authoritative DB value.
+        logger.info(f"Requesting durable teardown: {deployment_id=} {reason=}")
+        completed = await self.teardown.request_and_run(deployment_id, reason)
+        if completed:
+            logger.success(f"Durable teardown completed for {deployment_id=}")
+        else:
             logger.warning(
-                f"Skipping undeploy for {deployment_id} because cache preflight failed; will retry later"
+                f"Durable teardown for {deployment_id=} is retained for retry or review"
             )
-            return
+        return completed
 
-        # Clean up the database (safe now that preflight succeeded).
-        chute_id = None
-        validator_hotkey = None
-        config_id = None
-        async with get_session() as session:
-            deployment = (
-                (
-                    await session.execute(
-                        select(Deployment).where(Deployment.deployment_id == deployment_id)
-                    )
-                )
-                .unique()
-                .scalar_one_or_none()
+    async def cleanup_kubernetes_orphan(self, resource: dict[str, Any]) -> bool:
+        """Persist a UID-scoped tombstone before deleting an untracked K8s workload."""
+        deployment_id = resource.get("deployment_id")
+        cluster_context = resource.get("node")
+        labels = resource.get("labels") or {}
+        if not deployment_id or not cluster_context:
+            logger.error(
+                "Refusing Kubernetes orphan cleanup without deployment and cluster lineage: "
+                f"{resource}"
             )
-            if deployment:
-                if not instance_id:
-                    instance_id = deployment.instance_id
-                chute_id = deployment.chute_id
-                validator_hotkey = deployment.validator
-                config_id = deployment.config_id
-                if config_id:
-                    await self._revoke_registry_scope(
-                        validator_hotkey,
-                        config_id,
-                    )
-                await session.delete(deployment)
-                await session.commit()
-
-        # Clean up the validator's instance record.
-        if instance_id:
-            if (vali := validator_by_hotkey(validator_hotkey)) is not None:
-                await self.purge_validator_instance(vali, chute_id, instance_id)
-
-        # Purge in k8s if still there.
-        await k8s.undeploy(deployment_id, config_id=config_id)
-        logger.success(f"Removed {deployment_id=}")
+            return False
+        tombstone_id = await self.teardown.request_orphan(
+            deployment_id=deployment_id,
+            cluster_context=cluster_context,
+            immutable_labels={
+                key: str(value)
+                for key, value in labels.items()
+                if key
+                in {
+                    "chutes/deployment-id",
+                    "chutes/chute-id",
+                    "chutes/config-id",
+                    "chutes/job-id",
+                }
+            },
+        )
+        return bool(tombstone_id and await self.teardown.run_orphan(tombstone_id))
 
     async def gpu_verified(self, event_data):
         """
@@ -895,7 +892,7 @@ class Gepetto:
                 f"Error attempting to deploy {chute.chute_id=} on {server.server_id=}: {exc}\n{traceback.format_exc()}"
             )
             if deployment:
-                await self.undeploy(deployment.deployment_id)
+                await self.undeploy(deployment.deployment_id, reason="job_launch_failure")
             await self.release_job(chute, job_id)
 
     async def chute_updated(self, event_data: Dict[str, Any]):
@@ -1024,7 +1021,7 @@ class Gepetto:
             )
         if deployment:
             logger.info(f"Received job_deleted event, undeploying {deployment.deployment_id=}!")
-            await self.undeploy(deployment.deployment_id)
+            await self.undeploy(deployment.deployment_id, reason="job_deleted")
 
     async def bounty_changed(self, event_data):
         """
@@ -1078,23 +1075,6 @@ class Gepetto:
         except Exception as exc:
             logger.error(f"Error purging {gpu_id=} from validator={validator.hotkey}: {exc}")
 
-    @staticmethod
-    async def remove_server_from_validator(validator: Validator, server_id: str):
-        """
-        Purge a GPU from validator inventory.
-        """
-        try:
-            async with aiohttp.ClientSession(raise_for_status=True) as http_session:
-                headers, _ = sign_request(purpose="tee")
-                async with http_session.delete(
-                    f"{validator.api}/servers/{server_id}", headers=headers
-                ) as resp:
-                    logger.success(
-                        f"Successfully purged {server_id=} from validator={validator.hotkey}: {await resp.json()}"
-                    )
-        except Exception as exc:
-            logger.warning(f"Error purging {server_id=} from validator={validator.hotkey}: {exc}")
-
     async def gpu_deleted(self, event_data):
         """
         GPU no longer exists in validator inventory for some reason.
@@ -1107,6 +1087,9 @@ class Gepetto:
             return
         gpu_id = event_data["gpu_id"]
         logger.info(f"Received gpu_deleted event for {gpu_id=}")
+        deployment_id = None
+        validator_hotkey = None
+        allocation_group_id = None
         async with get_session() as session:
             gpu = (
                 (await session.execute(select(GPU).where(GPU.hardware_uuid == gpu_id)))
@@ -1119,15 +1102,31 @@ class Gepetto:
                 except ValueError as exc:
                     logger.error(f"Refusing gpu_deleted generic teardown for {gpu_id}: {exc}")
                     return
-                if gpu.deployment:
-                    await self.undeploy(gpu.deployment_id)
+                deployment_id = gpu.deployment_id
                 validator_hotkey = gpu.validator
-                if (validator := validator_by_hotkey(validator_hotkey)) is not None:
-                    await self.remove_gpu_from_validator(
-                        validator,
-                        gpu_id,
-                        gpu.gpu_allocation_group_id,
-                    )
+                allocation_group_id = gpu.gpu_allocation_group_id
+        if deployment_id and not await self.undeploy(
+            deployment_id,
+            reason="gpu_deleted",
+        ):
+            logger.warning(f"Retaining {gpu_id=} until its deployment teardown completes")
+            return
+        if (validator := validator_by_hotkey(validator_hotkey)) is not None:
+            await self.remove_gpu_from_validator(
+                validator,
+                gpu_id,
+                allocation_group_id,
+            )
+        async with get_session() as session:
+            gpu = (
+                await session.execute(
+                    select(GPU).where(GPU.hardware_uuid == gpu_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if gpu:
+                if gpu.deployment_id is not None:
+                    logger.warning(f"Retaining reassigned {gpu_id=}")
+                    return
                 await session.delete(gpu)
                 await session.commit()
         logger.info(f"Finished processing gpu_deleted event for {gpu_id=}")
@@ -1168,7 +1167,7 @@ class Gepetto:
                 .scalar_one_or_none()
             )
         if deployment:
-            await self.undeploy(deployment.deployment_id)
+            await self.undeploy(deployment.deployment_id, reason="instance_deleted")
         logger.info(f"Finished processing instance_deleted event for {instance_id=}")
 
     async def server_deleted(self, event_data: Dict[str, Any]):
@@ -1183,43 +1182,13 @@ class Gepetto:
         server_id = event_data["server_id"]
         logger.info(f"Received server_deleted event {server_id=}")
 
-        async with get_session() as session:
-            server = (
-                (await session.execute(select(Server).where(Server.server_id == server_id)))
-                .unique()
-                .scalar_one_or_none()
-            )
-            if server:
-                # Stop monitoring and clear Redis before deleting from DB so there is no
-                # window where the server is gone from DB but Redis still has the cluster.
-                if server.agent_api:
-                    try:
-                        await stop_server_monitoring(server.agent_api)
-                    except AgentError as e:
-                        if e.status_code == 409:
-                            logger.warning(
-                                f"Agent for {server.name} has no active monitoring state (status_code=409). "
-                                f"Agent cannot remove itself from cache. Manually clearing cache as fallback."
-                            )
-                        else:
-                            logger.error(
-                                f"Failed to stop monitoring for {server.name} (status_code={e.status_code}). "
-                                f"Clearing from cache.\n{str(e)}"
-                            )
-                        await clear_server_cache(server.name)
-                    except Exception as e:
-                        logger.error(
-                            f"Unexpected error encountered trying to stop monitoring for {server.name}. "
-                            f"Clearing from cache.\n{str(e)}"
-                        )
-                        await clear_server_cache(server.name)
-
-                if (validator := validator_by_hotkey(server.validator)) is not None:
-                    await self.remove_server_from_validator(validator, server.server_id)
-
-                await session.refresh(server)
-                await session.delete(server)
-                await session.commit()
+        operation_id = await self.teardown.request_parent(
+            "server",
+            server_id,
+            "server_deleted",
+        )
+        if operation_id:
+            await self.teardown.run_parent(operation_id)
 
         logger.info(f"Finished processing server_deleted event for {server_id=}")
 
@@ -1268,25 +1237,23 @@ class Gepetto:
         validator = event_data["validator"]
         logger.info(f"Received chute_deleted event for {chute_id=} {version=}")
         async with get_session() as session:
-            chute = (
-                await session.execute(
-                    select(Chute)
-                    .where(Chute.chute_id == chute_id)
-                    .where(Chute.version == version)
-                    .where(Chute.validator == validator)
-                    .options(selectinload(Chute.deployments))
+            chute = await session.scalar(
+                select(Chute).where(
+                    Chute.chute_id == chute_id,
+                    Chute.version == version,
+                    Chute.validator == validator,
                 )
-            ).scalar_one_or_none()
-            if chute:
-                if chute.deployments:
-                    await asyncio.gather(
-                        *[
-                            self.undeploy(deployment.deployment_id)
-                            for deployment in chute.deployments
-                        ]
-                    )
-                await session.delete(chute)
-                await session.commit()
+            )
+        if chute:
+            operation_id = await self.teardown.request_parent(
+                "chute",
+                chute_id,
+                "chute_deleted",
+                expected_validator=validator,
+                expected_chute_version=version,
+            )
+            if operation_id:
+                await self.teardown.run_parent(operation_id)
 
     async def chute_created(self, event_data: Dict[str, Any], desired_count: int = 1):
         """
@@ -1380,6 +1347,7 @@ class Gepetto:
             server = None
             server_gpu_type = None
             server_validator = None
+            old_deployment_id = None
             async with get_session() as session:
                 deployment = (
                     (
@@ -1396,6 +1364,7 @@ class Gepetto:
                     .scalar_one_or_none()
                 )
                 if deployment:
+                    old_deployment_id = deployment.deployment_id
                     server = deployment.server
                     server_id = deployment.server.server_id
                     server_gpu_type = deployment.server.gpus[0].model_short_ref
@@ -1413,7 +1382,14 @@ class Gepetto:
                     except DeploymentFailure as exc:
                         logger.error(f"Refusing rolling update for {instance_id=}: {exc}")
                         return
-                    await self.undeploy(deployment.deployment_id)
+            if old_deployment_id and not await self.undeploy(
+                old_deployment_id,
+                reason="rolling_update",
+            ):
+                logger.warning(
+                    f"Rolling update retained old deployment {old_deployment_id}; retrying later"
+                )
+                return
 
             # Make sure the local chute is updated.
             if (chute := await self.load_chute(chute_id, version, validator_hotkey)) is None:
@@ -1495,7 +1471,10 @@ class Gepetto:
                         f"Unhandled error attempting to deploy {chute.chute_id=} on {server_id=}: {exc}\n{traceback.format_exc()}"
                     )
                     if deployment:
-                        await self.undeploy(deployment.deployment_id)
+                        await self.undeploy(
+                            deployment.deployment_id,
+                            reason="rolling_update_launch_failure",
+                        )
                     return
 
     @staticmethod
@@ -1888,7 +1867,10 @@ class Gepetto:
                     f"Preempting deployments to make room for {chute.chute_id=}: {to_preempt}"
                 )
                 for deployment_id in to_preempt:
-                    await self.undeploy(deployment_id)
+                    if not await self.undeploy(deployment_id, reason="preemption"):
+                        raise DeploymentFailure(
+                            f"preempted deployment {deployment_id} remains in teardown"
+                        )
         except Exception as exc:
             logger.error(f"Unexpected error preempting deployments: {exc}")
             if job_id:
@@ -1922,7 +1904,10 @@ class Gepetto:
                 f"Error attempting to deploy {chute.chute_id=} {job_id=} on {target_server.server_id=} via preemption: {exc}\n{traceback.format_exc()}"
             )
             if deployment:
-                await self.undeploy(deployment.deployment_id)
+                await self.undeploy(
+                    deployment.deployment_id,
+                    reason="preemption_launch_failure",
+                )
             if job_id:
                 await self.release_job(chute, job_id)
         return False
@@ -1951,8 +1936,12 @@ class Gepetto:
                     # - consider both when counts are equal
                     # The default selects the deployment which when removed results in highest free GPU count on that server.
                     if (deployment := await self.optimal_scale_down_deployment(chute)) is not None:
-                        await self.undeploy(deployment.deployment_id)
-                        scaled = True
+                        scaled = await self.undeploy(
+                            deployment.deployment_id,
+                            reason="scale_down",
+                        )
+                        if not scaled:
+                            break
                     else:
                         logger.error(f"Scale down impossible right now, sorry: {chute.chute_id}")
                         scaled = False
@@ -2010,7 +1999,10 @@ class Gepetto:
                                 f"Error attempting to deploy {chute.chute_id=} on {server.server_id=}: {exc}\n{traceback.format_exc()}"
                             )
                             if deployment:
-                                await self.undeploy(deployment.deployment_id)
+                                await self.undeploy(
+                                    deployment.deployment_id,
+                                    reason="scale_up_launch_failure",
+                                )
                             scaled = False
                             break
 
@@ -2036,6 +2028,7 @@ class Gepetto:
         """
         Put our local system back in harmony with the validators.
         """
+        await self.teardown.resume_pending()
         try:
             await self.remote_refresh_all()
         except Exception as exc:
@@ -2202,7 +2195,12 @@ class Gepetto:
                     all_deployments.add(deployment.deployment_id)
                     if deployment.instance_id:
                         all_instances.add(deployment.instance_id)
-                    tasks.append(asyncio.create_task(self.undeploy(deployment.deployment_id)))
+                    tasks.append(
+                        self.undeploy(
+                            deployment.deployment_id,
+                            reason="unsupported_runtime",
+                        )
+                    )
                     continue
 
                 # Make sure the instances created with launch configs have the instance ID tracked.
@@ -2241,12 +2239,13 @@ class Gepetto:
                     logger.warning(
                         f"Deployment {deployment.deployment_id} has config_id={deployment.config_id} but no matching pod in k8s, cleaning up"
                     )
-                    if deployment.instance_id:
-                        if (vali := validator_by_hotkey(deployment.validator)) is not None:
-                            await self.purge_validator_instance(
-                                vali, deployment.chute_id, deployment.instance_id
-                            )
-                    await session.delete(deployment)
+                    all_deployments.add(deployment.deployment_id)
+                    tasks.append(
+                        self.undeploy(
+                            deployment.deployment_id,
+                            reason="reconcile_missing_pod",
+                        )
+                    )
                     continue
 
                 # Check if instance exists on validator
@@ -2257,9 +2256,7 @@ class Gepetto:
                         f"Deployment: {deployment.deployment_id} (instance_id={deployment.instance_id}) on validator {deployment.validator} not found"
                     )
                     tasks.append(
-                        asyncio.create_task(
-                            self.instance_deleted({"instance_id": deployment.instance_id})
-                        )
+                        self.instance_deleted({"instance_id": deployment.instance_id})
                     )
                     # Skip the rest of processing for this deployment since instance is gone
                     continue
@@ -2295,14 +2292,12 @@ class Gepetto:
                         if identifier not in chutes_to_remove:
                             chutes_to_remove.add(identifier)
                             tasks.append(
-                                asyncio.create_task(
-                                    self.chute_deleted(
-                                        {
-                                            "chute_id": deployment.chute_id,
-                                            "version": deployment.version,
-                                            "validator": deployment.validator,
-                                        }
-                                    )
+                                self.chute_deleted(
+                                    {
+                                        "chute_id": deployment.chute_id,
+                                        "version": deployment.version,
+                                        "validator": deployment.validator,
+                                    }
                                 )
                             )
                         continue
@@ -2326,14 +2321,12 @@ class Gepetto:
                     if identifier not in chutes_to_remove:
                         chutes_to_remove.add(identifier)
                         tasks.append(
-                            asyncio.create_task(
-                                self.chute_deleted(
-                                    {
-                                        "chute_id": deployment.chute_id,
-                                        "version": deployment.version,
-                                        "validator": deployment.validator,
-                                    }
-                                )
+                            self.chute_deleted(
+                                {
+                                    "chute_id": deployment.chute_id,
+                                    "version": deployment.version,
+                                    "validator": deployment.validator,
+                                }
                             )
                         )
                     # Don't continue here - we still need to check k8s state and cleanup
@@ -2356,12 +2349,13 @@ class Gepetto:
                     logger.warning(
                         f"Deployment has disappeared from kubernetes: {deployment.deployment_id}"
                     )
-                    if deployment.instance_id:
-                        if (vali := validator_by_hotkey(deployment.validator)) is not None:
-                            await self.purge_validator_instance(
-                                vali, deployment.chute_id, deployment.instance_id
-                            )
-                    await session.delete(deployment)
+                    all_deployments.add(deployment.deployment_id)
+                    tasks.append(
+                        self.undeploy(
+                            deployment.deployment_id,
+                            reason="reconcile_kubernetes_absent",
+                        )
+                    )
                     continue
 
                 # Clean up old stubs
@@ -2372,7 +2366,13 @@ class Gepetto:
                     logger.warning(
                         f"Deployment is still a stub after 30 minutes, deleting! {deployment.deployment_id}"
                     )
-                    await session.delete(deployment)
+                    all_deployments.add(deployment.deployment_id)
+                    tasks.append(
+                        self.undeploy(
+                            deployment.deployment_id,
+                            reason="reconcile_stale_stub",
+                        )
+                    )
                     continue
 
                 # Check for terminated jobs or jobs that never started
@@ -2385,7 +2385,12 @@ class Gepetto:
                         kd = await k8s.get_deployment(deployment.deployment_id)
                     except Exception as exc:
                         if "Not Found" in str(exc) or "(404)" in str(exc):
-                            await self.undeploy(deployment.deployment_id)
+                            tasks.append(
+                                self.undeploy(
+                                    deployment.deployment_id,
+                                    reason="reconcile_job_absent",
+                                )
+                            )
                         continue
 
                     destroyed = False
@@ -2394,11 +2399,21 @@ class Gepetto:
                     # Check job completion status
                     if job_status.get("succeeded", 0) > 0:
                         logger.info(f"Job completed successfully: {deployment.deployment_id}")
-                        await self.undeploy(deployment.deployment_id)
+                        tasks.append(
+                            self.undeploy(
+                                deployment.deployment_id,
+                                reason="job_completed",
+                            )
+                        )
                         destroyed = True
                     elif job_status.get("failed", 0) > 0:
                         logger.warning(f"Job failed: {deployment.deployment_id}")
-                        await self.undeploy(deployment.deployment_id)
+                        tasks.append(
+                            self.undeploy(
+                                deployment.deployment_id,
+                                reason="job_failed",
+                            )
+                        )
                         destroyed = True
 
                     # Check for terminated pods (for Jobs that don't update status properly)
@@ -2416,7 +2431,12 @@ class Gepetto:
                                     logger.warning(
                                         f"Job pod terminated with error: {deployment.deployment_id}, exit_code={exit_code}"
                                     )
-                                await self.undeploy(deployment.deployment_id)
+                                tasks.append(
+                                    self.undeploy(
+                                        deployment.deployment_id,
+                                        reason="job_pod_terminated",
+                                    )
+                                )
                                 destroyed = True
                                 break
 
@@ -2447,6 +2467,11 @@ class Gepetto:
 
             # Purge k8s deployments that aren't tracked anymore
             # BUT exclude legacy deployments from deletion
+            k8s_by_id = {
+                item["deployment_id"]: item
+                for item in k8s_chutes
+                if item.get("deployment_id")
+            }
             for deployment_id in all_k8s_ids - all_deployments:
                 if deployment_id in k8s_legacy_ids:
                     logger.info(f"Preserving legacy kubernetes deployment: {deployment_id}")
@@ -2454,7 +2479,13 @@ class Gepetto:
                 logger.warning(
                     f"Removing kubernetes deployment that is no longer tracked: {deployment_id}"
                 )
-                tasks.append(asyncio.create_task(self.undeploy(deployment_id)))
+                resource = k8s_by_id.get(deployment_id)
+                if resource is None:
+                    logger.error(
+                        f"Cannot tombstone Kubernetes orphan {deployment_id}: exact live identity missing"
+                    )
+                    continue
+                tasks.append(self.cleanup_kubernetes_orphan(resource))
 
             # GPUs that no longer exist in validator inventory.
             all_gpus = []
@@ -2508,14 +2539,12 @@ class Gepetto:
                         f"Chute: {chute.chute_id} version={chute.version} on validator {chute.validator} not found: {remote=}"
                     )
                     tasks.append(
-                        asyncio.create_task(
-                            self.chute_deleted(
-                                {
-                                    "chute_id": chute.chute_id,
-                                    "version": chute.version,
-                                    "validator": chute.validator,
-                                }
-                            )
+                        self.chute_deleted(
+                            {
+                                "chute_id": chute.chute_id,
+                                "version": chute.version,
+                                "validator": chute.validator,
+                            }
                         )
                     )
                     chutes_to_remove.add(identifier)
@@ -2533,14 +2562,12 @@ class Gepetto:
                             continue
                         logger.info(f"Found a new/untracked chute: {chute_id}")
                         tasks.append(
-                            asyncio.create_task(
-                                self.chute_created(
-                                    {
-                                        "chute_id": chute_id,
-                                        "version": config["version"],
-                                        "validator": validator,
-                                    }
-                                )
+                            self.chute_created(
+                                {
+                                    "chute_id": chute_id,
+                                    "version": config["version"],
+                                    "validator": validator,
+                                }
                             )
                         )
 
@@ -2553,16 +2580,14 @@ class Gepetto:
             for server in servers:
                 if server.server_id not in node_ids:
                     logger.warning(f"Server {server.server_id} no longer in kubernetes node list!")
-                    tasks.append(
-                        asyncio.create_task(self.server_deleted({"server_id": server.server_id}))
-                    )
+                    tasks.append(self.server_deleted({"server_id": server.server_id}))
                 all_server_ids.add(server.server_id)
 
             # XXX We won't do the opposite (remove k8s nodes that aren't tracked) because they could be in provisioning status.
             for node_id in node_ids - all_server_ids:
                 logger.warning(f"Server/node {node_id} not tracked in inventory, ignoring...")
 
-            await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
 
     async def reconciler(self):
         """
