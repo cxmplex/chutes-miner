@@ -143,7 +143,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
                   'kubernetes_orphan_tombstones',
                   'kubernetes_orphan_tombstone_resources'
               );
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT trigger_name)
             FROM information_schema.triggers
             WHERE event_object_schema = current_schema()
               AND trigger_name IN (
@@ -257,7 +257,7 @@ def test_teardown_guards_require_the_bound_operation_and_failed_down_is_atomic()
         preserved = _psql(
             """
             SELECT COUNT(*) FROM deployment_teardown_operations;
-            SELECT COUNT(*) FROM information_schema.triggers
+            SELECT COUNT(DISTINCT trigger_name) FROM information_schema.triggers
             WHERE event_object_schema = current_schema()
               AND trigger_name = 'gpus_require_teardown';
             SELECT COUNT(*) FROM information_schema.columns
