@@ -1,1 +1,5 @@
 grafana_password: chutethis
+legacy_cutover_k3s_version: v1.33.1+k3s1
+legacy_cutover_util_linux_version: 2.37.2-4ubuntu3.4
+legacy_cutover_psmisc_version: 23.4-2build3
+legacy_cutover_k3s_helper_sha256: bff738a1797f26645a75258ec9ab5c575e8689ddab0803dcd7b8d091a987347d

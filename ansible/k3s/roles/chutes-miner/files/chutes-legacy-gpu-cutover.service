@@ -9,7 +9,7 @@ Type=oneshot
 User=root
 Group=root
 Environment=KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml
-ExecStart=/usr/local/bin/chutes-miner l0 gpu-legacy-cutover-run --bundle-path /run/chutes/legacy-gpu-cutover.json
+ExecStart=/usr/bin/nsenter --target 1 --mount -- /usr/local/bin/chutes-miner l0 gpu-legacy-cutover-run --bundle-path /run/chutes/legacy-gpu-cutover.json
 ExecStopPost=/usr/bin/rm -f /run/chutes/legacy-k3s-admin.yaml
 RemainAfterExit=no
 PrivateTmp=yes

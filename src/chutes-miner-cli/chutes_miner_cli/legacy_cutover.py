@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import ssl
@@ -16,9 +17,29 @@ from typing import Any
 import aiohttp
 
 BUNDLE_PATH = "/run/chutes/legacy-gpu-cutover.json"
-RECOVERY_MARKER = "/run/chutes/legacy-gpu-cutover-recovery-required"
-CLOSURE_PATH = "/run/chutes/legacy-gpu-cutover-closure.json"
+CUTOVER_STATE_PATH = "/var/lib/chutes/legacy-gpu-cutover/state.json"
+CLOSURE_PATH = "/var/lib/chutes/legacy-gpu-cutover/closure.json"
 K3S_ADMIN_KUBECONFIG = "/run/chutes/legacy-k3s-admin.yaml"
+K3S_SHUTDOWN_HELPER = "/usr/local/libexec/chutes/k3s-killall-v1.33.1+k3s1.sh"
+K3S_SHUTDOWN_HELPER_SHA256 = (
+    "bff738a1797f26645a75258ec9ab5c575e8689ddab0803dcd7b8d091a987347d"
+)
+_CUTOVER_PHASES = (
+    "prepared",
+    "k3s_quiesced",
+    "filesystems_unmounted",
+    "mappers_closed",
+    "transfer_acknowledged",
+)
+_LEGACY_MOUNTS = (
+    "/var/lib/chutes/agent",
+    "/etc/admission-controller/certs",
+    "/etc/rancher/k3s",
+    "/var/lib/kubelet",
+    "/var/lib/rancher/k3s",
+    "/cache/storage",
+    "/var/snap",
+)
 
 
 class LegacyCutoverError(RuntimeError):
@@ -107,11 +128,28 @@ def _write_private_json(path: str, document: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
+        directory_descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _load_closure(path: str) -> dict[str, Any]:
+def _unlink_private(path: str) -> None:
+    destination = Path(path)
+    if not destination.exists():
+        return
+    destination.unlink()
+    directory_descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _load_private_json(path: str, label: str) -> dict[str, Any]:
     metadata = os.stat(path, follow_symlinks=False)
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -119,28 +157,112 @@ def _load_closure(path: str) -> dict[str, Any]:
         or metadata.st_uid != 0
         or metadata.st_mode & 0o077
     ):
-        raise LegacyCutoverError("persisted closure evidence is unsafe")
+        raise LegacyCutoverError(f"persisted {label} is unsafe")
     try:
         document = json.loads(Path(path).read_text(encoding="ascii"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise LegacyCutoverError("persisted closure evidence is malformed") from exc
+        raise LegacyCutoverError(f"persisted {label} is malformed") from exc
+    if not isinstance(document, dict):
+        raise LegacyCutoverError(f"persisted {label} is malformed")
+    return document
+
+
+def _load_closure(path: str) -> dict[str, Any]:
+    document = _load_private_json(path, "closure evidence")
     if (
-        not isinstance(document, dict)
-        or document.get("schema") != "chutes.gpu-legacy-close-request"
+        document.get("schema") != "chutes.gpu-legacy-close-request"
         or document.get("version") != 1
     ):
         raise LegacyCutoverError("persisted closure evidence has the wrong schema")
     return document
 
 
+def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
+    path = path or CUTOVER_STATE_PATH
+    document = _load_private_json(path, "cutover recovery state")
+    common = {
+        "schema",
+        "version",
+        "phase",
+        "boot_id",
+        "legacy_server_id",
+        "target_host_id",
+    }
+    source = common | {
+        "cutover_authorization",
+        "storage_luks_uuid",
+        "storage_filesystem_uuid",
+        "storage_generation",
+        "cache_luks_uuid",
+        "cache_filesystem_uuid",
+        "cache_filesystem_type",
+        "cache_generation",
+        "postgres_password",
+    }
+    acknowledged = common | {"closure_sha256", "api_result"}
+    phase = document.get("phase")
+    expected = acknowledged if phase == "transfer_acknowledged" else source
+    if (
+        set(document) != expected
+        or document.get("schema") != "chutes.legacy-gpu-cutover-state"
+        or document.get("version") != 1
+        or phase not in _CUTOVER_PHASES
+        or any(
+            not isinstance(document.get(key), str) or not document[key]
+            for key in ("boot_id", "legacy_server_id", "target_host_id")
+        )
+    ):
+        raise LegacyCutoverError(
+            "persisted cutover recovery state has the wrong schema"
+        )
+    if phase == "transfer_acknowledged":
+        result = document["api_result"]
+        if (
+            not isinstance(result, dict)
+            or not isinstance(document["closure_sha256"], str)
+            or len(document["closure_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in document["closure_sha256"]
+            )
+            or result.get("schema") != "chutes.gpu-legacy-closed"
+            or result.get("legacy_server_id") != document["legacy_server_id"]
+            or result.get("status") != "guest_closed"
+        ):
+            raise LegacyCutoverError("persisted transfer acknowledgement is malformed")
+        return document
+    if (
+        any(
+            not isinstance(document.get(key), str) or not document[key]
+            for key in source - common - {"storage_generation", "cache_generation"}
+        )
+        or not isinstance(document["storage_generation"], int)
+        or document["storage_generation"] < 0
+        or not isinstance(document["cache_generation"], int)
+        or document["cache_generation"] < 0
+    ):
+        raise LegacyCutoverError("persisted cutover source evidence is malformed")
+    return document
+
+
 def rebind_closure_authorization(token: str) -> None:
-    if not Path(CLOSURE_PATH).exists():
-        return
     if not token:
         raise LegacyCutoverError("replacement cutover authorization is empty")
-    closure = _load_closure(CLOSURE_PATH)
-    closure["cutover_authorization"] = token
-    _write_private_json(CLOSURE_PATH, closure)
+    changed = False
+    if Path(CUTOVER_STATE_PATH).exists():
+        state = _load_cutover_state()
+        if state["phase"] == "transfer_acknowledged":
+            raise LegacyCutoverError("acknowledged cutover authorization is immutable")
+        state["cutover_authorization"] = token
+        _write_private_json(CUTOVER_STATE_PATH, state)
+        changed = True
+    if Path(CLOSURE_PATH).exists():
+        closure = _load_closure(CLOSURE_PATH)
+        closure["cutover_authorization"] = token
+        _write_private_json(CLOSURE_PATH, closure)
+        changed = True
+    if not changed:
+        return
 
 
 def _generation(root: str) -> int:
@@ -153,18 +275,143 @@ def _generation(root: str) -> int:
     return value
 
 
+def _boot_id() -> str:
+    try:
+        value = (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        )
+    except OSError as exc:
+        raise LegacyCutoverError("host boot identity is unavailable") from exc
+    if len(value) != 36:
+        raise LegacyCutoverError("host boot identity is malformed")
+    return value
+
+
+def _verify_host_mount_namespace() -> None:
+    try:
+        current = os.stat("/proc/self/ns/mnt")
+        host = os.stat("/proc/1/ns/mnt")
+    except OSError as exc:
+        raise LegacyCutoverError("mount namespace identity is unavailable") from exc
+    if (current.st_dev, current.st_ino) != (host.st_dev, host.st_ino):
+        raise LegacyCutoverError(
+            "legacy cutover is not running in PID 1's mount namespace"
+        )
+
+
+def _verify_shutdown_helper() -> None:
+    try:
+        metadata = os.stat(K3S_SHUTDOWN_HELPER, follow_symlinks=False)
+        payload = Path(K3S_SHUTDOWN_HELPER).read_bytes()
+    except OSError as exc:
+        raise LegacyCutoverError("pinned K3s shutdown helper is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not metadata.st_mode & stat.S_IXUSR
+        or hashlib.sha256(payload).hexdigest() != K3S_SHUTDOWN_HELPER_SHA256
+    ):
+        raise LegacyCutoverError("pinned K3s shutdown helper failed validation")
+
+
+def _mountpoint(path: str) -> bool:
+    result = _run(["/usr/bin/mountpoint", "-q", "--", path])
+    if result.returncode not in {0, 1}:
+        raise LegacyCutoverError(f"legacy mount status is unavailable: {path}")
+    return result.returncode == 0
+
+
+def _require_no_mount_holders(path: str) -> None:
+    if not _mountpoint(path):
+        return
+    result = _run(["/usr/bin/fuser", "-m", "--", path])
+    if result.returncode == 0:
+        raise LegacyCutoverError(f"legacy mount still has open holders: {path}")
+    if result.returncode != 1:
+        raise LegacyCutoverError(f"legacy mount holders are unavailable: {path}")
+
+
 def _unmount(path: str) -> None:
-    if _run(["mountpoint", "-q", path]).returncode == 0:
-        if _run(["umount", path]).returncode != 0:
-            raise LegacyCutoverError(f"legacy mount could not be closed: {path}")
+    if not _mountpoint(path):
+        return
+    _require_no_mount_holders(path)
+    if _run(["/usr/bin/umount", "--", path]).returncode != 0 or _mountpoint(path):
+        raise LegacyCutoverError(f"legacy mount could not be closed: {path}")
+
+
+def _require_mapper_unmounted(name: str) -> None:
+    mapper = f"/dev/mapper/{name}"
+    result = _run(["/usr/bin/findmnt", "-rn", "--source", mapper])
+    if result.returncode == 0:
+        raise LegacyCutoverError(f"legacy mapper remains mounted: {name}")
+    if result.returncode != 1:
+        raise LegacyCutoverError(f"legacy mapper mount status is unavailable: {name}")
+
+
+def _require_no_mapper_holders(name: str) -> None:
+    mapper = f"/dev/mapper/{name}"
+    if not os.path.exists(mapper):
+        return
+    result = _run(["/usr/bin/fuser", "--", mapper])
+    if result.returncode == 0:
+        raise LegacyCutoverError(f"legacy mapper still has open holders: {name}")
+    if result.returncode != 1:
+        raise LegacyCutoverError(f"legacy mapper holders are unavailable: {name}")
 
 
 def _close_mapper(name: str) -> None:
     mapper = f"/dev/mapper/{name}"
-    if os.path.exists(mapper) and _run(["cryptsetup", "luksClose", name]).returncode != 0:
+    _require_mapper_unmounted(name)
+    _require_no_mapper_holders(name)
+    if (
+        os.path.exists(mapper)
+        and _run(["cryptsetup", "luksClose", name]).returncode != 0
+    ):
         raise LegacyCutoverError(f"legacy mapper could not be closed: {name}")
     if os.path.exists(mapper) or _run(["cryptsetup", "status", name]).returncode == 0:
         raise LegacyCutoverError(f"legacy mapper remains open: {name}")
+
+
+def _require_k3s_quiesced() -> None:
+    service = _run(["systemctl", "is-active", "--quiet", "k3s.service"])
+    if service.returncode == 0:
+        raise LegacyCutoverError("K3s remains active after the shutdown helper")
+    if service.returncode != 3:
+        raise LegacyCutoverError(
+            "K3s service state is unavailable after the shutdown helper"
+        )
+    shims = _run(
+        [
+            "pgrep",
+            "-f",
+            r"/var/lib/rancher/k3s/data/[^/]+/bin/containerd-shim",
+        ]
+    )
+    if shims.returncode == 0:
+        raise LegacyCutoverError("K3s container shims remain active")
+    if shims.returncode != 1:
+        raise LegacyCutoverError("K3s container-shim state is unavailable")
+
+
+def _require_filesystems_unmounted() -> None:
+    for path in _LEGACY_MOUNTS:
+        if _mountpoint(path):
+            raise LegacyCutoverError(f"legacy mount remains open: {path}")
+    _require_mapper_unmounted("storage")
+    _require_mapper_unmounted("tdx-cache")
+
+
+def _require_mappers_closed() -> None:
+    _require_filesystems_unmounted()
+    for name in ("storage", "tdx-cache"):
+        mapper = f"/dev/mapper/{name}"
+        if (
+            os.path.exists(mapper)
+            or _run(["cryptsetup", "status", name]).returncode == 0
+        ):
+            raise LegacyCutoverError(f"legacy mapper remains open: {name}")
 
 
 def _verified_postgres_password(kubeconfig: str) -> str:
@@ -178,7 +425,9 @@ def _verified_postgres_password(kubeconfig: str) -> str:
         or metadata.st_uid != 0
         or metadata.st_mode & 0o077
     ):
-        raise LegacyCutoverError("legacy K3s admin kubeconfig is absent or not root-only")
+        raise LegacyCutoverError(
+            "legacy K3s admin kubeconfig is absent or not root-only"
+        )
     ready = _run(["kubectl", "--kubeconfig", kubeconfig, "get", "--raw=/readyz"])
     if ready.returncode != 0 or ready.stdout.strip() != "ok":
         raise LegacyCutoverError("legacy K3s admin kubeconfig is not ready")
@@ -223,7 +472,9 @@ def _verified_postgres_password(kubeconfig: str) -> str:
             or not secret.get("metadata", {}).get("uid")
             or set(secret.get("data", {})) != {"postgres-password"}
         ):
-            raise LegacyCutoverError("legacy cluster or PostgreSQL secret identity is invalid")
+            raise LegacyCutoverError(
+                "legacy cluster or PostgreSQL secret identity is invalid"
+            )
         encoded = secret["data"]["postgres-password"]
         password = base64.b64decode(encoded, validate=True).decode("utf-8")
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -233,12 +484,31 @@ def _verified_postgres_password(kubeconfig: str) -> str:
     return password
 
 
-def _closure_document(bundle: dict[str, Any]) -> dict[str, Any]:
+def _canonical_json(document: dict[str, Any]) -> bytes:
+    return json.dumps(
+        document,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def _capture_source_state(bundle: dict[str, Any], boot_id: str) -> dict[str, Any]:
     postgres_password = _verified_postgres_password(bundle["kubeconfig_path"])
     storage_device = "/dev/disk/by-label/storage"
     cache_device = "/dev/disk/by-label/tdx-cache"
     storage_mapper = "/dev/mapper/storage"
     cache_mapper = "/dev/mapper/tdx-cache"
+    if (
+        not os.path.exists(storage_mapper)
+        or not os.path.exists(cache_mapper)
+        or not _mountpoint("/cache/storage")
+        or not _mountpoint("/var/snap")
+    ):
+        raise LegacyCutoverError(
+            "legacy storage and tdx-cache layouts must both be mounted"
+        )
     if (
         _output(
             ["blkid", "-o", "value", "-s", "TYPE", storage_mapper],
@@ -254,8 +524,11 @@ def _closure_document(bundle: dict[str, Any]) -> dict[str, Any]:
     if cache_type not in {"xfs", "ext4"}:
         raise LegacyCutoverError("legacy tdx-cache filesystem is unsupported")
     return {
-        "schema": "chutes.gpu-legacy-close-request",
+        "schema": "chutes.legacy-gpu-cutover-state",
         "version": 1,
+        "phase": "prepared",
+        "boot_id": boot_id,
+        "legacy_server_id": bundle["legacy_server_id"],
         "cutover_authorization": bundle["cutover_authorization"],
         "target_host_id": bundle["target_host_id"],
         "storage_luks_uuid": _output(
@@ -278,6 +551,28 @@ def _closure_document(bundle: dict[str, Any]) -> dict[str, Any]:
         "cache_filesystem_type": cache_type,
         "cache_generation": _generation("/var/snap"),
         "postgres_password": postgres_password,
+    }
+
+
+def _closure_document(state: dict[str, Any]) -> dict[str, Any]:
+    if state["phase"] != "mappers_closed":
+        raise LegacyCutoverError(
+            "closure cannot be generated before both mappers are closed"
+        )
+    _require_mappers_closed()
+    return {
+        "schema": "chutes.gpu-legacy-close-request",
+        "version": 1,
+        "cutover_authorization": state["cutover_authorization"],
+        "target_host_id": state["target_host_id"],
+        "storage_luks_uuid": state["storage_luks_uuid"],
+        "storage_filesystem_uuid": state["storage_filesystem_uuid"],
+        "storage_generation": state["storage_generation"],
+        "cache_luks_uuid": state["cache_luks_uuid"],
+        "cache_filesystem_uuid": state["cache_filesystem_uuid"],
+        "cache_filesystem_type": state["cache_filesystem_type"],
+        "cache_generation": state["cache_generation"],
+        "postgres_password": state["postgres_password"],
         "workloads_stopped": True,
         "postgres_stopped": True,
         "filesystems_synced": True,
@@ -287,81 +582,168 @@ def _closure_document(bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _advance_phase(
+    state: dict[str, Any],
+    expected: str,
+    successor: str,
+) -> dict[str, Any]:
+    if (
+        state.get("phase") != expected
+        or _CUTOVER_PHASES.index(successor) != _CUTOVER_PHASES.index(expected) + 1
+    ):
+        raise LegacyCutoverError("cutover phase transition is invalid")
+    updated = dict(state)
+    updated["phase"] = successor
+    _write_private_json(CUTOVER_STATE_PATH, updated)
+    return updated
+
+
+def _require_state_bundle_identity(
+    state: dict[str, Any],
+    bundle: dict[str, Any],
+) -> None:
+    if (
+        state["legacy_server_id"] != bundle["legacy_server_id"]
+        or state["target_host_id"] != bundle["target_host_id"]
+    ):
+        raise LegacyCutoverError("persisted cutover state belongs to different custody")
+
+
 async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise LegacyCutoverError("legacy GPU cutover must run as root")
-    bundle = _load_bundle(bundle_path)
-    closure = (
-        _load_closure(CLOSURE_PATH) if Path(CLOSURE_PATH).exists() else _closure_document(bundle)
+    _verify_host_mount_namespace()
+    current_boot_id = _boot_id()
+    state = (
+        _load_cutover_state(CUTOVER_STATE_PATH)
+        if Path(CUTOVER_STATE_PATH).exists()
+        else None
     )
-    if not Path(CLOSURE_PATH).exists():
-        _write_private_json(CLOSURE_PATH, closure)
-    if _run(["systemctl", "stop", "k3s.service"]).returncode != 0:
-        raise LegacyCutoverError("K3s and legacy PostgreSQL did not quiesce")
-    os.sync()
-    for path in (
-        "/var/lib/chutes/agent",
-        "/etc/admission-controller/certs",
-        "/etc/rancher/k3s",
-        "/var/lib/kubelet",
-        "/var/lib/rancher/k3s",
-        "/cache/storage",
-        "/var/snap",
-    ):
-        _unmount(path)
-    _close_mapper("storage")
-    _close_mapper("tdx-cache")
-    os.sync()
-    Path(RECOVERY_MARKER).write_text("reboot reopens validator custody\n", encoding="ascii")
-    os.chmod(RECOVERY_MARKER, 0o600)
-    context = ssl.create_default_context(cafile=bundle["ca_path"] or None)
-    context.load_cert_chain(bundle["cert_path"], bundle["key_path"])
-    connector = aiohttp.TCPConnector(ssl=context)
-    target = f"/servers/gpu/{bundle['legacy_server_id']}/legacy-migration/close"
-    try:
+    if state is not None and state["phase"] == "transfer_acknowledged":
+        _unlink_private(CLOSURE_PATH)
+        _unlink_private(bundle_path)
+        if _run(["systemctl", "poweroff", "--no-block"]).returncode != 0:
+            raise LegacyCutoverError("legacy guest could not resume final poweroff")
+        return state["api_result"]
+
+    _verify_shutdown_helper()
+    bundle = _load_bundle(bundle_path)
+    if state is None or state["boot_id"] != current_boot_id:
+        state = _capture_source_state(bundle, current_boot_id)
+        _write_private_json(CUTOVER_STATE_PATH, state)
+        _unlink_private(CLOSURE_PATH)
+    else:
+        _require_state_bundle_identity(state, bundle)
+
+    if state["phase"] == "prepared":
+        if _run([K3S_SHUTDOWN_HELPER]).returncode != 0:
+            raise LegacyCutoverError("pinned K3s shutdown helper failed")
+        _require_k3s_quiesced()
+        state = _advance_phase(state, "prepared", "k3s_quiesced")
+
+    if state["phase"] == "k3s_quiesced":
+        _require_k3s_quiesced()
+        os.sync()
+        for path in _LEGACY_MOUNTS:
+            _unmount(path)
+        os.sync()
+        _require_filesystems_unmounted()
+        state = _advance_phase(
+            state,
+            "k3s_quiesced",
+            "filesystems_unmounted",
+        )
+
+    if state["phase"] == "filesystems_unmounted":
+        _require_filesystems_unmounted()
+        _close_mapper("storage")
+        _close_mapper("tdx-cache")
+        os.sync()
+        _require_mappers_closed()
+        state = _advance_phase(
+            state,
+            "filesystems_unmounted",
+            "mappers_closed",
+        )
+
+    if state["phase"] == "mappers_closed":
+        _require_mappers_closed()
+        expected_closure = _closure_document(state)
+        if Path(CLOSURE_PATH).exists():
+            closure = _load_closure(CLOSURE_PATH)
+            if closure != expected_closure:
+                raise LegacyCutoverError(
+                    "persisted closure differs from closed source evidence"
+                )
+        else:
+            closure = expected_closure
+            _write_private_json(CLOSURE_PATH, closure)
+
+        context = ssl.create_default_context(cafile=bundle["ca_path"] or None)
+        context.load_cert_chain(bundle["cert_path"], bundle["key_path"])
+        connector = aiohttp.TCPConnector(ssl=context)
+        target = f"/servers/gpu/{bundle['legacy_server_id']}/legacy-migration/close"
         async with aiohttp.ClientSession(
             base_url=bundle["validator_api"].rstrip("/"),
             connector=connector,
         ) as session:
-            async with session.post(target, json=closure, allow_redirects=False) as response:
+            async with session.post(
+                target, json=closure, allow_redirects=False
+            ) as response:
                 result = await response.json()
                 if response.status != 200:
                     raise LegacyCutoverError(
                         f"validator custody transfer failed with HTTP {response.status}"
                     )
-    except Exception:
-        # Mappings remain closed. The operator can run recovery, which reboots
-        # through the unchanged legacy initramfs key-release flow.
-        raise
-    if (
-        not isinstance(result, dict)
-        or result.get("schema") != "chutes.gpu-legacy-closed"
-        or result.get("legacy_server_id") != bundle["legacy_server_id"]
-        or result.get("status") != "guest_closed"
-    ):
-        raise LegacyCutoverError("validator returned invalid transfer evidence")
-    Path(RECOVERY_MARKER).unlink(missing_ok=True)
-    Path(CLOSURE_PATH).unlink(missing_ok=True)
-    Path(bundle_path).unlink(missing_ok=True)
-    os.sync()
+        if (
+            not isinstance(result, dict)
+            or result.get("schema") != "chutes.gpu-legacy-closed"
+            or result.get("legacy_server_id") != state["legacy_server_id"]
+            or result.get("status") != "guest_closed"
+        ):
+            raise LegacyCutoverError("validator returned invalid transfer evidence")
+        acknowledged = {
+            "schema": "chutes.legacy-gpu-cutover-state",
+            "version": 1,
+            "phase": "transfer_acknowledged",
+            "boot_id": state["boot_id"],
+            "legacy_server_id": state["legacy_server_id"],
+            "target_host_id": state["target_host_id"],
+            "closure_sha256": hashlib.sha256(_canonical_json(closure)).hexdigest(),
+            "api_result": result,
+        }
+        _write_private_json(CUTOVER_STATE_PATH, acknowledged)
+        _unlink_private(CLOSURE_PATH)
+        _unlink_private(bundle_path)
+        state = acknowledged
+
+    if state["phase"] != "transfer_acknowledged":
+        raise LegacyCutoverError("cutover stopped in an unknown phase")
     if _run(["systemctl", "poweroff", "--no-block"]).returncode != 0:
         raise LegacyCutoverError("legacy guest could not begin final poweroff")
-    return result
+    return state["api_result"]
 
 
 def recover_legacy_cutover() -> None:
     if os.geteuid() != 0:
         raise LegacyCutoverError("legacy GPU recovery must run as root")
-    if not Path(RECOVERY_MARKER).is_file():
+    if not Path(CUTOVER_STATE_PATH).is_file():
         raise LegacyCutoverError("no failed legacy cutover requires recovery")
-    if _run(["systemctl", "reboot", "--no-block"]).returncode != 0:
-        raise LegacyCutoverError("legacy recovery reboot failed")
+    state = _load_cutover_state(CUTOVER_STATE_PATH)
+    if state["phase"] == "mappers_closed":
+        raise LegacyCutoverError(
+            "exact validator closure must be resumed; reboot is forbidden after mapper closure"
+        )
+    action = "poweroff" if state["phase"] == "transfer_acknowledged" else "reboot"
+    if _run(["systemctl", action, "--no-block"]).returncode != 0:
+        raise LegacyCutoverError(f"legacy recovery {action} failed")
 
 
 def run(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     kubeconfig: str | None = None
     try:
-        kubeconfig = _load_bundle(bundle_path)["kubeconfig_path"]
+        if Path(bundle_path).exists():
+            kubeconfig = _load_bundle(bundle_path)["kubeconfig_path"]
         return asyncio.run(run_cutover(bundle_path))
     finally:
         if kubeconfig:

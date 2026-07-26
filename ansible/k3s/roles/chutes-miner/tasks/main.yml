@@ -1,4 +1,22 @@
 ---
+- name: Validate pinned legacy cutover dependencies
+  ansible.builtin.assert:
+    that:
+      - k3s_version == legacy_cutover_k3s_version
+      - >-
+        (lookup('ansible.builtin.file', role_path +
+        '/files/k3s-killall-v1.33.1+k3s1.sh') | hash('sha256')) ==
+        legacy_cutover_k3s_helper_sha256
+    fail_msg: Legacy GPU cutover dependency pins do not match the reviewed closure.
+
+- name: Install pinned host-namespace cutover tools
+  ansible.builtin.apt:
+    name:
+      - "util-linux={{ legacy_cutover_util_linux_version }}"
+      - "psmisc={{ legacy_cutover_psmisc_version }}"
+    state: present
+    update_cache: true
+
 - name: Create legacy cutover helper directory
   ansible.builtin.file:
     path: /usr/local/libexec/chutes
@@ -6,6 +24,34 @@
     owner: root
     group: root
     mode: "0755"
+
+- name: Create durable legacy cutover recovery directory
+  ansible.builtin.file:
+    path: /var/lib/chutes/legacy-gpu-cutover
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install checksum-pinned K3s shutdown helper
+  ansible.builtin.copy:
+    src: k3s-killall-v1.33.1+k3s1.sh
+    dest: /usr/local/libexec/chutes/k3s-killall-v1.33.1+k3s1.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Verify installed K3s shutdown helper checksum
+  ansible.builtin.stat:
+    path: /usr/local/libexec/chutes/k3s-killall-v1.33.1+k3s1.sh
+    checksum_algorithm: sha256
+  register: legacy_cutover_k3s_helper
+
+- name: Reject a changed installed K3s shutdown helper
+  ansible.builtin.assert:
+    that:
+      - legacy_cutover_k3s_helper.stat.checksum == legacy_cutover_k3s_helper_sha256
+    fail_msg: Installed legacy GPU cutover shutdown helper failed checksum validation.
 
 - name: Install legacy K3s admin preparation helper
   ansible.builtin.copy:
