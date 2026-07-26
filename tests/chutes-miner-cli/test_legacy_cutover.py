@@ -11,6 +11,27 @@ from chutes_miner_cli import legacy_cutover
 
 
 BOOT_ID = "11111111-2222-3333-4444-555555555555"
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_cutover_state_contract_fixture_matches_implementation():
+    contract = json.loads(
+        (ROOT / "tests/fixtures/legacy_gpu_cutover_state_v1.json").read_text(encoding="ascii")
+    )
+    assert contract == {
+        "acknowledged_fields": sorted(legacy_cutover.CUTOVER_STATE_ACKNOWLEDGED_FIELDS),
+        "file_requirements": {
+            "mode": "0600",
+            "owner_uid": 0,
+            "regular_file": True,
+            "symlinks": False,
+        },
+        "path": legacy_cutover.CUTOVER_STATE_PATH,
+        "phases": list(legacy_cutover.CUTOVER_STATE_PHASES),
+        "schema": legacy_cutover.CUTOVER_STATE_SCHEMA,
+        "source_fields": sorted(legacy_cutover.CUTOVER_STATE_SOURCE_FIELDS),
+        "version": legacy_cutover.CUTOVER_STATE_VERSION,
+    }
 
 
 def _bundle() -> dict:
@@ -559,6 +580,30 @@ def test_private_json_fsyncs_file_and_directory(monkeypatch, tmp_path):
     assert len(calls) == 2
     assert modes == [0o600]
     assert json.loads(path.read_text(encoding="ascii")) == {"phase": "prepared"}
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o640, 0o700])
+def test_private_json_requires_exact_mode_0600(monkeypatch, tmp_path, mode):
+    path = tmp_path / "state.json"
+    path.write_text('{"phase":"prepared"}\n', encoding="ascii")
+    monkeypatch.setattr(
+        legacy_cutover.os,
+        "stat",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            st_mode=stat.S_IFREG | mode,
+            st_uid=0,
+        ),
+    )
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match="unsafe"):
+        legacy_cutover._load_private_json(str(path), "cutover recovery state")
+
+
+def test_dangling_cutover_marker_symlink_fails_closed(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.symlink_to(tmp_path / "missing.json")
+    monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match="unsafe"):
+        legacy_cutover.enforce_reboot_fence()
 
 
 def test_cutover_rejects_service_private_mount_namespace(monkeypatch):

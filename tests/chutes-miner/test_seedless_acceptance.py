@@ -13,6 +13,31 @@ CONTROL_LABEL = {"chutes/seedless-control-plane": "true"}
 STACK_IMAGE = f"chutes.local/seedless-stack@sha256:{'a' * 64}"
 
 
+def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
+    miner_fixture = ROOT / "tests/fixtures/legacy_gpu_cutover_state_v1.json"
+    sek8s_root = repository_root("sek8s", start=Path(__file__))
+    sek8s_fixture = sek8s_root / "tests/fixtures/legacy_gpu_cutover_state_v1.json"
+    assert miner_fixture.read_bytes() == sek8s_fixture.read_bytes()
+    setup_storage = (
+        sek8s_root
+        / "ansible/guest/roles/luks/files/initramfs/setup_storage"
+    ).read_text(encoding="utf-8")
+    fence_call = '"$CUTOVER_FENCE_HELPER" "$cutover_state" 0'
+    assert 'CUTOVER_STATE_RELATIVE="/var/lib/chutes/legacy-gpu-cutover/state.json"' in (
+        setup_storage
+    )
+    assert setup_storage.index(fence_call) < setup_storage.index("if ! load_vm_data")
+    for operation in (
+        "detect_storage_device",
+        "detect_cache_device",
+        "post_sync_keys",
+        "setup_storage",
+        "setup_cache",
+        "stage_volume_generation",
+    ):
+        assert setup_storage.index(fence_call) < setup_storage.index(f"if ! {operation}")
+
+
 def test_runtime_purposes_use_the_cross_repo_contract():
     fixture = (
         repository_root("api", start=Path(__file__))

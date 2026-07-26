@@ -1,0 +1,47 @@
+{
+  "acknowledged_fields": [
+    "api_result",
+    "boot_id",
+    "closure_sha256",
+    "last_boot_id",
+    "legacy_server_id",
+    "phase",
+    "schema",
+    "target_host_id",
+    "version"
+  ],
+  "file_requirements": {
+    "mode": "0600",
+    "owner_uid": 0,
+    "regular_file": true,
+    "symlinks": false
+  },
+  "path": "/var/lib/chutes/legacy-gpu-cutover/state.json",
+  "phases": [
+    "prepared",
+    "k3s_quiesced",
+    "filesystems_unmounted",
+    "mappers_closed",
+    "transfer_acknowledged"
+  ],
+  "schema": "chutes.legacy-gpu-cutover-state",
+  "source_fields": [
+    "boot_id",
+    "cache_filesystem_type",
+    "cache_filesystem_uuid",
+    "cache_generation",
+    "cache_luks_uuid",
+    "connection",
+    "last_boot_id",
+    "legacy_server_id",
+    "phase",
+    "postgres_password",
+    "schema",
+    "storage_filesystem_uuid",
+    "storage_generation",
+    "storage_luks_uuid",
+    "target_host_id",
+    "version"
+  ],
+  "version": 1
+}

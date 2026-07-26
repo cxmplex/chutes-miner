@@ -25,13 +25,41 @@ K3S_SHUTDOWN_HELPER = "/usr/local/libexec/chutes/k3s-killall-v1.33.1+k3s1.sh"
 K3S_SHUTDOWN_HELPER_SHA256 = (
     "bff738a1797f26645a75258ec9ab5c575e8689ddab0803dcd7b8d091a987347d"
 )
-_CUTOVER_PHASES = (
+CUTOVER_STATE_SCHEMA = "chutes.legacy-gpu-cutover-state"
+CUTOVER_STATE_VERSION = 1
+CUTOVER_STATE_PHASES = (
     "prepared",
     "k3s_quiesced",
     "filesystems_unmounted",
     "mappers_closed",
     "transfer_acknowledged",
 )
+CUTOVER_STATE_COMMON_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "phase",
+        "boot_id",
+        "last_boot_id",
+        "legacy_server_id",
+        "target_host_id",
+    }
+)
+CUTOVER_STATE_SOURCE_FIELDS = CUTOVER_STATE_COMMON_FIELDS | {
+    "connection",
+    "storage_luks_uuid",
+    "storage_filesystem_uuid",
+    "storage_generation",
+    "cache_luks_uuid",
+    "cache_filesystem_uuid",
+    "cache_filesystem_type",
+    "cache_generation",
+    "postgres_password",
+}
+CUTOVER_STATE_ACKNOWLEDGED_FIELDS = CUTOVER_STATE_COMMON_FIELDS | {
+    "closure_sha256",
+    "api_result",
+}
 _LEGACY_MOUNTS = (
     "/var/lib/chutes/agent",
     "/etc/admission-controller/certs",
@@ -150,13 +178,21 @@ def _unlink_private(path: str) -> None:
         os.close(directory_descriptor)
 
 
+def _path_present(path: str) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _load_private_json(path: str, label: str) -> dict[str, Any]:
     metadata = os.stat(path, follow_symlinks=False)
     if (
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != 0
-        or metadata.st_mode & 0o077
+        or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         raise LegacyCutoverError(f"persisted {label} is unsafe")
     try:
@@ -181,34 +217,17 @@ def _load_closure(path: str) -> dict[str, Any]:
 def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
     path = path or CUTOVER_STATE_PATH
     document = _load_private_json(path, "cutover recovery state")
-    common = {
-        "schema",
-        "version",
-        "phase",
-        "boot_id",
-        "last_boot_id",
-        "legacy_server_id",
-        "target_host_id",
-    }
-    source = common | {
-        "connection",
-        "storage_luks_uuid",
-        "storage_filesystem_uuid",
-        "storage_generation",
-        "cache_luks_uuid",
-        "cache_filesystem_uuid",
-        "cache_filesystem_type",
-        "cache_generation",
-        "postgres_password",
-    }
-    acknowledged = common | {"closure_sha256", "api_result"}
     phase = document.get("phase")
-    expected = acknowledged if phase == "transfer_acknowledged" else source
+    expected = (
+        CUTOVER_STATE_ACKNOWLEDGED_FIELDS
+        if phase == "transfer_acknowledged"
+        else CUTOVER_STATE_SOURCE_FIELDS
+    )
     if (
         set(document) != expected
-        or document.get("schema") != "chutes.legacy-gpu-cutover-state"
-        or document.get("version") != 1
-        or phase not in _CUTOVER_PHASES
+        or document.get("schema") != CUTOVER_STATE_SCHEMA
+        or document.get("version") != CUTOVER_STATE_VERSION
+        or phase not in CUTOVER_STATE_PHASES
         or any(
             not isinstance(document.get(key), str) or not document[key]
             for key in ("boot_id", "last_boot_id", "legacy_server_id", "target_host_id")
@@ -241,8 +260,8 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
     if (
         any(
             not isinstance(document.get(key), str) or not document[key]
-            for key in source
-            - common
+            for key in CUTOVER_STATE_SOURCE_FIELDS
+            - CUTOVER_STATE_COMMON_FIELDS
             - {"storage_generation", "cache_generation", "connection"}
         )
         or not isinstance(document["storage_generation"], int)
@@ -283,7 +302,7 @@ def _persist_authorization(
 def rebind_closure_authorization(token: str) -> None:
     if not token:
         raise LegacyCutoverError("replacement cutover authorization is empty")
-    if Path(CUTOVER_STATE_PATH).exists():
+    if _path_present(CUTOVER_STATE_PATH):
         state = _load_cutover_state()
         if state["phase"] == "transfer_acknowledged":
             raise LegacyCutoverError("acknowledged cutover authorization is immutable")
@@ -584,8 +603,8 @@ def _capture_source_state(bundle: dict[str, Any], boot_id: str) -> dict[str, Any
     if cache_type not in {"xfs", "ext4"}:
         raise LegacyCutoverError("legacy tdx-cache filesystem is unsupported")
     return {
-        "schema": "chutes.legacy-gpu-cutover-state",
-        "version": 1,
+        "schema": CUTOVER_STATE_SCHEMA,
+        "version": CUTOVER_STATE_VERSION,
         "phase": "prepared",
         "boot_id": boot_id,
         "last_boot_id": boot_id,
@@ -655,7 +674,8 @@ def _advance_phase(
 ) -> dict[str, Any]:
     if (
         state.get("phase") != expected
-        or _CUTOVER_PHASES.index(successor) != _CUTOVER_PHASES.index(expected) + 1
+        or CUTOVER_STATE_PHASES.index(successor)
+        != CUTOVER_STATE_PHASES.index(expected) + 1
     ):
         raise LegacyCutoverError("cutover phase transition is invalid")
     updated = dict(state)
@@ -689,7 +709,7 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     current_boot_id = _boot_id()
     state = (
         _load_cutover_state(CUTOVER_STATE_PATH)
-        if Path(CUTOVER_STATE_PATH).exists()
+        if _path_present(CUTOVER_STATE_PATH)
         else None
     )
     if state is not None and state["phase"] == "transfer_acknowledged":
@@ -714,7 +734,7 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
             state = _capture_source_state(bundle, current_boot_id)
             _write_private_json(CUTOVER_STATE_PATH, state)
         except Exception:
-            if not Path(CUTOVER_STATE_PATH).exists():
+            if not _path_present(CUTOVER_STATE_PATH):
                 _unlink_private(AUTHORIZATION_PATH)
             raise
         _unlink_private(CLOSURE_PATH)
@@ -813,8 +833,8 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
         ):
             raise LegacyCutoverError("validator returned invalid transfer evidence")
         acknowledged = {
-            "schema": "chutes.legacy-gpu-cutover-state",
-            "version": 1,
+            "schema": CUTOVER_STATE_SCHEMA,
+            "version": CUTOVER_STATE_VERSION,
             "phase": "transfer_acknowledged",
             "boot_id": state["boot_id"],
             "last_boot_id": state["last_boot_id"],
@@ -853,7 +873,7 @@ def recover_legacy_cutover() -> None:
 
 def enforce_reboot_fence() -> None:
     """Fail a RequiredBy probe while any transferred-source state remains."""
-    if not Path(CUTOVER_STATE_PATH).exists():
+    if not _path_present(CUTOVER_STATE_PATH):
         return
     state = _load_cutover_state(CUTOVER_STATE_PATH)
     raise LegacyCutoverError(
