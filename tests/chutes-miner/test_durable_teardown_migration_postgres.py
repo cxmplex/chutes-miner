@@ -134,6 +134,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
             WHERE table_schema = current_schema()
               AND table_name IN (
                   'deployment_teardown_operations',
+                  'deployment_teardown_node_incarnation_handoffs',
                   'deployment_teardown_k8s_resources',
                   'deployment_launch_operations',
                   'delayed_validator_instance_cleanups',
@@ -159,7 +160,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
         _assert_ok(inspected)
         assert [
             line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["8", "5"]
+        ] == ["9", "5"]
 
         _assert_ok(_psql(f"BEGIN;\n{DOWN_SQL}\nCOMMIT;", schema=schema))
         restored = _psql(
@@ -169,6 +170,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
             WHERE table_schema = current_schema()
               AND table_name IN (
                   'deployment_teardown_operations',
+                  'deployment_teardown_node_incarnation_handoffs',
                   'deployment_teardown_k8s_resources',
                   'deployment_launch_operations',
                   'delayed_validator_instance_cleanups',

@@ -18,11 +18,12 @@ from chutes_common.auth import sign_request
 from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
 from chutes_common.schemas.gpu import GPU
-from chutes_common.schemas.server import Server
+from chutes_common.schemas.server import Server, ServerNodeIdentity
 from chutes_common.schemas.teardown import (
     DelayedValidatorInstanceCleanup,
     DeploymentLaunchOperation,
     DeploymentTeardownK8sResource,
+    DeploymentTeardownNodeIncarnationHandoff,
     DeploymentTeardownOperation,
     KubernetesOrphanTombstone,
     KubernetesOrphanTombstoneResource,
@@ -119,6 +120,173 @@ class ResourceIdentity:
     @property
     def labels_sha256(self) -> str:
         return canonical_sha256(self.labels)
+
+
+@dataclass(frozen=True, slots=True)
+class NodeIncarnationLineage:
+    kubernetes_node_uid: str | None
+    kubernetes_node_generation: int
+    registration_attestation_id: str | None
+    gpu_allocation_group_id: str | None
+    gpu_allocation_group_generation: int | None
+    cluster_context_sha256: str
+
+
+def _operation_node_lineage(
+    operation: DeploymentTeardownOperation,
+    handoff: DeploymentTeardownNodeIncarnationHandoff | None,
+) -> NodeIncarnationLineage:
+    if handoff is not None:
+        return NodeIncarnationLineage(
+            kubernetes_node_uid=handoff.to_kubernetes_node_uid,
+            kubernetes_node_generation=handoff.to_kubernetes_node_generation,
+            registration_attestation_id=handoff.to_registration_attestation_id,
+            gpu_allocation_group_id=handoff.to_gpu_allocation_group_id,
+            gpu_allocation_group_generation=handoff.to_gpu_allocation_group_generation,
+            cluster_context_sha256=handoff.to_cluster_context_sha256,
+        )
+    return NodeIncarnationLineage(
+        kubernetes_node_uid=operation.kubernetes_node_uid,
+        kubernetes_node_generation=operation.kubernetes_node_generation,
+        registration_attestation_id=operation.registration_attestation_id,
+        gpu_allocation_group_id=operation.gpu_allocation_group_id,
+        gpu_allocation_group_generation=operation.gpu_allocation_group_generation,
+        cluster_context_sha256=operation.cluster_context_sha256,
+    )
+
+
+def _server_node_lineage(server: Server) -> NodeIncarnationLineage:
+    return NodeIncarnationLineage(
+        kubernetes_node_uid=server.kubernetes_node_uid,
+        kubernetes_node_generation=server.kubernetes_node_generation,
+        registration_attestation_id=server.registration_attestation_id,
+        gpu_allocation_group_id=server.gpu_allocation_group_id,
+        gpu_allocation_group_generation=server.gpu_allocation_group_generation,
+        cluster_context_sha256=cluster_context_sha256(server),
+    )
+
+
+def authorized_node_incarnation_handoff_values(
+    *,
+    operation: DeploymentTeardownOperation,
+    latest_handoff: DeploymentTeardownNodeIncarnationHandoff | None,
+    deployment: Deployment | None,
+    server: Server | None,
+    gpu_rows: Iterable[GPU],
+    node_history: Iterable[ServerNodeIdentity],
+) -> dict[str, Any] | None:
+    """Validate one registrar-backed transition without mutating original lineage."""
+    if server is None:
+        raise DeploymentFailure("teardown logical server no longer exists")
+    expected = _operation_node_lineage(operation, latest_handoff)
+    current = _server_node_lineage(server)
+    if current == expected:
+        return None
+
+    if deployment is None:
+        raise DeploymentFailure("unfinished teardown deployment no longer exists")
+    expected_deployment = (
+        operation.validator,
+        operation.server_id,
+        operation.chute_id,
+        operation.config_id,
+        operation.job_id,
+        operation.instance_id,
+    )
+    actual_deployment = (
+        deployment.validator,
+        deployment.server_id,
+        deployment.chute_id,
+        deployment.config_id,
+        deployment.job_id,
+        deployment.instance_id,
+    )
+    if actual_deployment != expected_deployment:
+        raise DeploymentFailure("Deployment lineage changed during node rotation")
+    if server.server_id != operation.server_id or server.validator != operation.validator:
+        raise DeploymentFailure("logical server ownership changed during node rotation")
+    if server.name != operation.cluster_context:
+        raise DeploymentFailure("Kubernetes context changed during node rotation")
+
+    required_expected = (
+        expected.kubernetes_node_uid,
+        expected.registration_attestation_id,
+        expected.gpu_allocation_group_id,
+        expected.gpu_allocation_group_generation,
+    )
+    required_current = (
+        current.kubernetes_node_uid,
+        current.registration_attestation_id,
+        current.gpu_allocation_group_id,
+        current.gpu_allocation_group_generation,
+    )
+    if (
+        not all(required_expected)
+        or not all(required_current)
+        or expected.kubernetes_node_generation <= 0
+        or current.kubernetes_node_generation <= expected.kubernetes_node_generation
+        or current.registration_attestation_id == expected.registration_attestation_id
+    ):
+        raise DeploymentFailure("node rotation lacks complete monotonic attested lineage")
+
+    rows = sorted(node_history, key=lambda row: row.generation)
+    expected_generations = list(
+        range(expected.kubernetes_node_generation, current.kubernetes_node_generation + 1)
+    )
+    if [row.generation for row in rows] != expected_generations:
+        raise DeploymentFailure("node rotation history is incomplete")
+    previous_attestation = None
+    for index, row in enumerate(rows):
+        if row.server_id != operation.server_id or not row.registration_attestation_id:
+            raise DeploymentFailure("node rotation history has conflicting ownership")
+        if index == 0 and (
+            row.kubernetes_node_uid != expected.kubernetes_node_uid
+            or row.registration_attestation_id != expected.registration_attestation_id
+        ):
+            raise DeploymentFailure("node rotation predecessor does not match teardown lineage")
+        if previous_attestation == row.registration_attestation_id:
+            raise DeploymentFailure("node rotation reused a registrar attestation")
+        if index < len(rows) - 1 and row.retired_at is None:
+            raise DeploymentFailure("node rotation predecessor is not retired")
+        if index == len(rows) - 1 and (
+            row.retired_at is not None
+            or row.kubernetes_node_uid != current.kubernetes_node_uid
+            or row.registration_attestation_id != current.registration_attestation_id
+        ):
+            raise DeploymentFailure("active node identity does not match logical server")
+        previous_attestation = row.registration_attestation_id
+
+    gpus = list(gpu_rows)
+    actual_gpu_uuids = sorted(str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpus)
+    if not actual_gpu_uuids or actual_gpu_uuids != list(operation.gpu_hardware_uuids):
+        raise DeploymentFailure("assigned GPU UUID closure changed during node rotation")
+    if any(
+        gpu.server_id != operation.server_id
+        or gpu.deployment_id != operation.deployment_id
+        or gpu.validator != operation.validator
+        or gpu.gpu_allocation_group_id != current.gpu_allocation_group_id
+        or gpu.gpu_allocation_group_generation != current.gpu_allocation_group_generation
+        for gpu in gpus
+    ):
+        raise DeploymentFailure("assigned GPU lineage changed during node rotation")
+
+    return {
+        "handoff_id": str(uuid.uuid4()),
+        "operation_id": operation.operation_id,
+        "sequence": (latest_handoff.sequence + 1) if latest_handoff else 1,
+        "from_kubernetes_node_uid": expected.kubernetes_node_uid,
+        "from_kubernetes_node_generation": expected.kubernetes_node_generation,
+        "from_registration_attestation_id": expected.registration_attestation_id,
+        "from_gpu_allocation_group_id": expected.gpu_allocation_group_id,
+        "from_gpu_allocation_group_generation": expected.gpu_allocation_group_generation,
+        "from_cluster_context_sha256": expected.cluster_context_sha256,
+        "to_kubernetes_node_uid": current.kubernetes_node_uid,
+        "to_kubernetes_node_generation": current.kubernetes_node_generation,
+        "to_registration_attestation_id": current.registration_attestation_id,
+        "to_gpu_allocation_group_id": current.gpu_allocation_group_id,
+        "to_gpu_allocation_group_generation": current.gpu_allocation_group_generation,
+        "to_cluster_context_sha256": current.cluster_context_sha256,
+    }
 
 
 def _owner(metadata: Any) -> tuple[str | None, str | None, str | None]:
@@ -432,6 +600,17 @@ class DeploymentTeardownCoordinator:
             await self._seed_launch_resources(session, existing, launch)
             return existing
 
+        server = (
+            (
+                await session.execute(
+                    select(Server)
+                    .where(Server.server_id == deployment.server_id)
+                    .with_for_update(of=Server)
+                )
+            )
+            .unique()
+            .scalar_one()
+        )
         gpu_rows = (
             (
                 await session.execute(
@@ -445,7 +624,6 @@ class DeploymentTeardownCoordinator:
             .scalars()
             .all()
         )
-        server = deployment.server
         operation = DeploymentTeardownOperation(
             operation_id=str(uuid.uuid4()),
             deployment_id=deployment.deployment_id,
@@ -462,6 +640,9 @@ class DeploymentTeardownCoordinator:
             namespace=settings.namespace,
             kubernetes_node_uid=server.kubernetes_node_uid,
             kubernetes_node_generation=server.kubernetes_node_generation,
+            registration_attestation_id=server.registration_attestation_id,
+            gpu_allocation_group_id=server.gpu_allocation_group_id,
+            gpu_allocation_group_generation=server.gpu_allocation_group_generation,
             gpu_hardware_uuids=sorted(
                 str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
             ),
@@ -605,6 +786,114 @@ class DeploymentTeardownCoordinator:
                 raise DeploymentFailure("teardown lease or phase changed during external work")
             operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
+
+    async def _authorize_current_node_incarnation(self, operation_id: str) -> None:
+        """Persist an attested same-server handoff before resumed external work."""
+        async with get_session() as session:
+            deployment = (
+                (
+                    await session.execute(
+                        select(Deployment)
+                        .where(Deployment.teardown_operation_id == operation_id)
+                        .with_for_update(of=Deployment)
+                    )
+                )
+                .unique()
+                .scalar_one_or_none()
+            )
+            operation = (
+                await session.execute(
+                    select(DeploymentTeardownOperation)
+                    .where(DeploymentTeardownOperation.operation_id == operation_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if operation is None or operation.phase == "completed":
+                return
+            if (
+                operation.retry_lease_owner != self.worker_id
+                or operation.lineage_conflict_at is not None
+            ):
+                raise DeploymentFailure("teardown lease or lineage changed before node check")
+            latest_handoff = (
+                await session.execute(
+                    select(DeploymentTeardownNodeIncarnationHandoff)
+                    .where(DeploymentTeardownNodeIncarnationHandoff.operation_id == operation_id)
+                    .order_by(DeploymentTeardownNodeIncarnationHandoff.sequence.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            server = (
+                (
+                    await session.execute(
+                        select(Server)
+                        .where(Server.server_id == operation.server_id)
+                        .with_for_update(of=Server)
+                    )
+                )
+                .unique()
+                .scalar_one_or_none()
+            )
+            if server is not None and _server_node_lineage(server) == _operation_node_lineage(
+                operation, latest_handoff
+            ):
+                return
+
+            gpu_rows = (
+                (
+                    await session.execute(
+                        select(GPU)
+                        .where(GPU.deployment_id == operation.deployment_id)
+                        .order_by(GPU.gpu_id)
+                        .with_for_update(of=GPU)
+                    )
+                )
+                .unique()
+                .scalars()
+                .all()
+            )
+            node_history = []
+            if server is not None:
+                expected = _operation_node_lineage(operation, latest_handoff)
+                node_history = (
+                    (
+                        await session.execute(
+                            select(ServerNodeIdentity)
+                            .where(
+                                ServerNodeIdentity.server_id == operation.server_id,
+                                ServerNodeIdentity.generation
+                                >= expected.kubernetes_node_generation,
+                                ServerNodeIdentity.generation <= server.kubernetes_node_generation,
+                            )
+                            .order_by(ServerNodeIdentity.generation)
+                            .with_for_update()
+                        )
+                    )
+                    .unique()
+                    .scalars()
+                    .all()
+                )
+            try:
+                values = authorized_node_incarnation_handoff_values(
+                    operation=operation,
+                    latest_handoff=latest_handoff,
+                    deployment=deployment,
+                    server=server,
+                    gpu_rows=gpu_rows,
+                    node_history=node_history,
+                )
+            except DeploymentFailure as exc:
+                operation.lineage_conflict_at = utc_now()
+                operation.last_failure = str(exc)
+                operation.retry_lease_owner = None
+                operation.retry_lease_expires_at = None
+                await session.commit()
+                raise
+            if values is not None:
+                session.add(DeploymentTeardownNodeIncarnationHandoff(**values))
+                operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
+                await session.commit()
 
     async def _renew_orphan_lease(self, tombstone_id: str, phase: str) -> None:
         async with get_session() as session:
@@ -1208,6 +1497,18 @@ class DeploymentTeardownCoordinator:
                 and (not current.instance_id or current.validator_instance_deletion_ack)
             ):
                 raise DeploymentFailure("teardown finalization lacks persisted acknowledgements")
+            latest_handoff = (
+                await session.execute(
+                    select(DeploymentTeardownNodeIncarnationHandoff)
+                    .where(
+                        DeploymentTeardownNodeIncarnationHandoff.operation_id
+                        == current.operation_id
+                    )
+                    .order_by(DeploymentTeardownNodeIncarnationHandoff.sequence.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             server = (
                 (
                     await session.execute(
@@ -1232,6 +1533,15 @@ class DeploymentTeardownCoordinator:
                 .scalars()
                 .all()
             )
+            expected_node_lineage = _operation_node_lineage(current, latest_handoff)
+            if server is None or _server_node_lineage(server) != expected_node_lineage:
+                current.last_failure = (
+                    "server/node incarnation changed after teardown authorization; retry required"
+                )
+                current.retry_lease_owner = None
+                current.retry_lease_expires_at = None
+                await session.commit()
+                raise DeploymentFailure(current.last_failure)
             lineage_errors = []
             if deployment is not None:
                 expected_deployment = (
@@ -1252,13 +1562,21 @@ class DeploymentTeardownCoordinator:
                 )
                 if actual_deployment != expected_deployment:
                     lineage_errors.append("Deployment lineage changed")
-            if server is None or cluster_context_sha256(server) != current.cluster_context_sha256:
-                lineage_errors.append("server/node lineage changed")
             actual_gpu_uuids = sorted(
                 str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
             )
             if actual_gpu_uuids != list(current.gpu_hardware_uuids):
                 lineage_errors.append("assigned GPU UUID closure changed")
+            if any(
+                gpu.server_id != current.server_id
+                or gpu.deployment_id != current.deployment_id
+                or gpu.validator != current.validator
+                or gpu.gpu_allocation_group_id != expected_node_lineage.gpu_allocation_group_id
+                or gpu.gpu_allocation_group_generation
+                != expected_node_lineage.gpu_allocation_group_generation
+                for gpu in gpu_rows
+            ):
+                lineage_errors.append("assigned GPU lineage changed")
             if lineage_errors:
                 current.lineage_conflict_at = utc_now()
                 current.last_failure = "; ".join(lineage_errors)
@@ -1326,6 +1644,7 @@ class DeploymentTeardownCoordinator:
             return bool(operation and operation.phase == "completed")
         try:
             while True:
+                await self._authorize_current_node_incarnation(operation_id)
                 operation = await self._load(operation_id)
                 if operation is None:
                     return False

@@ -11,6 +11,7 @@ from chutes_miner.api.deployment import teardown
 from chutes_miner.api.deployment.teardown import (
     DirectKubernetesClosure,
     ResourceIdentity,
+    authorized_node_incarnation_handoff_values,
     replacement_matches,
 )
 from chutes_miner.api.exceptions import DeploymentFailure
@@ -56,6 +57,260 @@ EXPECTED_LABELS = {
     "chutes/chute-id": "chute-1",
     "chutes/config-id": "config-1",
 }
+
+
+class _QueryResult:
+    def __init__(self, value):
+        self.value = value
+
+    def unique(self):
+        return self
+
+    def scalar_one_or_none(self):
+        return self.value
+
+    def scalar_one(self):
+        return self.value
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.value
+
+
+def _rotation_lineage():
+    operation = SimpleNamespace(
+        operation_id="teardown-1",
+        deployment_id="deployment-1",
+        phase="discovering",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        lineage_conflict_at=None,
+        last_failure=None,
+        validator="validator-1",
+        server_id="server-1",
+        chute_id="chute-1",
+        config_id="config-1",
+        job_id=None,
+        instance_id="instance-1",
+        cluster_context="node-a",
+        cluster_context_sha256="old-context-sha256",
+        kubernetes_node_uid="node-uid-old",
+        kubernetes_node_generation=3,
+        registration_attestation_id="attestation-old",
+        gpu_allocation_group_id="group-old",
+        gpu_allocation_group_generation=7,
+        gpu_hardware_uuids=["GPU-a", "GPU-b"],
+    )
+    deployment = SimpleNamespace(
+        validator="validator-1",
+        server_id="server-1",
+        chute_id="chute-1",
+        config_id="config-1",
+        job_id=None,
+        instance_id="instance-1",
+    )
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="new-kubeconfig",
+        kubernetes_node_uid="node-uid-new",
+        kubernetes_node_generation=4,
+        registration_attestation_id="attestation-new",
+        gpu_allocation_group_id="group-new",
+        gpu_allocation_group_generation=8,
+    )
+    gpus = [
+        SimpleNamespace(
+            gpu_id=f"gpu-{suffix}",
+            hardware_uuid=f"GPU-{suffix}",
+            server_id="server-1",
+            deployment_id="deployment-1",
+            validator="validator-1",
+            gpu_allocation_group_id="group-new",
+            gpu_allocation_group_generation=8,
+        )
+        for suffix in ("a", "b")
+    ]
+    history = [
+        SimpleNamespace(
+            server_id="server-1",
+            generation=3,
+            kubernetes_node_uid="node-uid-old",
+            registration_attestation_id="attestation-old",
+            retired_at=object(),
+        ),
+        SimpleNamespace(
+            server_id="server-1",
+            generation=4,
+            kubernetes_node_uid="node-uid-new",
+            registration_attestation_id="attestation-new",
+            retired_at=None,
+        ),
+    ]
+    return operation, deployment, server, gpus, history
+
+
+@pytest.mark.asyncio
+async def test_teardown_snapshot_uses_locked_server_lineage_before_gpu_rows():
+    stale_server = SimpleNamespace(
+        name="stale-node",
+        kubernetes_node_uid="stale-uid",
+    )
+    deployment = SimpleNamespace(
+        launch_operation_id=None,
+        teardown_operation_id=None,
+        deployment_id="deployment-1",
+        validator="validator-1",
+        server_id="server-1",
+        chute_id="chute-1",
+        config_id="config-1",
+        job_id=None,
+        instance_id="instance-1",
+        server=stale_server,
+        active=True,
+    )
+    locked_server = SimpleNamespace(
+        name="node-a",
+        kubeconfig="locked-kubeconfig",
+        kubernetes_node_uid="node-uid-3",
+        kubernetes_node_generation=3,
+        registration_attestation_id="attestation-3",
+        gpu_allocation_group_id="group-3",
+        gpu_allocation_group_generation=3,
+    )
+    gpu = SimpleNamespace(gpu_id="gpu-a", hardware_uuid="GPU-a")
+    added = []
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(None),
+                _QueryResult(locked_server),
+                _QueryResult([gpu]),
+            ]
+        ),
+        add=lambda value: added.append(value),
+        flush=AsyncMock(),
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+
+    operation = await coordinator._request_in_session(session, deployment, "delete")
+
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "FROM servers" in statements[1]
+    assert "FOR UPDATE" in statements[1]
+    assert "FROM gpus" in statements[2]
+    assert operation.cluster_context == "node-a"
+    assert operation.kubernetes_node_uid == "node-uid-3"
+    assert operation.registration_attestation_id == "attestation-3"
+    assert operation.gpu_allocation_group_id == "group-3"
+    assert operation.gpu_allocation_group_generation == 3
+    assert operation.gpu_hardware_uuids == ["GPU-a"]
+    assert operation in added
+
+
+@pytest.mark.asyncio
+async def test_old_generation_teardown_persists_authorized_node_rotation(monkeypatch):
+    operation, deployment, server, gpus, history = _rotation_lineage()
+    added = []
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(deployment),
+                _QueryResult(operation),
+                _QueryResult(None),
+                _QueryResult(server),
+                _QueryResult(gpus),
+                _QueryResult(history),
+            ]
+        ),
+        add=lambda value: added.append(value),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    operation.retry_lease_owner = coordinator.worker_id
+    await coordinator._authorize_current_node_incarnation(operation.operation_id)
+
+    assert len(added) == 1
+    handoff = added[0]
+    assert handoff.from_kubernetes_node_uid == "node-uid-old"
+    assert handoff.from_kubernetes_node_generation == 3
+    assert handoff.to_kubernetes_node_uid == "node-uid-new"
+    assert handoff.to_kubernetes_node_generation == 4
+    assert handoff.to_registration_attestation_id == "attestation-new"
+    assert handoff.to_gpu_allocation_group_id == "group-new"
+    assert operation.kubernetes_node_uid == "node-uid-old"
+    assert operation.registration_attestation_id == "attestation-old"
+    assert operation.lineage_conflict_at is None
+    session.commit.assert_awaited_once()
+    assert (
+        authorized_node_incarnation_handoff_values(
+            operation=operation,
+            latest_handoff=handoff,
+            deployment=deployment,
+            server=server,
+            gpu_rows=gpus,
+            node_history=history,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_unattested_node_rotation_fences_unfinished_teardown(monkeypatch):
+    operation, deployment, server, gpus, history = _rotation_lineage()
+    history[-1].registration_attestation_id = "attestation-conflict"
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(deployment),
+                _QueryResult(operation),
+                _QueryResult(None),
+                _QueryResult(server),
+                _QueryResult(gpus),
+                _QueryResult(history),
+            ]
+        ),
+        add=lambda _value: pytest.fail("conflicting rotation was persisted"),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    operation.retry_lease_owner = coordinator.worker_id
+    with pytest.raises(DeploymentFailure, match="active node identity"):
+        await coordinator._authorize_current_node_incarnation(operation.operation_id)
+
+    assert operation.lineage_conflict_at is not None
+    assert operation.retry_lease_owner is None
+    assert "active node identity" in operation.last_failure
+    session.commit.assert_awaited_once()
+
+
+def test_handoff_requires_exact_current_gpu_ownership():
+    operation, deployment, server, gpus, history = _rotation_lineage()
+    gpus[1].deployment_id = "other-deployment"
+    with pytest.raises(DeploymentFailure, match="assigned GPU lineage"):
+        authorized_node_incarnation_handoff_values(
+            operation=operation,
+            latest_handoff=None,
+            deployment=deployment,
+            server=server,
+            gpu_rows=gpus,
+            node_history=history,
+        )
 
 
 def test_matching_controller_replacement_is_captured_but_conflicting_lineage_stops():

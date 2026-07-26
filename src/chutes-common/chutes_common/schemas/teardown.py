@@ -50,6 +50,9 @@ class DeploymentTeardownOperation(Base):
     namespace = Column(String, nullable=False)
     kubernetes_node_uid = Column(String, nullable=True)
     kubernetes_node_generation = Column(Integer, nullable=False)
+    registration_attestation_id = Column(String, nullable=True)
+    gpu_allocation_group_id = Column(String, nullable=True)
+    gpu_allocation_group_generation = Column(Integer, nullable=True)
     gpu_hardware_uuids = Column(JSONB, nullable=False)
     immutable_labels = Column(JSONB, nullable=False)
 
@@ -81,6 +84,12 @@ class DeploymentTeardownOperation(Base):
         passive_deletes=True,
         lazy="selectin",
     )
+    node_incarnation_handoffs = relationship(
+        "DeploymentTeardownNodeIncarnationHandoff",
+        back_populates="operation",
+        order_by="DeploymentTeardownNodeIncarnationHandoff.sequence",
+        lazy="selectin",
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -91,6 +100,14 @@ class DeploymentTeardownOperation(Base):
         CheckConstraint(
             "kubernetes_node_generation >= 0",
             name="ck_deployment_teardown_node_generation",
+        ),
+        CheckConstraint(
+            "(gpu_allocation_group_id IS NULL "
+            "AND gpu_allocation_group_generation IS NULL) OR "
+            "(gpu_allocation_group_id IS NOT NULL "
+            "AND gpu_allocation_group_generation IS NOT NULL "
+            "AND gpu_allocation_group_generation > 0)",
+            name="ck_deployment_teardown_allocation_group",
         ),
         Index(
             "deployment_teardown_active_deployment_idx",
@@ -120,6 +137,66 @@ class DeploymentTeardownOperation(Base):
         CheckConstraint(
             "(pull_secret_deletion_ack IS NULL) = (pull_secret_deleted_at IS NULL)",
             name="ck_deployment_teardown_secret_ack",
+        ),
+    )
+
+
+class DeploymentTeardownNodeIncarnationHandoff(Base):
+    """Attested node-incarnation transition accepted by an unfinished teardown."""
+
+    __tablename__ = "deployment_teardown_node_incarnation_handoffs"
+
+    handoff_id = Column(String, primary_key=True, default=_uuid)
+    operation_id = Column(
+        String,
+        ForeignKey("deployment_teardown_operations.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    sequence = Column(Integer, nullable=False)
+    from_kubernetes_node_uid = Column(String, nullable=False)
+    from_kubernetes_node_generation = Column(Integer, nullable=False)
+    from_registration_attestation_id = Column(String, nullable=False)
+    from_gpu_allocation_group_id = Column(String, nullable=False)
+    from_gpu_allocation_group_generation = Column(Integer, nullable=False)
+    from_cluster_context_sha256 = Column(String, nullable=False)
+    to_kubernetes_node_uid = Column(String, nullable=False)
+    to_kubernetes_node_generation = Column(Integer, nullable=False)
+    to_registration_attestation_id = Column(String, nullable=False)
+    to_gpu_allocation_group_id = Column(String, nullable=False)
+    to_gpu_allocation_group_generation = Column(Integer, nullable=False)
+    to_cluster_context_sha256 = Column(String, nullable=False)
+    authorized_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    operation = relationship(
+        "DeploymentTeardownOperation",
+        back_populates="node_incarnation_handoffs",
+    )
+
+    __table_args__ = (
+        CheckConstraint("sequence > 0", name="ck_teardown_node_handoff_sequence"),
+        CheckConstraint(
+            "from_kubernetes_node_generation > 0 "
+            "AND to_kubernetes_node_generation > from_kubernetes_node_generation",
+            name="ck_teardown_node_handoff_generation",
+        ),
+        CheckConstraint(
+            "from_gpu_allocation_group_generation > 0 AND to_gpu_allocation_group_generation > 0",
+            name="ck_teardown_node_handoff_group_generation",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "sequence",
+            name="deployment_teardown_node_handoff_sequence_key",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "from_kubernetes_node_generation",
+            name="deployment_teardown_node_handoff_from_generation_key",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "to_kubernetes_node_generation",
+            name="deployment_teardown_node_handoff_to_generation_key",
         ),
     )
 

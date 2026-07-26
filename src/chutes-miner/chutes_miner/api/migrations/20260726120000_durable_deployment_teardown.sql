@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS deployment_teardown_operations (
     namespace TEXT NOT NULL,
     kubernetes_node_uid TEXT,
     kubernetes_node_generation INTEGER NOT NULL,
+    registration_attestation_id TEXT,
+    gpu_allocation_group_id TEXT,
+    gpu_allocation_group_generation INTEGER,
     gpu_hardware_uuids JSONB NOT NULL,
     immutable_labels JSONB NOT NULL,
     registry_revocation_ack JSONB,
@@ -43,6 +46,18 @@ CREATE TABLE IF NOT EXISTS deployment_teardown_operations (
     CONSTRAINT ck_deployment_teardown_node_generation CHECK (
         kubernetes_node_generation >= 0
     ),
+    CONSTRAINT ck_deployment_teardown_allocation_group CHECK (
+        (
+            gpu_allocation_group_id IS NULL
+            AND gpu_allocation_group_generation IS NULL
+        )
+        OR
+        (
+            gpu_allocation_group_id IS NOT NULL
+            AND gpu_allocation_group_generation IS NOT NULL
+            AND gpu_allocation_group_generation > 0
+        )
+    ),
     CONSTRAINT ck_deployment_teardown_retry_lease CHECK (
         (retry_lease_owner IS NULL) = (retry_lease_expires_at IS NULL)
     ),
@@ -64,6 +79,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS deployment_teardown_active_deployment_idx
 CREATE INDEX IF NOT EXISTS deployment_teardown_retry_idx
     ON deployment_teardown_operations (phase, retry_lease_expires_at)
     WHERE phase <> 'completed';
+
+CREATE TABLE IF NOT EXISTS deployment_teardown_node_incarnation_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL REFERENCES deployment_teardown_operations(operation_id)
+        ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL,
+    from_kubernetes_node_uid TEXT NOT NULL,
+    from_kubernetes_node_generation INTEGER NOT NULL,
+    from_registration_attestation_id TEXT NOT NULL,
+    from_gpu_allocation_group_id TEXT NOT NULL,
+    from_gpu_allocation_group_generation INTEGER NOT NULL,
+    from_cluster_context_sha256 TEXT NOT NULL,
+    to_kubernetes_node_uid TEXT NOT NULL,
+    to_kubernetes_node_generation INTEGER NOT NULL,
+    to_registration_attestation_id TEXT NOT NULL,
+    to_gpu_allocation_group_id TEXT NOT NULL,
+    to_gpu_allocation_group_generation INTEGER NOT NULL,
+    to_cluster_context_sha256 TEXT NOT NULL,
+    authorized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_teardown_node_handoff_sequence CHECK (sequence > 0),
+    CONSTRAINT ck_teardown_node_handoff_generation CHECK (
+        from_kubernetes_node_generation > 0
+        AND to_kubernetes_node_generation > from_kubernetes_node_generation
+    ),
+    CONSTRAINT ck_teardown_node_handoff_group_generation CHECK (
+        from_gpu_allocation_group_generation > 0
+        AND to_gpu_allocation_group_generation > 0
+    ),
+    CONSTRAINT deployment_teardown_node_handoff_sequence_key
+        UNIQUE (operation_id, sequence),
+    CONSTRAINT deployment_teardown_node_handoff_from_generation_key
+        UNIQUE (operation_id, from_kubernetes_node_generation),
+    CONSTRAINT deployment_teardown_node_handoff_to_generation_key
+        UNIQUE (operation_id, to_kubernetes_node_generation)
+);
 
 CREATE TABLE IF NOT EXISTS deployment_teardown_k8s_resources (
     resource_id TEXT PRIMARY KEY,
@@ -456,6 +506,7 @@ CREATE TRIGGER deployments_fence_parent_deletion
 -- migrate:down
 LOCK TABLE deployments, gpus, servers, chutes,
     deployment_teardown_operations, deployment_teardown_k8s_resources,
+    deployment_teardown_node_incarnation_handoffs,
     deployment_launch_operations, delayed_validator_instance_cleanups,
     parent_deletion_operations, parent_deletion_children, kubernetes_orphan_tombstones,
     kubernetes_orphan_tombstone_resources IN ACCESS EXCLUSIVE MODE;
@@ -511,4 +562,5 @@ DROP TABLE IF EXISTS parent_deletion_operations;
 DROP TABLE IF EXISTS delayed_validator_instance_cleanups;
 DROP TABLE IF EXISTS deployment_launch_operations;
 DROP TABLE IF EXISTS deployment_teardown_k8s_resources;
+DROP TABLE IF EXISTS deployment_teardown_node_incarnation_handoffs;
 DROP TABLE IF EXISTS deployment_teardown_operations;

@@ -44,6 +44,9 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "pull_secret_deletion_ack",
         "pull_secret_deleted_at",
         "lineage_conflict_at",
+        "registration_attestation_id",
+        "gpu_allocation_group_id",
+        "gpu_allocation_group_generation",
     }.issubset(operation.c.keys())
     assert "parent_deletion_children" in Base.metadata.tables
     resource = Base.metadata.tables["deployment_teardown_k8s_resources"]
@@ -58,6 +61,22 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
     assert unique_columns == {
         ("operation_id", "cluster_context", "namespace", "kind", "uid")
     }
+    handoff = Base.metadata.tables["deployment_teardown_node_incarnation_handoffs"]
+    assert _ondelete("deployment_teardown_node_incarnation_handoffs", "operation_id") == "RESTRICT"
+    assert {
+        "from_kubernetes_node_uid",
+        "from_kubernetes_node_generation",
+        "from_registration_attestation_id",
+        "from_gpu_allocation_group_id",
+        "from_gpu_allocation_group_generation",
+        "from_cluster_context_sha256",
+        "to_kubernetes_node_uid",
+        "to_kubernetes_node_generation",
+        "to_registration_attestation_id",
+        "to_gpu_allocation_group_id",
+        "to_gpu_allocation_group_generation",
+        "to_cluster_context_sha256",
+    }.issubset(handoff.c.keys())
 
 
 def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
@@ -89,6 +108,7 @@ def test_migration_guards_release_and_has_migration_specific_down_guard():
     assert "chutes_require_parent_deletion" in sql
     assert "deployments_fence_parent_deletion" in sql
     assert "deployment_launch_recovery_idx" in sql
+    assert "deployment_teardown_node_incarnation_handoffs" in sql
     assert "LOCK TABLE deployments, gpus, servers, chutes" in sql
     assert "cannot remove durable teardown schema while teardown history exists" in sql
     assert "phase IN ('finalizing', 'completed')" in sql
