@@ -60,12 +60,11 @@ class Server(Base):
     kubeconfig = Column(Text, nullable=True)  # Make this false if enforicng migration
     is_tee = Column(Boolean, default=False)
 
-    gpus = relationship("GPU", back_populates="server", lazy="joined", cascade="all, delete-orphan")
+    gpus = relationship("GPU", back_populates="server", lazy="joined")
     deployments = relationship(
         "Deployment",
         back_populates="server",
         lazy="joined",
-        cascade="all, delete-orphan",
     )
 
     __table_args__ = (

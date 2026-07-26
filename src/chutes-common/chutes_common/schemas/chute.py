@@ -27,4 +27,4 @@ class Chute(Base):
     preemptible = Column(Boolean, default=True)
     tee = Column(Boolean, default=False)
 
-    deployments = relationship("Deployment", back_populates="chute", cascade="all, delete-orphan")
+    deployments = relationship("Deployment", back_populates="chute")

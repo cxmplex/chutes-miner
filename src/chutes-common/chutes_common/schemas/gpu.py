@@ -30,12 +30,12 @@ class GPU(Base):
     validator = Column(String)
     server_id = Column(
         String,
-        ForeignKey("servers.server_id", onupdate="CASCADE", ondelete="CASCADE"),
+        ForeignKey("servers.server_id", onupdate="CASCADE", ondelete="RESTRICT"),
         nullable=False,
     )
     deployment_id = Column(
         String,
-        ForeignKey("deployments.deployment_id", ondelete="SET NULL"),
+        ForeignKey("deployments.deployment_id", ondelete="RESTRICT"),
         nullable=True,
     )
 

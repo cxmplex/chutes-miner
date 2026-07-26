@@ -1,0 +1,70 @@
+"""Durable teardown must be the only route that releases miner GPU ownership."""
+
+from pathlib import Path
+
+import chutes_common.schemas.orms  # noqa: F401
+from chutes_common.schemas import Base
+from sqlalchemy.orm import configure_mappers
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MIGRATION = (
+    ROOT
+    / "src/chutes-miner/chutes_miner/api/migrations/"
+    "20260726120000_durable_deployment_teardown.sql"
+)
+
+
+def _ondelete(table: str, column: str) -> str:
+    foreign_key = next(iter(Base.metadata.tables[table].c[column].foreign_keys))
+    return foreign_key.ondelete
+
+
+def test_ownership_foreign_keys_are_restrictive_and_mappers_configure():
+    configure_mappers()
+    assert _ondelete("deployments", "server_id") == "RESTRICT"
+    assert _ondelete("deployments", "chute_id") == "RESTRICT"
+    assert _ondelete("gpus", "server_id") == "RESTRICT"
+    assert _ondelete("gpus", "deployment_id") == "RESTRICT"
+    assert _ondelete("deployments", "teardown_operation_id") == "RESTRICT"
+
+
+def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
+    operation = Base.metadata.tables["deployment_teardown_operations"]
+    assert not operation.c.deployment_id.foreign_keys
+    assert {
+        "registry_revocation_ack",
+        "registry_revoked_at",
+        "validator_instance_deletion_ack",
+        "validator_instance_deleted_at",
+        "controllers_absent_at",
+        "services_absent_at",
+        "pods_absent_at",
+        "pull_secret_deletion_ack",
+        "pull_secret_deleted_at",
+    }.issubset(operation.c.keys())
+    assert "parent_deletion_children" in Base.metadata.tables
+    resource = Base.metadata.tables["deployment_teardown_k8s_resources"]
+    assert {"owner_kind", "owner_name", "owner_uid"}.issubset(resource.c.keys())
+
+
+def test_migration_guards_release_and_has_migration_specific_down_guard():
+    sql = MIGRATION.read_text(encoding="utf-8")
+    assert "deployments_require_teardown" in sql
+    assert "gpus_require_teardown" in sql
+    assert "servers_require_parent_deletion" in sql
+    assert "chutes_require_parent_deletion" in sql
+    assert "LOCK TABLE deployments, gpus, servers, chutes" in sql
+    assert "cannot remove durable teardown schema while teardown history exists" in sql
+    assert "phase IN ('finalizing', 'completed')" in sql
+    assert "'blocked'" not in sql
+
+
+def test_orphan_tombstone_binds_cluster_and_node_lineage():
+    table = Base.metadata.tables["kubernetes_orphan_tombstones"]
+    assert {
+        "cluster_context",
+        "cluster_context_sha256",
+        "kubernetes_node_uid",
+        "kubernetes_node_generation",
+    }.issubset(table.c.keys())
