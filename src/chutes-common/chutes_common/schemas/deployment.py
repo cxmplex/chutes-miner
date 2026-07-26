@@ -36,6 +36,11 @@ class Deployment(Base):
         ForeignKey("deployment_teardown_operations.operation_id", ondelete="RESTRICT"),
         nullable=True,
     )
+    launch_operation_id = Column(
+        String,
+        ForeignKey("deployment_launch_operations.operation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     preemptible = Column(Boolean, default=True)
 
@@ -47,6 +52,11 @@ class Deployment(Base):
         foreign_keys=[teardown_operation_id],
         lazy="joined",
     )
+    launch_operation = relationship(
+        "DeploymentLaunchOperation",
+        foreign_keys=[launch_operation_id],
+        lazy="joined",
+    )
 
     __table_args__ = (
         Index(
@@ -54,5 +64,11 @@ class Deployment(Base):
             "teardown_operation_id",
             unique=True,
             postgresql_where=text("teardown_operation_id IS NOT NULL"),
+        ),
+        Index(
+            "deployments_launch_operation_id_key",
+            "launch_operation_id",
+            unique=True,
+            postgresql_where=text("launch_operation_id IS NOT NULL"),
         ),
     )

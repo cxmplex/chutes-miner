@@ -1,5 +1,6 @@
 """Focused trust-boundary tests for restartable miner teardown."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,9 @@ from chutes_miner.api.deployment.teardown import (
     ResourceIdentity,
     replacement_matches,
 )
+from chutes_miner.api.exceptions import DeploymentFailure
+from chutes_miner.api.k8s import operator as k8s_operator
+from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.gepetto import Gepetto
 from kubernetes.client.rest import ApiException
 
@@ -90,6 +94,29 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
         expected_node_name="node-a",
         accepted_owner_uids=set(),
         resource=_resource("Job", "wrong-node", node_name="node-b"),
+    )
+    assert not replacement_matches(
+        expected_labels=EXPECTED_LABELS,
+        expected_node_name="node-a",
+        accepted_owner_uids=set(),
+        resource=_resource(
+            "Service",
+            "missing-config",
+            labels={
+                "chutes/deployment-id": "dep-1",
+                "chutes/chute-id": "chute-1",
+            },
+        ),
+    )
+    assert not replacement_matches(
+        expected_labels={**EXPECTED_LABELS, "chutes/job-id": "job-1"},
+        expected_node_name="node-a",
+        accepted_owner_uids=set(),
+        resource=_resource(
+            "Job",
+            "wrong-job",
+            labels={**EXPECTED_LABELS, "chutes/job-id": "job-2"},
+        ),
     )
 
 
@@ -224,10 +251,294 @@ async def test_parent_deletion_remains_pending_while_child_teardown_is_incomplet
     coordinator = teardown.DeploymentTeardownCoordinator(
         kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
     )
+    coordinator._adopt_parent_children = AsyncMock(return_value=["child-1"])
     coordinator.run = AsyncMock(return_value=False)
     assert await coordinator.run_parent("parent-1") is False
     assert operation.phase == "waiting_for_children"
     assert "child teardown child-1 is incomplete" in operation.last_failure
+
+
+@pytest.mark.asyncio
+async def test_parent_deletion_readopts_children_before_external_work(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="parent-1",
+        parent_type="chute",
+        parent_id="chute-1",
+        phase="waiting_for_children",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        attempt_count=0,
+        last_failure=None,
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=operation), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
+    )
+    coordinator._adopt_parent_children = AsyncMock(
+        side_effect=[["child-1"], ["child-1", "child-2"]]
+    )
+    coordinator.run = AsyncMock(return_value=True)
+    coordinator._delete_validator_server = AsyncMock()
+
+    assert await coordinator.run_parent("parent-1") is False
+    coordinator._delete_validator_server.assert_not_awaited()
+    assert "adopted a concurrent child" in operation.last_failure
+
+
+@pytest.mark.asyncio
+async def test_server_monitor_failure_is_not_persisted_as_an_ack(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="parent-1",
+        parent_type="server",
+        parent_id="server-1",
+        phase="waiting_for_children",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        attempt_count=0,
+        last_failure=None,
+        snapshot={"agent_api": "https://agent", "name": "node-a"},
+        monitor_stop_ack=None,
+        monitor_stopped_at=None,
+        validator_server_deletion_ack=None,
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=operation),
+        scalar=AsyncMock(return_value=None),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    stop = AsyncMock(side_effect=ConnectionError("response lost"))
+    clear = AsyncMock()
+    monkeypatch.setattr("chutes_miner.api.server.util.stop_server_monitoring", stop)
+    monkeypatch.setattr("chutes_miner.api.server.util.clear_server_cache", clear)
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
+    )
+    coordinator._adopt_parent_children = AsyncMock(return_value=[])
+
+    assert await coordinator.run_parent("parent-1") is False
+    assert operation.monitor_stop_ack is None
+    assert operation.monitor_stopped_at is None
+    assert "was not acknowledged" in operation.last_failure
+    clear.assert_awaited_once_with("node-a")
+
+
+@pytest.mark.asyncio
+async def test_inflight_launch_finishes_into_exact_teardown_uid_closure(monkeypatch):
+    token = "launch-token"
+    deployment = SimpleNamespace(
+        deployment_id="dep-1",
+        teardown_operation_id="teardown-1",
+        launch_operation_id="launch-1",
+        server=SimpleNamespace(name="node-a"),
+    )
+    launch = SimpleNamespace(
+        operation_id="launch-1",
+        deployment_id="dep-1",
+        phase="teardown_fenced",
+        lease_owner=token,
+        lease_expires_at=object(),
+        immutable_labels=EXPECTED_LABELS,
+        service_name=None,
+        service_uid=None,
+        create_results={},
+    )
+    added = []
+
+    async def get(model, *_args, **_kwargs):
+        return deployment if model.__name__ == "Deployment" else launch
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        scalar=AsyncMock(return_value=None),
+        add=lambda value: added.append(value),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(k8s_operator, "get_session", fake_session)
+    service = SimpleNamespace(
+        api_version="v1",
+        metadata=SimpleNamespace(
+            name="chute-svc-dep-1",
+            namespace="chutes",
+            uid="service-uid",
+            labels=EXPECTED_LABELS,
+        ),
+    )
+
+    with pytest.raises(DeploymentFailure, match="fenced while Kubernetes create"):
+        await K8sOperator._record_launch_resource(
+            SimpleNamespace(), "dep-1", token, "Service", service
+        )
+    assert launch.service_uid == "service-uid"
+    assert launch.lease_owner is None
+    assert len(added) == 1
+    assert added[0].operation_id == "teardown-1"
+    assert added[0].uid == "service-uid"
+
+
+@pytest.mark.asyncio
+async def test_delayed_instance_event_rewinds_active_teardown_before_finalization(
+    monkeypatch,
+):
+    deployment = SimpleNamespace(
+        teardown_operation_id="operation-1",
+        instance_id=None,
+    )
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        phase="finalizing",
+        instance_id=None,
+        validator_instance_deletion_ack={"status": "already_absent"},
+        validator_instance_deleted_at=object(),
+        retry_lease_owner="old-run",
+        retry_lease_expires_at=object(),
+    )
+
+    class Result:
+        def unique(self):
+            return self
+
+        def scalar_one_or_none(self):
+            return deployment
+
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=Result()),
+        get=AsyncMock(return_value=operation),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    assert await coordinator.bind_instance_created(
+        config_id="config-1", instance_id="instance-late"
+    ) == ("teardown", "operation-1")
+    assert operation.phase == "revoking"
+    assert operation.instance_id == "instance-late"
+    assert operation.validator_instance_deletion_ack is None
+    assert operation.retry_lease_owner is None
+
+
+@pytest.mark.asyncio
+async def test_instance_event_after_local_delete_creates_durable_exact_cleanup(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        phase="completed",
+        instance_id="instance-created-before-delete",
+        validator="validator-1",
+        chute_id="chute-1",
+    )
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def unique(self):
+            return self
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    added = []
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[Result(None), Result(operation), Result(None)]
+        ),
+        add=lambda value: added.append(value),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    action = await coordinator.bind_instance_created(
+        config_id="config-1", instance_id="instance-late"
+    )
+    assert action == ("cleanup", added[0].cleanup_id)
+    assert added[0].source_teardown_operation_id == "operation-1"
+    assert added[0].instance_id == "instance-late"
+
+
+@pytest.mark.asyncio
+async def test_delayed_instance_cleanup_retries_lost_response_with_same_identity(monkeypatch):
+    cleanup = SimpleNamespace(
+        cleanup_id="cleanup-1",
+        phase="pending",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        attempt_count=0,
+        validator="validator-1",
+        chute_id="chute-1",
+        instance_id="instance-1",
+        deletion_ack=None,
+        deleted_at=None,
+        completed_at=None,
+        last_failure=None,
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=cleanup), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    coordinator._delete_validator_instance_exact = AsyncMock(
+        side_effect=[
+            ConnectionError("response lost"),
+            {"status": "already_absent", "instance_id": "instance-1"},
+        ]
+    )
+    assert await coordinator.run_delayed_instance_cleanup("cleanup-1") is False
+    assert cleanup.phase == "pending"
+    assert cleanup.retry_lease_owner is None
+    assert await coordinator.run_delayed_instance_cleanup("cleanup-1") is True
+    assert cleanup.phase == "completed"
+    assert cleanup.deletion_ack["instance_id"] == "instance-1"
+    assert coordinator._delete_validator_instance_exact.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_operations_use_distinct_compare_and_set_lease_owners():
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    observed = {}
+    both_claimed = asyncio.Event()
+
+    async def claimed(operation_id):
+        observed[operation_id] = coordinator.worker_id
+        if len(observed) == 2:
+            both_claimed.set()
+        await both_claimed.wait()
+        return True
+
+    coordinator._run_claimed = claimed
+    assert await asyncio.gather(coordinator.run("one"), coordinator.run("two")) == [
+        True,
+        True,
+    ]
+    assert observed["one"] != observed["two"]
 
 
 @pytest.mark.asyncio
@@ -245,6 +556,8 @@ async def test_startup_resumes_deployment_parent_and_orphan_operations(monkeypat
                 Result(["deployment-operation"]),
                 Result(["parent-operation"]),
                 Result(["orphan-tombstone"]),
+                Result(["delayed-instance-cleanup"]),
+                Result(["stale-launch-deployment"]),
             ]
         )
     )
@@ -260,10 +573,18 @@ async def test_startup_resumes_deployment_parent_and_orphan_operations(monkeypat
     coordinator.run = AsyncMock(return_value=True)
     coordinator.run_parent = AsyncMock(return_value=True)
     coordinator.run_orphan = AsyncMock(return_value=True)
+    coordinator.run_delayed_instance_cleanup = AsyncMock(return_value=True)
+    coordinator.request_and_run = AsyncMock(return_value=True)
     await coordinator.resume_pending()
     coordinator.run.assert_awaited_once_with("deployment-operation")
     coordinator.run_parent.assert_awaited_once_with("parent-operation")
     coordinator.run_orphan.assert_awaited_once_with("orphan-tombstone")
+    coordinator.run_delayed_instance_cleanup.assert_awaited_once_with(
+        "delayed-instance-cleanup"
+    )
+    coordinator.request_and_run.assert_awaited_once_with(
+        "stale-launch-deployment", "launch_rollback"
+    )
 
 
 def test_gepetto_has_no_direct_deployment_delete_or_cache_proof_for_gpu_teardown():

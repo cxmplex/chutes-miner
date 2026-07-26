@@ -190,6 +190,112 @@ class DeploymentTeardownK8sResource(Base):
     )
 
 
+class DeploymentLaunchOperation(Base):
+    """Durable fence around Kubernetes creation after GPU ownership is claimed."""
+
+    __tablename__ = "deployment_launch_operations"
+
+    operation_id = Column(String, primary_key=True, default=_uuid)
+    deployment_id = Column(String, nullable=False, unique=True)
+    phase = Column(String, nullable=False, default="reserved", server_default="reserved")
+    lease_owner = Column(String, nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    immutable_labels = Column(JSONB, nullable=False)
+    service_name = Column(String, nullable=True)
+    service_uid = Column(String, nullable=True)
+    secret_name = Column(String, nullable=True)
+    secret_uid = Column(String, nullable=True)
+    job_name = Column(String, nullable=True)
+    job_uid = Column(String, nullable=True)
+    create_results = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    last_failure = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('reserved', 'creating', 'created', 'teardown_fenced', 'failed')",
+            name="ck_deployment_launch_phase",
+        ),
+        CheckConstraint(
+            "(lease_owner IS NULL) = (lease_expires_at IS NULL)",
+            name="ck_deployment_launch_lease",
+        ),
+        CheckConstraint(
+            "(service_name IS NULL) = (service_uid IS NULL)",
+            name="ck_deployment_launch_service",
+        ),
+        CheckConstraint(
+            "(secret_name IS NULL) = (secret_uid IS NULL)",
+            name="ck_deployment_launch_secret",
+        ),
+        CheckConstraint(
+            "(job_name IS NULL) = (job_uid IS NULL)",
+            name="ck_deployment_launch_job",
+        ),
+        Index(
+            "deployment_launch_recovery_idx",
+            "phase",
+            "lease_expires_at",
+            postgresql_where=text(
+                "phase IN ('reserved', 'creating', 'failed')"
+            ),
+        ),
+    )
+
+
+class DelayedValidatorInstanceCleanup(Base):
+    """Idempotent validator cleanup for instance-created events after local deletion."""
+
+    __tablename__ = "delayed_validator_instance_cleanups"
+
+    cleanup_id = Column(String, primary_key=True, default=_uuid)
+    source_teardown_operation_id = Column(
+        String,
+        ForeignKey("deployment_teardown_operations.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    validator = Column(String, nullable=False)
+    chute_id = Column(String, nullable=False)
+    config_id = Column(String, nullable=False)
+    instance_id = Column(String, nullable=False)
+    phase = Column(String, nullable=False, default="pending", server_default="pending")
+    retry_lease_owner = Column(String, nullable=True)
+    retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    deletion_ack = Column(JSONB, nullable=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    last_failure = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "config_id",
+            "instance_id",
+            name="delayed_validator_instance_cleanup_identity_key",
+        ),
+        CheckConstraint(
+            "phase IN ('pending', 'completed')",
+            name="ck_delayed_validator_instance_cleanup_phase",
+        ),
+        CheckConstraint(
+            "(retry_lease_owner IS NULL) = (retry_lease_expires_at IS NULL)",
+            name="ck_delayed_validator_instance_cleanup_lease",
+        ),
+        CheckConstraint(
+            "(deletion_ack IS NULL) = (deleted_at IS NULL)",
+            name="ck_delayed_validator_instance_cleanup_ack",
+        ),
+    )
+
+
 class ParentDeletionOperation(Base):
     """Durable Server/Chute deletion that waits for child teardown."""
 

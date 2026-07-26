@@ -105,6 +105,74 @@ CREATE TABLE IF NOT EXISTS deployment_teardown_k8s_resources (
 CREATE INDEX IF NOT EXISTS deployment_teardown_resource_lookup_idx
     ON deployment_teardown_k8s_resources (operation_id, kind, name);
 
+CREATE TABLE IF NOT EXISTS deployment_launch_operations (
+    operation_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL UNIQUE,
+    phase TEXT NOT NULL DEFAULT 'reserved',
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    immutable_labels JSONB NOT NULL,
+    service_name TEXT,
+    service_uid TEXT,
+    secret_name TEXT,
+    secret_uid TEXT,
+    job_name TEXT,
+    job_uid TEXT,
+    create_results JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_failure TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT ck_deployment_launch_phase CHECK (
+        phase IN ('reserved', 'creating', 'created', 'teardown_fenced', 'failed')
+    ),
+    CONSTRAINT ck_deployment_launch_lease CHECK (
+        (lease_owner IS NULL) = (lease_expires_at IS NULL)
+    ),
+    CONSTRAINT ck_deployment_launch_service CHECK (
+        (service_name IS NULL) = (service_uid IS NULL)
+    ),
+    CONSTRAINT ck_deployment_launch_secret CHECK (
+        (secret_name IS NULL) = (secret_uid IS NULL)
+    ),
+    CONSTRAINT ck_deployment_launch_job CHECK (
+        (job_name IS NULL) = (job_uid IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS deployment_launch_recovery_idx
+    ON deployment_launch_operations (phase, lease_expires_at)
+    WHERE phase IN ('reserved', 'creating', 'failed');
+
+CREATE TABLE IF NOT EXISTS delayed_validator_instance_cleanups (
+    cleanup_id TEXT PRIMARY KEY,
+    source_teardown_operation_id TEXT NOT NULL
+        REFERENCES deployment_teardown_operations(operation_id) ON DELETE RESTRICT,
+    validator TEXT NOT NULL,
+    chute_id TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'pending',
+    retry_lease_owner TEXT,
+    retry_lease_expires_at TIMESTAMPTZ,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    deletion_ack JSONB,
+    deleted_at TIMESTAMPTZ,
+    last_failure TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT delayed_validator_instance_cleanup_identity_key
+        UNIQUE (config_id, instance_id),
+    CONSTRAINT ck_delayed_validator_instance_cleanup_phase CHECK (
+        phase IN ('pending', 'completed')
+    ),
+    CONSTRAINT ck_delayed_validator_instance_cleanup_lease CHECK (
+        (retry_lease_owner IS NULL) = (retry_lease_expires_at IS NULL)
+    ),
+    CONSTRAINT ck_delayed_validator_instance_cleanup_ack CHECK (
+        (deletion_ack IS NULL) = (deleted_at IS NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS parent_deletion_operations (
     operation_id TEXT PRIMARY KEY,
     parent_type TEXT NOT NULL,
@@ -236,6 +304,13 @@ ALTER TABLE deployments ADD CONSTRAINT deployments_teardown_operation_id_fkey
     REFERENCES deployment_teardown_operations(operation_id) ON DELETE RESTRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS deployments_teardown_operation_id_key
     ON deployments (teardown_operation_id) WHERE teardown_operation_id IS NOT NULL;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS launch_operation_id TEXT;
+ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_launch_operation_id_fkey;
+ALTER TABLE deployments ADD CONSTRAINT deployments_launch_operation_id_fkey
+    FOREIGN KEY (launch_operation_id)
+    REFERENCES deployment_launch_operations(operation_id) ON DELETE RESTRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS deployments_launch_operation_id_key
+    ON deployments (launch_operation_id) WHERE launch_operation_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION require_finished_deployment_teardown()
 RETURNS TRIGGER AS $$
@@ -317,6 +392,12 @@ BEGIN
               WHERE child.parent_operation_id = op.operation_id
                 AND teardown.phase <> 'completed'
           )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM deployments deployment
+              WHERE (expected_type = 'server' AND deployment.server_id = expected_id)
+                 OR (expected_type = 'chute' AND deployment.chute_id = expected_id)
+          )
           AND (
               expected_type <> 'server'
               OR (
@@ -329,6 +410,25 @@ BEGIN
             USING ERRCODE = '23503';
     END IF;
     RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fence_parent_deletion_placement()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM parent_deletion_operations op
+        WHERE op.phase <> 'completed'
+          AND (
+              (op.parent_type = 'server' AND op.parent_id = NEW.server_id)
+              OR (op.parent_type = 'chute' AND op.parent_id = NEW.chute_id)
+          )
+    ) THEN
+        RAISE EXCEPTION 'deployment placement is fenced by parent deletion'
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -348,16 +448,23 @@ DROP TRIGGER IF EXISTS chutes_require_parent_deletion ON chutes;
 CREATE TRIGGER chutes_require_parent_deletion
     BEFORE DELETE ON chutes
     FOR EACH ROW EXECUTE FUNCTION require_finished_parent_deletion();
+DROP TRIGGER IF EXISTS deployments_fence_parent_deletion ON deployments;
+CREATE TRIGGER deployments_fence_parent_deletion
+    BEFORE INSERT OR UPDATE OF server_id, chute_id ON deployments
+    FOR EACH ROW EXECUTE FUNCTION fence_parent_deletion_placement();
 
 -- migrate:down
 LOCK TABLE deployments, gpus, servers, chutes,
     deployment_teardown_operations, deployment_teardown_k8s_resources,
+    deployment_launch_operations, delayed_validator_instance_cleanups,
     parent_deletion_operations, parent_deletion_children, kubernetes_orphan_tombstones,
     kubernetes_orphan_tombstone_resources IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM deployment_teardown_operations)
+       OR EXISTS (SELECT 1 FROM deployment_launch_operations)
+       OR EXISTS (SELECT 1 FROM delayed_validator_instance_cleanups)
        OR EXISTS (SELECT 1 FROM parent_deletion_operations)
        OR EXISTS (SELECT 1 FROM kubernetes_orphan_tombstones) THEN
         RAISE EXCEPTION 'cannot remove durable teardown schema while teardown history exists';
@@ -369,10 +476,15 @@ DROP TRIGGER IF EXISTS deployments_require_teardown ON deployments;
 DROP TRIGGER IF EXISTS gpus_require_teardown ON gpus;
 DROP TRIGGER IF EXISTS servers_require_parent_deletion ON servers;
 DROP TRIGGER IF EXISTS chutes_require_parent_deletion ON chutes;
+DROP TRIGGER IF EXISTS deployments_fence_parent_deletion ON deployments;
 DROP FUNCTION IF EXISTS require_finished_deployment_teardown();
 DROP FUNCTION IF EXISTS require_finished_gpu_teardown();
 DROP FUNCTION IF EXISTS require_finished_parent_deletion();
+DROP FUNCTION IF EXISTS fence_parent_deletion_placement();
 
+DROP INDEX IF EXISTS deployments_launch_operation_id_key;
+ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_launch_operation_id_fkey;
+ALTER TABLE deployments DROP COLUMN IF EXISTS launch_operation_id;
 DROP INDEX IF EXISTS deployments_teardown_operation_id_key;
 ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_teardown_operation_id_fkey;
 ALTER TABLE deployments DROP COLUMN IF EXISTS teardown_operation_id;
@@ -396,5 +508,7 @@ DROP TABLE IF EXISTS kubernetes_orphan_tombstone_resources;
 DROP TABLE IF EXISTS kubernetes_orphan_tombstones;
 DROP TABLE IF EXISTS parent_deletion_children;
 DROP TABLE IF EXISTS parent_deletion_operations;
+DROP TABLE IF EXISTS delayed_validator_instance_cleanups;
+DROP TABLE IF EXISTS deployment_launch_operations;
 DROP TABLE IF EXISTS deployment_teardown_k8s_resources;
 DROP TABLE IF EXISTS deployment_teardown_operations;

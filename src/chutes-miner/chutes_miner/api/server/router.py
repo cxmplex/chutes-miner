@@ -219,6 +219,7 @@ async def purge_server(
     """
     gepetto = Gepetto()
     deployments = []
+    operation_ids = []
     for deployment in (
         (
             await db.execute(
@@ -249,7 +250,14 @@ async def purge_server(
         logger.warning(
             f"Initiating deletion of {deployment.deployment_id}: {deployment.chute.name} from server {deployment.server.name}"
         )
-        asyncio.create_task(gepetto.undeploy(deployment.deployment_id))
+        operation_id = await gepetto.teardown.request(
+            deployment.deployment_id, "management_purge_server"
+        )
+        if operation_id:
+            operation_ids.append(operation_id)
+
+    for operation_id in operation_ids:
+        asyncio.create_task(gepetto.teardown.run(operation_id))
 
     return {
         "status": "initiated",

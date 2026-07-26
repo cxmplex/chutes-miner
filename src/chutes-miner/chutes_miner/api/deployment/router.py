@@ -24,6 +24,7 @@ async def purge(
     Purge all deployments, allowing gepetto to re-scale for max $$$
     """
     deployments = []
+    operation_ids = []
     gepetto = Gepetto()
     for deployment in (await db.execute(select(Deployment))).unique().scalars().all():
         deployments.append(
@@ -38,7 +39,13 @@ async def purge(
         logger.warning(
             f"Initiating deletion of {deployment.deployment_id}: {deployment.chute.name} from server {deployment.server.name}"
         )
-        asyncio.create_task(gepetto.undeploy(deployment.deployment_id))
+        operation_id = await gepetto.teardown.request(
+            deployment.deployment_id, "management_purge_all"
+        )
+        if operation_id:
+            operation_ids.append(operation_id)
+    for operation_id in operation_ids:
+        asyncio.create_task(gepetto.teardown.run(operation_id))
     return {
         "status": "initiated",
         "deployments_purged": deployments,
@@ -71,7 +78,15 @@ async def purge_deployment(
         f"Initiating deletion of {deployment.deployment_id}: {deployment.chute.name} from server {deployment.server.name}"
     )
 
-    asyncio.create_task(gepetto.undeploy(deployment.deployment_id))
+    operation_id = await gepetto.teardown.request(
+        deployment.deployment_id, "management_purge_single"
+    )
+    if not operation_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deployment teardown could not be persisted",
+        )
+    asyncio.create_task(gepetto.teardown.run(operation_id))
     return {
         "status": "initiated",
         "deployment_purged": deployment,

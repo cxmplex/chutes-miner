@@ -363,18 +363,27 @@ def build_chute_job(
 
 
 def build_chute_service(
-    chute: Chute, deployment_id: str, extra_service_ports: list[dict[str, Any]] = []
+    chute: Chute,
+    deployment_id: str,
+    extra_service_ports: list[dict[str, Any]] = [],
+    *,
+    config_id: str,
+    job_id: str | None = None,
 ):
     needs_attestation_port = _needs_attestation_port(chute)
+    immutable_labels = {
+        "chutes/deployment-id": deployment_id,
+        "chutes/chute": "true",
+        "chutes/chute-id": chute.chute_id,
+        "chutes/version": chute.version,
+        "chutes/config-id": config_id,
+    }
+    if job_id:
+        immutable_labels["chutes/job-id"] = job_id
     return V1Service(
         metadata=V1ObjectMeta(
             name=f"{CHUTE_SVC_PREFIX}-{deployment_id}",
-            labels={
-                "chutes/deployment-id": deployment_id,
-                "chutes/chute": "true",
-                "chutes/chute-id": chute.chute_id,
-                "chutes/version": chute.version,
-            },
+            labels=immutable_labels,
         ),
         spec=V1ServiceSpec(
             type="NodePort",

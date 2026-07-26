@@ -27,6 +27,7 @@ def test_ownership_foreign_keys_are_restrictive_and_mappers_configure():
     assert _ondelete("gpus", "server_id") == "RESTRICT"
     assert _ondelete("gpus", "deployment_id") == "RESTRICT"
     assert _ondelete("deployments", "teardown_operation_id") == "RESTRICT"
+    assert _ondelete("deployments", "launch_operation_id") == "RESTRICT"
 
 
 def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
@@ -59,12 +60,35 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
     }
 
 
+def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
+    launch = Base.metadata.tables["deployment_launch_operations"]
+    assert not launch.c.deployment_id.foreign_keys
+    assert {
+        "phase",
+        "lease_owner",
+        "lease_expires_at",
+        "service_uid",
+        "secret_uid",
+        "job_uid",
+        "create_results",
+    }.issubset(launch.c.keys())
+    cleanup = Base.metadata.tables["delayed_validator_instance_cleanups"]
+    assert _ondelete(
+        "delayed_validator_instance_cleanups", "source_teardown_operation_id"
+    ) == "RESTRICT"
+    assert {"validator", "chute_id", "config_id", "instance_id", "deletion_ack"}.issubset(
+        cleanup.c.keys()
+    )
+
+
 def test_migration_guards_release_and_has_migration_specific_down_guard():
     sql = MIGRATION.read_text(encoding="utf-8")
     assert "deployments_require_teardown" in sql
     assert "gpus_require_teardown" in sql
     assert "servers_require_parent_deletion" in sql
     assert "chutes_require_parent_deletion" in sql
+    assert "deployments_fence_parent_deletion" in sql
+    assert "deployment_launch_recovery_idx" in sql
     assert "LOCK TABLE deployments, gpus, servers, chutes" in sql
     assert "cannot remove durable teardown schema while teardown history exists" in sql
     assert "phase IN ('finalizing', 'completed')" in sql

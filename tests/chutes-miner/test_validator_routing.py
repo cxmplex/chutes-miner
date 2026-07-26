@@ -705,6 +705,9 @@ class _ClaimSession:
         self.statement = statement
         return SimpleNamespace(rowcount=self.claimed)
 
+    async def scalar(self, _statement):
+        return None
+
     async def commit(self):
         self.committed = True
 
@@ -734,6 +737,7 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
     assert len(gpu_uuids) == 2
     assert session.flushed
     assert session.committed
+    assert len(session.added) == 2
     assert "gpus.deployment_id IS NULL" in str(session.statement)
 
 

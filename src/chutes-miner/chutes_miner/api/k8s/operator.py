@@ -1,6 +1,7 @@
 import abc
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import re
@@ -27,6 +28,11 @@ from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
 from chutes_common.schemas.gpu import GPU
 from chutes_common.schemas.server import Server
+from chutes_common.schemas.teardown import (
+    DeploymentLaunchOperation,
+    DeploymentTeardownK8sResource,
+    ParentDeletionOperation,
+)
 from chutes_miner.api.config import (
     k8s_api_client,
     k8s_app_client,
@@ -72,7 +78,7 @@ from kubernetes.client import (
 from kubernetes.client.rest import ApiException
 from loguru import logger
 from redis.client import PubSub
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib3.exceptions import MaxRetryError
 
@@ -1041,6 +1047,7 @@ class K8sOperator(abc.ABC):
         deployment_id = None
         chute_version = None
         server = None
+        launch_token = None
         try:
             # Backwards compatible types...
             if isinstance(chute_id, Chute):
@@ -1081,13 +1088,31 @@ class K8sOperator(abc.ABC):
                     registry_repository,
                     registry_manifest_digest,
                 )
+                launch_token = await self._claim_launch(deployment_id)
 
             # Build the service that exposes it.
+            await self._assert_launch_creation_allowed(deployment_id, launch_token)
             service = self._create_service_for_deployment(
-                chute, server, deployment_id, extra_service_ports
+                chute,
+                server,
+                deployment_id,
+                extra_service_ports,
+                config_id=config_id,
+                job_id=job_id,
+            )
+            await self._record_launch_resource(
+                deployment_id, launch_token, "Service", service
             )
 
+            if settings.gpu_tee_only:
+                await self._assert_launch_creation_allowed(deployment_id, launch_token)
+                secret = self._create_registry_pull_secret(config_id, server.validator)
+                await self._record_launch_resource(
+                    deployment_id, launch_token, "Secret", secret
+                )
+
             # Create the deployment.
+            await self._assert_launch_creation_allowed(deployment_id, launch_token)
             job = self._create_job_for_deployment(
                 deployment_id,
                 chute,
@@ -1102,14 +1127,18 @@ class K8sOperator(abc.ABC):
                 disk_gb=disk_gb,
                 vm_version=vm_version,
             )
+            await self._record_launch_resource(deployment_id, launch_token, "Job", job)
 
             # Deploy the chute
-            deployment = await self._update_deployment(deployment_id, server, service)
+            deployment = await self._update_deployment(
+                deployment_id, server, service, launch_token
+            )
 
             self.invalidate_node_disk_cache(server.name)
             return deployment, job
         except Exception as exc:
             if deployment_id:
+                await self._fail_launch(deployment_id, launch_token, exc)
                 rollback_completed = await self._clear_deployment(deployment_id)
                 if not rollback_completed:
                     raise DeploymentFailure(
@@ -1126,7 +1155,13 @@ class K8sOperator(abc.ABC):
 
     async def _get_chute(self, session: AsyncSession, chute_id: str):
         chute = (
-            (await session.execute(select(Chute).where(Chute.chute_id == chute_id)))
+            (
+                await session.execute(
+                    select(Chute)
+                    .where(Chute.chute_id == chute_id)
+                    .with_for_update(of=Chute)
+                )
+            )
             .unique()
             .scalar_one_or_none()
         )
@@ -1138,7 +1173,13 @@ class K8sOperator(abc.ABC):
 
     async def _get_server(self, session: AsyncSession, server_id: str):
         server = (
-            (await session.execute(select(Server).where(Server.server_id == server_id)))
+            (
+                await session.execute(
+                    select(Server)
+                    .where(Server.server_id == server_id)
+                    .with_for_update(of=Server)
+                )
+            )
             .unique()
             .scalar_one_or_none()
         )
@@ -1173,6 +1214,25 @@ class K8sOperator(abc.ABC):
         registry_manifest_digest: str = None,
     ):
         # Immediately track this deployment (before actually creating it) to avoid allocation contention.
+        parent_fence = await session.scalar(
+            select(ParentDeletionOperation.operation_id)
+            .where(
+                ParentDeletionOperation.phase != "completed",
+                or_(
+                    (
+                        (ParentDeletionOperation.parent_type == "server")
+                        & (ParentDeletionOperation.parent_id == server.server_id)
+                    ),
+                    (
+                        (ParentDeletionOperation.parent_type == "chute")
+                        & (ParentDeletionOperation.parent_id == chute.chute_id)
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+        if parent_fence:
+            raise DeploymentFailure("deployment placement is fenced by parent deletion")
         deployment_id = str(uuid.uuid4())
         gpu_candidates = [gpu for gpu in server.gpus if gpu.gpu_id in available_gpus][
             : chute.gpu_count
@@ -1205,6 +1265,23 @@ class K8sOperator(abc.ABC):
         session.add(deployment)
         await session.flush()
 
+        immutable_labels = {
+            "chutes/deployment-id": deployment_id,
+            "chutes/chute-id": chute.chute_id,
+            "chutes/config-id": config_id,
+        }
+        if job_id:
+            immutable_labels["chutes/job-id"] = job_id
+        launch = DeploymentLaunchOperation(
+            operation_id=str(uuid.uuid4()),
+            deployment_id=deployment_id,
+            phase="reserved",
+            immutable_labels=immutable_labels,
+        )
+        session.add(launch)
+        await session.flush()
+        deployment.launch_operation_id = launch.operation_id
+
         # Atomically claim only GPUs that are still unassigned.
         # The WHERE deployment_id IS NULL guard prevents stealing
         # GPUs that were concurrently assigned to another deployment.
@@ -1226,6 +1303,197 @@ class K8sOperator(abc.ABC):
 
         return deployment_id, gpu_uuids
 
+    async def _claim_launch(self, deployment_id: str) -> str:
+        now = _utc_now()
+        token = f"{deployment_id}:{uuid.uuid4()}"
+        async with get_session() as session:
+            deployment = await session.get(
+                Deployment,
+                deployment_id,
+                with_for_update={"of": Deployment},
+            )
+            if deployment is None or not deployment.launch_operation_id:
+                raise DeploymentFailure("durable launch reservation is unavailable")
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if deployment.teardown_operation_id or launch.phase in {
+                "teardown_fenced",
+                "failed",
+            }:
+                raise DeploymentFailure("launch is fenced by durable teardown")
+            if launch.phase == "created":
+                raise DeploymentFailure("launch was already completed")
+            if launch.lease_expires_at and launch.lease_expires_at > now:
+                raise DeploymentFailure("launch is already owned by another attempt")
+            launch.phase = "creating"
+            launch.lease_owner = token
+            launch.lease_expires_at = now + timedelta(seconds=300)
+            launch.last_failure = None
+            await session.commit()
+        return token
+
+    async def _assert_launch_creation_allowed(
+        self, deployment_id: str, token: str | None
+    ) -> None:
+        async with get_session() as session:
+            deployment = await session.get(
+                Deployment,
+                deployment_id,
+                with_for_update={"of": Deployment},
+            )
+            if deployment is None or not deployment.launch_operation_id:
+                raise DeploymentFailure("launch ownership disappeared")
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if (
+                not token
+                or launch.lease_owner != token
+                or launch.phase != "creating"
+                or deployment.teardown_operation_id is not None
+            ):
+                raise DeploymentFailure("launch creation is fenced by teardown")
+            launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
+            await session.commit()
+
+    async def _record_launch_resource(
+        self,
+        deployment_id: str,
+        token: str | None,
+        kind: str,
+        resource: Any,
+    ) -> None:
+        metadata = getattr(resource, "metadata", None)
+        name = str(getattr(metadata, "name", "") or "")
+        uid = str(getattr(metadata, "uid", "") or "")
+        labels = dict(getattr(metadata, "labels", None) or {})
+        node_name = None
+        if kind == "Job":
+            template = getattr(getattr(resource, "spec", None), "template", None)
+            node_name = getattr(getattr(template, "spec", None), "node_name", None)
+        if not name or not uid:
+            raise DeploymentFailure(f"created {kind} has no stable Kubernetes identity")
+        async with get_session() as session:
+            deployment = await session.get(
+                Deployment,
+                deployment_id,
+                with_for_update={"of": Deployment},
+            )
+            if deployment is None or not deployment.launch_operation_id:
+                raise DeploymentFailure("launch disappeared before UID persistence")
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if not token or launch.lease_owner != token or launch.phase not in {
+                "creating",
+                "teardown_fenced",
+            }:
+                raise DeploymentFailure("launch lease changed before UID persistence")
+            if kind == "Secret":
+                if labels.get("chutes/launch-config-id") != launch.immutable_labels.get(
+                    "chutes/config-id"
+                ):
+                    raise DeploymentFailure("created Secret conflicts with launch lineage")
+            elif any(
+                labels.get(key) != value
+                for key, value in launch.immutable_labels.items()
+            ):
+                raise DeploymentFailure(f"created {kind} conflicts with launch lineage")
+            if kind == "Job" and node_name != deployment.server.name:
+                raise DeploymentFailure("created Job conflicts with stable server lineage")
+            prefix = kind.lower()
+            setattr(launch, f"{prefix}_name", name)
+            setattr(launch, f"{prefix}_uid", uid)
+            results = dict(launch.create_results or {})
+            results[prefix] = {
+                "name": name,
+                "uid": uid,
+                "labels": labels,
+            }
+            launch.create_results = results
+            if deployment.teardown_operation_id:
+                known = await session.scalar(
+                    select(DeploymentTeardownK8sResource.resource_id).where(
+                        DeploymentTeardownK8sResource.operation_id
+                        == deployment.teardown_operation_id,
+                        DeploymentTeardownK8sResource.kind == kind,
+                        DeploymentTeardownK8sResource.uid == uid,
+                    )
+                )
+                if known is None:
+                    session.add(
+                        DeploymentTeardownK8sResource(
+                            resource_id=str(uuid.uuid4()),
+                            operation_id=deployment.teardown_operation_id,
+                            cluster_context=deployment.server.name,
+                            namespace=str(getattr(metadata, "namespace", None) or settings.namespace),
+                            api_version=str(
+                                getattr(resource, "api_version", None)
+                                or ("batch/v1" if kind == "Job" else "v1")
+                            ),
+                            kind=kind,
+                            name=name,
+                            uid=uid,
+                            owner_kind=None,
+                            owner_name=None,
+                            owner_uid=None,
+                            node_name=str(node_name) if node_name else None,
+                            labels=labels,
+                            labels_sha256=hashlib.sha256(
+                                json.dumps(
+                                    labels,
+                                    ensure_ascii=True,
+                                    allow_nan=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                ).encode("ascii")
+                            ).hexdigest(),
+                        )
+                    )
+            fenced = launch.phase == "teardown_fenced"
+            if fenced:
+                launch.lease_owner = None
+                launch.lease_expires_at = None
+            else:
+                launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
+            await session.commit()
+        if fenced:
+            raise DeploymentFailure("launch was fenced while Kubernetes create was in flight")
+
+    async def _fail_launch(
+        self, deployment_id: str, token: str | None, exc: Exception
+    ) -> None:
+        if not token:
+            return
+        async with get_session() as session:
+            deployment = await session.get(
+                Deployment,
+                deployment_id,
+                with_for_update={"of": Deployment},
+            )
+            if deployment is None or not deployment.launch_operation_id:
+                return
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if launch.lease_owner != token:
+                return
+            if launch.phase == "creating":
+                launch.phase = "failed"
+            launch.lease_owner = None
+            launch.lease_expires_at = None
+            launch.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
+            await session.commit()
+
     async def _clear_deployment(self, deployment_id: str) -> bool:
         from chutes_miner.api.deployment.teardown import (
             DeploymentTeardownCoordinator,
@@ -1237,13 +1505,21 @@ class K8sOperator(abc.ABC):
         )
         return await coordinator.request_and_run(deployment_id, "launch_rollback")
 
-    async def _update_deployment(self, deployment_id: str, server: Server, service: V1Service):
+    async def _update_deployment(
+        self,
+        deployment_id: str,
+        server: Server,
+        service: V1Service,
+        launch_token: str,
+    ):
         deployment_port = service.spec.ports[0].node_port
         async with get_session() as session:
             deployment = (
                 (
                     await session.execute(
-                        select(Deployment).where(Deployment.deployment_id == deployment_id)
+                        select(Deployment)
+                        .where(Deployment.deployment_id == deployment_id)
+                        .with_for_update(of=Deployment)
                     )
                 )
                 .unique()
@@ -1251,9 +1527,29 @@ class K8sOperator(abc.ABC):
             )
             if not deployment:
                 raise DeploymentFailure("Deployment disappeared mid-flight!")
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if (
+                deployment.teardown_operation_id is not None
+                or launch is None
+                or launch.phase != "creating"
+                or launch.lease_owner != launch_token
+                or not launch.service_uid
+                or not launch.job_uid
+                or (settings.gpu_tee_only and not launch.secret_uid)
+            ):
+                raise DeploymentFailure("launch completion was fenced or lacks exact UIDs")
             deployment.host = server.ip_address
             deployment.port = deployment_port
             deployment.stub = False
+            launch.phase = "created"
+            launch.completed_at = _utc_now()
+            launch.lease_owner = None
+            launch.lease_expires_at = None
+            launch.last_failure = None
             await session.commit()
             await session.refresh(deployment)
 
@@ -1474,15 +1770,41 @@ class K8sOperator(abc.ABC):
         server: Server,
         deployment_id: str,
         extra_service_ports: list[dict[str, Any]] = [],
+        *,
+        config_id: str,
+        job_id: str | None,
     ):
-        service = build_chute_service(chute, deployment_id, extra_service_ports)
+        service = build_chute_service(
+            chute,
+            deployment_id,
+            extra_service_ports,
+            config_id=config_id,
+            job_id=job_id,
+        )
 
         try:
             created_service = self._deploy_service(service, server_name=server.name)
-        except Exception:
+        except ApiException as exc:
+            if exc.status != 409:
+                raise DeploymentFailure(
+                    f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
+                ) from exc
+            client = (
+                self._manager.get_core_client(server.name)
+                if getattr(self, "_manager", None) is not None
+                else k8s_core_client()
+            )
+            created_service = client.read_namespaced_service(
+                name=service.metadata.name,
+                namespace=settings.namespace,
+                _request_timeout=30,
+            )
+            if dict(created_service.metadata.labels or {}) != dict(service.metadata.labels or {}):
+                raise DeploymentFailure("existing Service conflicts with launch lineage") from exc
+        except Exception as exc:
             raise DeploymentFailure(
                 f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
-            )
+            ) from exc
 
         return created_service
 
@@ -1502,8 +1824,6 @@ class K8sOperator(abc.ABC):
         vm_version: Optional[str] = None,
     ) -> V1Job:
         probe_port = self._get_probe_port(chute)
-        if settings.gpu_tee_only:
-            self._create_registry_pull_secret(config_id, server.validator)
         job = build_chute_job(
             deployment_id,
             chute,
@@ -1522,12 +1842,27 @@ class K8sOperator(abc.ABC):
 
         try:
             created_job = self._deploy_job_for_deployment(job, server_name=server.name)
-        except Exception:
-            if settings.gpu_tee_only:
-                self._delete_registry_pull_secret(config_id)
+        except ApiException as exc:
+            if exc.status != 409:
+                raise DeploymentFailure(
+                    f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
+                ) from exc
+            client = (
+                self._manager.get_batch_client(server.name)
+                if getattr(self, "_manager", None) is not None
+                else k8s_batch_client()
+            )
+            created_job = client.read_namespaced_job(
+                name=job.metadata.name,
+                namespace=settings.namespace,
+                _request_timeout=30,
+            )
+            if dict(created_job.metadata.labels or {}) != dict(job.metadata.labels or {}):
+                raise DeploymentFailure("existing Job conflicts with launch lineage") from exc
+        except Exception as exc:
             raise DeploymentFailure(
                 f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
-            )
+            ) from exc
 
         return created_job
 
@@ -1540,7 +1875,7 @@ class K8sOperator(abc.ABC):
             raise DeploymentFailure("launch config ID is invalid for registry scope secret")
         return registry_pull_secret_name(config_id)
 
-    def _create_registry_pull_secret(self, config_id: str, validator: str) -> None:
+    def _create_registry_pull_secret(self, config_id: str, validator: str) -> V1Secret:
         name = self._registry_pull_secret_name(config_id)
         host = f"{validator.lower()}.localregistry.chutes.ai:{settings.registry_proxy_port}"
         credential = base64.b64encode(f"{config_id}:chutes-registry-scope".encode("ascii")).decode(
@@ -1572,9 +1907,10 @@ class K8sOperator(abc.ABC):
             data={".dockerconfigjson": base64.b64encode(docker_config).decode("ascii")},
         )
         try:
-            k8s_core_client().create_namespaced_secret(
+            return k8s_core_client().create_namespaced_secret(
                 namespace=settings.namespace,
                 body=body,
+                _request_timeout=60,
             )
         except ApiException as exc:
             if exc.status != 409:
@@ -1582,6 +1918,7 @@ class K8sOperator(abc.ABC):
             current = k8s_core_client().read_namespaced_secret(
                 name=name,
                 namespace=settings.namespace,
+                _request_timeout=30,
             )
             if (
                 current.type != body.type
@@ -1591,6 +1928,7 @@ class K8sOperator(abc.ABC):
                 raise DeploymentFailure(
                     "existing registry scope secret conflicts with launch lifecycle"
                 ) from exc
+            return current
 
     def _delete_registry_pull_secret(self, config_id: str) -> None:
         name = self._registry_pull_secret_name(config_id)
@@ -1598,6 +1936,7 @@ class K8sOperator(abc.ABC):
             k8s_core_client().delete_namespaced_secret(
                 name=name,
                 namespace=settings.namespace,
+                _request_timeout=30,
             )
         except ApiException as exc:
             if exc.status != 404:

@@ -1,3 +1,6 @@
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy.sql.selectable import Select
@@ -12,6 +15,19 @@ from chutes_miner.api.server.router import purge_server
 app = FastAPI()
 app.include_router(router, prefix="/deployments")
 client = TestClient(app)
+
+
+def _durable_gepetto(operation_id="operation-1"):
+    teardown = SimpleNamespace(
+        request=AsyncMock(return_value=operation_id),
+        run=AsyncMock(return_value=True),
+    )
+    return SimpleNamespace(teardown=teardown)
+
+
+def _close_scheduled(coroutine):
+    coroutine.close()
+    return MagicMock()
 
 
 @pytest.fixture
@@ -43,10 +59,15 @@ async def test_purge_endpoint(mock_db_session, mock_deployment):
     mock_db_session.execute = AsyncMock(return_value=mock_result)
 
     # Mock Gepetto
-    mock_gepetto = MagicMock()
-    mock_gepetto.undeploy = AsyncMock()
+    mock_gepetto = _durable_gepetto()
 
-    with patch("chutes_miner.api.deployment.router.Gepetto", return_value=mock_gepetto):
+    with (
+        patch("chutes_miner.api.deployment.router.Gepetto", return_value=mock_gepetto),
+        patch(
+            "chutes_miner.api.deployment.router.asyncio.create_task",
+            side_effect=_close_scheduled,
+        ),
+    ):
         with patch("chutes_miner.api.deployment.router.logger") as mock_logger:
             # Call the function
             response = await purge(db=mock_db_session)
@@ -65,9 +86,9 @@ async def test_purge_endpoint(mock_db_session, mock_deployment):
 
             # Verify create_task was called to undeploy
             mock_db_session.execute.assert_called_once()
-            # Note: We can't directly verify asyncio.create_task was called because
-            # it's a built-in that's hard to mock, but we can verify the gepetto instance
-            # and method were called correctly
+            mock_gepetto.teardown.request.assert_awaited_once_with(
+                "test-deployment-id", "management_purge_all"
+            )
 
 
 @pytest.mark.asyncio
@@ -80,10 +101,15 @@ async def test_purge_deployment_endpoint(mock_db_session, mock_deployment):
     mock_db_session.execute = AsyncMock(return_value=mock_result)
 
     # Mock Gepetto
-    mock_gepetto = MagicMock()
-    mock_gepetto.undeploy = AsyncMock()
+    mock_gepetto = _durable_gepetto()
 
-    with patch("chutes_miner.api.deployment.router.Gepetto", return_value=mock_gepetto):
+    with (
+        patch("chutes_miner.api.deployment.router.Gepetto", return_value=mock_gepetto),
+        patch(
+            "chutes_miner.api.deployment.router.asyncio.create_task",
+            side_effect=_close_scheduled,
+        ),
+    ):
         with patch("chutes_miner.api.deployment.router.logger") as mock_logger:
             # Call the function
             response = await purge_deployment(
@@ -103,6 +129,9 @@ async def test_purge_deployment_endpoint(mock_db_session, mock_deployment):
             call_args = mock_db_session.execute.call_args[0][0]
             # Check that it's a select query
             assert isinstance(call_args, Select)
+            mock_gepetto.teardown.request.assert_awaited_once_with(
+                "test-deployment-id", "management_purge_single"
+            )
 
 
 @pytest.mark.asyncio
@@ -116,10 +145,15 @@ async def test_purge_server_endpoint(mock_db_session, mock_deployment):
     mock_db_session.execute = AsyncMock(return_value=mock_result)
 
     # Mock Gepetto
-    mock_gepetto = MagicMock()
-    mock_gepetto.undeploy = AsyncMock()
+    mock_gepetto = _durable_gepetto()
 
-    with patch("chutes_miner.api.server.router.Gepetto", return_value=mock_gepetto):
+    with (
+        patch("chutes_miner.api.server.router.Gepetto", return_value=mock_gepetto),
+        patch(
+            "chutes_miner.api.server.router.asyncio.create_task",
+            side_effect=_close_scheduled,
+        ),
+    ):
         with patch("chutes_miner.api.server.router.logger") as mock_logger:
             # Call the function
             response = await purge_server(id_or_name="test-deployment-id", db=mock_db_session)
@@ -142,6 +176,53 @@ async def test_purge_server_endpoint(mock_db_session, mock_deployment):
             call_args = mock_db_session.execute.call_args[0][0]
             # Check that it's a select query
             assert isinstance(call_args, Select)
+            mock_gepetto.teardown.request.assert_awaited_once_with(
+                "test-deployment-id", "management_purge_server"
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "router_module", "reason"),
+    [
+        ("all", "chutes_miner.api.deployment.router", "management_purge_all"),
+        ("single", "chutes_miner.api.deployment.router", "management_purge_single"),
+        ("server", "chutes_miner.api.server.router", "management_purge_server"),
+    ],
+)
+async def test_purge_cancellation_happens_only_after_durable_request(
+    mock_db_session,
+    mock_deployment,
+    route,
+    router_module,
+    reason,
+):
+    result = MagicMock()
+    result.unique.return_value = result
+    result.scalars.return_value = result
+    result.all.return_value = [mock_deployment]
+    result.scalar_one_or_none.return_value = mock_deployment
+    mock_db_session.execute = AsyncMock(return_value=result)
+    gepetto = _durable_gepetto("persisted-operation")
+
+    def cancel_after_persist(coroutine):
+        coroutine.close()
+        gepetto.teardown.request.assert_awaited_once_with(
+            "test-deployment-id", reason
+        )
+        raise asyncio.CancelledError
+
+    with (
+        patch(f"{router_module}.Gepetto", return_value=gepetto),
+        patch(f"{router_module}.asyncio.create_task", side_effect=cancel_after_persist),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        if route == "all":
+            await purge(db=mock_db_session)
+        elif route == "single":
+            await purge_deployment("test-deployment-id", db=mock_db_session)
+        else:
+            await purge_server("test-server-id", db=mock_db_session)
 
 
 @pytest.mark.asyncio

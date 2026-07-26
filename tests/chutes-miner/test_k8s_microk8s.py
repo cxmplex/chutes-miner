@@ -3,6 +3,7 @@ Unit tests for kubernetes helper module.
 """
 
 import uuid
+from contextlib import contextmanager
 import pytest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from kubernetes.client import V1PodList
@@ -15,6 +16,29 @@ import chutes_miner.api.k8s as k8s
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator, SingleClusterK8sOperator
 from chutes_common.k8s import serializer
+
+
+@contextmanager
+def _mock_durable_launch(mock_db_session, deployment):
+    mock_db_session.scalar = AsyncMock(return_value=None)
+
+    async def finish(_deployment_id, server, service, _token):
+        if deployment is None:
+            raise DeploymentFailure("Deployment disappeared mid-flight!")
+        deployment.host = server.ip_address
+        deployment.port = service.spec.ports[0].node_port
+        deployment.stub = False
+        await mock_db_session.commit()
+        return deployment
+
+    with (
+        patch.object(K8sOperator, "_claim_launch", AsyncMock(return_value="claim-token")),
+        patch.object(K8sOperator, "_assert_launch_creation_allowed", AsyncMock()),
+        patch.object(K8sOperator, "_record_launch_resource", AsyncMock()),
+        patch.object(K8sOperator, "_fail_launch", AsyncMock()),
+        patch.object(K8sOperator, "_update_deployment", side_effect=finish),
+    ):
+        yield
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -443,8 +467,12 @@ async def test_deploy_chute_success(
     )
 
     # Call the function
-    with patch(
-        "chutes_miner.api.k8s.operator.uuid.uuid4", return_value=mock_deployment_db.deployment_id
+    with (
+        patch(
+            "chutes_miner.api.k8s.operator.uuid.uuid4",
+            return_value=mock_deployment_db.deployment_id,
+        ),
+        _mock_durable_launch(mock_db_session, mock_deployment_db),
     ):
         result, created_deployment = await k8s.deploy_chute(
             sample_chute,
@@ -454,7 +482,7 @@ async def test_deploy_chute_success(
         )
 
     # Assertions
-    assert mock_db_session.add.call_count == 1
+    assert mock_db_session.add.call_count == 2
     assert mock_db_session.commit.call_count == 2
     mock_k8s_core_client.create_namespaced_service.assert_called_once()
     mock_k8s_batch_client.create_namespaced_job.assert_called_once()
@@ -530,12 +558,15 @@ async def test_deploy_chute_deployment_disappeared(
     )
 
     # Call the function and expect exception
-    with patch.object(
-        K8sOperator,
-        "_clear_deployment",
-        new_callable=AsyncMock,
-        return_value=True,
-    ) as rollback:
+    with (
+        _mock_durable_launch(mock_db_session, None),
+        patch.object(
+            K8sOperator,
+            "_clear_deployment",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as rollback,
+    ):
         with pytest.raises(DeploymentFailure, match="Deployment disappeared mid-flight"):
             await k8s.deploy_chute(
                 sample_chute,
@@ -588,12 +619,15 @@ async def test_deploy_chute_api_exception(
     )
 
     # Call the function and expect exception
-    with patch.object(
-        K8sOperator,
-        "_clear_deployment",
-        new_callable=AsyncMock,
-        return_value=True,
-    ) as rollback:
+    with (
+        _mock_durable_launch(mock_db_session, mock_deployment_db),
+        patch.object(
+            K8sOperator,
+            "_clear_deployment",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as rollback,
+    ):
         with pytest.raises(DeploymentFailure, match="Failed to deploy chute"):
             await k8s.deploy_chute(
                 sample_chute,

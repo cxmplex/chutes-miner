@@ -135,6 +135,8 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
               AND table_name IN (
                   'deployment_teardown_operations',
                   'deployment_teardown_k8s_resources',
+                  'deployment_launch_operations',
+                  'delayed_validator_instance_cleanups',
                   'parent_deletion_operations',
                   'parent_deletion_children',
                   'kubernetes_orphan_tombstones',
@@ -147,7 +149,8 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
                   'deployments_require_teardown',
                   'gpus_require_teardown',
                   'servers_require_parent_deletion',
-                  'chutes_require_parent_deletion'
+                  'chutes_require_parent_deletion',
+                  'deployments_fence_parent_deletion'
               );
             """,
             schema=schema,
@@ -156,7 +159,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
         _assert_ok(inspected)
         assert [
             line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["6", "4"]
+        ] == ["8", "5"]
 
         _assert_ok(_psql(f"BEGIN;\n{DOWN_SQL}\nCOMMIT;", schema=schema))
         restored = _psql(
@@ -167,6 +170,8 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
               AND table_name IN (
                   'deployment_teardown_operations',
                   'deployment_teardown_k8s_resources',
+                  'deployment_launch_operations',
+                  'delayed_validator_instance_cleanups',
                   'parent_deletion_operations',
                   'parent_deletion_children',
                   'kubernetes_orphan_tombstones',
@@ -176,7 +181,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
             FROM information_schema.columns
             WHERE table_schema = current_schema()
               AND table_name = 'deployments'
-              AND column_name = 'teardown_operation_id';
+              AND column_name IN ('teardown_operation_id', 'launch_operation_id');
             """,
             schema=schema,
             tuples_only=True,

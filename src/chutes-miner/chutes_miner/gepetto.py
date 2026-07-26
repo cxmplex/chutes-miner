@@ -763,12 +763,16 @@ class Gepetto:
         if event_data["miner_hotkey"] != settings.miner_ss58:
             return
         logger.info(f"Received instance_created event: {event_data}")
-        async with get_session() as session:
-            await session.execute(
-                update(Deployment)
-                .where(Deployment.config_id == event_data["config_id"])
-                .values({"instance_id": event_data["instance_id"]})
-            )
+        action = await self.teardown.bind_instance_created(
+            config_id=event_data["config_id"],
+            instance_id=event_data["instance_id"],
+        )
+        if action:
+            action_type, operation_id = action
+            if action_type == "teardown":
+                await self.teardown.run(operation_id)
+            else:
+                await self.teardown.run_delayed_instance_cleanup(operation_id)
 
     async def instance_verified(self, event_data):
         """
