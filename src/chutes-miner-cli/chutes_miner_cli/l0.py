@@ -43,6 +43,7 @@ from chutes_miner_cli.legacy_cutover import (
     BUNDLE_PATH as LEGACY_CUTOVER_BUNDLE_PATH,
     K3S_ADMIN_KUBECONFIG,
     LegacyCutoverError,
+    enforce_reboot_fence,
     recover_legacy_cutover,
     rebind_closure_authorization,
     run as run_legacy_cutover,
@@ -1283,9 +1284,6 @@ def gpu_legacy_cutover_retry() -> None:
     if os.geteuid() != 0:
         _print_cli_error("legacy GPU cutover retry must run as root")
         raise typer.Exit(1)
-    if not Path(LEGACY_CUTOVER_BUNDLE_PATH).is_file():
-        _print_cli_error("legacy GPU cutover bundle is unavailable")
-        raise typer.Exit(1)
     result = subprocess.run(  # nosec B603
         ["systemctl", "start", "chutes-legacy-gpu-cutover.service"],
         check=False,
@@ -1295,6 +1293,16 @@ def gpu_legacy_cutover_retry() -> None:
     if result.returncode != 0:
         _print_cli_error("legacy GPU cutover retry failed")
         raise typer.Exit(1)
+
+
+@l0_app.command("gpu-legacy-cutover-fence", hidden=True)
+def gpu_legacy_cutover_fence() -> None:
+    """Block normal K3s/storage startup while durable cutover state is active."""
+    try:
+        enforce_reboot_fence()
+    except LegacyCutoverError as exc:
+        _print_cli_error(str(exc))
+        raise typer.Exit(1) from None
 
 
 @l0_app.command("gpu-legacy-recover")

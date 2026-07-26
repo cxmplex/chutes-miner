@@ -77,6 +77,38 @@
     group: root
     mode: "0644"
 
+- name: Install early legacy GPU cutover fence service
+  ansible.builtin.copy:
+    src: chutes-legacy-gpu-cutover-fence.service
+    dest: /etc/systemd/system/chutes-legacy-gpu-cutover-fence.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create cutover fence drop-in directories
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - k3s.service
+    - systemd-cryptsetup@storage.service
+    - systemd-cryptsetup@tdx\x2dcache.service
+
+- name: Require the cutover fence before K3s or legacy mapper unlock
+  ansible.builtin.copy:
+    src: legacy-cutover-fence.conf
+    dest: "/etc/systemd/system/{{ item }}.d/legacy-cutover-fence.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - k3s.service
+    - systemd-cryptsetup@storage.service
+    - systemd-cryptsetup@tdx\x2dcache.service
+
 - name: Create k3s post-start drop-in directory
   ansible.builtin.file:
     path: /etc/systemd/system/k3s-post-start.service.d
@@ -100,6 +132,11 @@
 - name: Enable ephemeral legacy K3s admin preparation
   ansible.builtin.systemd:
     name: chutes-legacy-kubeconfig-prepare.service
+    enabled: true
+
+- name: Enable cross-boot legacy GPU cutover recovery
+  ansible.builtin.systemd:
+    name: chutes-legacy-gpu-cutover.service
     enabled: true
 
 - name: Setup monitoring

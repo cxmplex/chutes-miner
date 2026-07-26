@@ -19,6 +19,7 @@ import aiohttp
 BUNDLE_PATH = "/run/chutes/legacy-gpu-cutover.json"
 CUTOVER_STATE_PATH = "/var/lib/chutes/legacy-gpu-cutover/state.json"
 CLOSURE_PATH = "/var/lib/chutes/legacy-gpu-cutover/closure.json"
+AUTHORIZATION_PATH = "/var/lib/chutes/legacy-gpu-cutover/authorization.json"
 K3S_ADMIN_KUBECONFIG = "/run/chutes/legacy-k3s-admin.yaml"
 K3S_SHUTDOWN_HELPER = "/usr/local/libexec/chutes/k3s-killall-v1.33.1+k3s1.sh"
 K3S_SHUTDOWN_HELPER_SHA256 = (
@@ -185,11 +186,12 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
         "version",
         "phase",
         "boot_id",
+        "last_boot_id",
         "legacy_server_id",
         "target_host_id",
     }
     source = common | {
-        "cutover_authorization",
+        "connection",
         "storage_luks_uuid",
         "storage_filesystem_uuid",
         "storage_generation",
@@ -209,7 +211,7 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
         or phase not in _CUTOVER_PHASES
         or any(
             not isinstance(document.get(key), str) or not document[key]
-            for key in ("boot_id", "legacy_server_id", "target_host_id")
+            for key in ("boot_id", "last_boot_id", "legacy_server_id", "target_host_id")
         )
     ):
         raise LegacyCutoverError(
@@ -219,6 +221,8 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
         result = document["api_result"]
         if (
             not isinstance(result, dict)
+            or set(result)
+            != {"schema", "version", "migration_id", "legacy_server_id", "status"}
             or not isinstance(document["closure_sha256"], str)
             or len(document["closure_sha256"]) != 64
             or any(
@@ -226,6 +230,9 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
                 for character in document["closure_sha256"]
             )
             or result.get("schema") != "chutes.gpu-legacy-closed"
+            or result.get("version") != 1
+            or not isinstance(result.get("migration_id"), str)
+            or not result["migration_id"]
             or result.get("legacy_server_id") != document["legacy_server_id"]
             or result.get("status") != "guest_closed"
         ):
@@ -234,7 +241,9 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
     if (
         any(
             not isinstance(document.get(key), str) or not document[key]
-            for key in source - common - {"storage_generation", "cache_generation"}
+            for key in source
+            - common
+            - {"storage_generation", "cache_generation", "connection"}
         )
         or not isinstance(document["storage_generation"], int)
         or document["storage_generation"] < 0
@@ -242,27 +251,78 @@ def _load_cutover_state(path: str | None = None) -> dict[str, Any]:
         or document["cache_generation"] < 0
     ):
         raise LegacyCutoverError("persisted cutover source evidence is malformed")
+    connection = document["connection"]
+    if (
+        not isinstance(connection, dict)
+        or set(connection) != {"validator_api", "cert_path", "key_path", "ca_path"}
+        or any(
+            not isinstance(connection.get(key), str) or not connection[key]
+            for key in ("validator_api", "cert_path", "key_path")
+        )
+        or not isinstance(connection.get("ca_path"), str)
+    ):
+        raise LegacyCutoverError("persisted validator connection descriptor is malformed")
     return document
+
+
+def _persist_authorization(
+    *, legacy_server_id: str, target_host_id: str, token: str
+) -> None:
+    _write_private_json(
+        AUTHORIZATION_PATH,
+        {
+            "schema": "chutes.legacy-gpu-cutover-authorization-envelope",
+            "version": 1,
+            "legacy_server_id": legacy_server_id,
+            "target_host_id": target_host_id,
+            "cutover_authorization": token,
+        },
+    )
 
 
 def rebind_closure_authorization(token: str) -> None:
     if not token:
         raise LegacyCutoverError("replacement cutover authorization is empty")
-    changed = False
     if Path(CUTOVER_STATE_PATH).exists():
         state = _load_cutover_state()
         if state["phase"] == "transfer_acknowledged":
             raise LegacyCutoverError("acknowledged cutover authorization is immutable")
-        state["cutover_authorization"] = token
-        _write_private_json(CUTOVER_STATE_PATH, state)
-        changed = True
-    if Path(CLOSURE_PATH).exists():
-        closure = _load_closure(CLOSURE_PATH)
-        closure["cutover_authorization"] = token
-        _write_private_json(CLOSURE_PATH, closure)
-        changed = True
-    if not changed:
+        legacy_server_id = state["legacy_server_id"]
+        target_host_id = state["target_host_id"]
+    elif Path(BUNDLE_PATH).exists():
+        bundle = _load_bundle(BUNDLE_PATH)
+        legacy_server_id = bundle["legacy_server_id"]
+        target_host_id = bundle["target_host_id"]
+    else:
         return
+    _persist_authorization(
+        legacy_server_id=legacy_server_id,
+        target_host_id=target_host_id,
+        token=token,
+    )
+
+
+def _load_authorization(state: dict[str, Any]) -> str:
+    envelope = _load_private_json(AUTHORIZATION_PATH, "authorization envelope")
+    if (
+        set(envelope)
+        != {
+            "schema",
+            "version",
+            "legacy_server_id",
+            "target_host_id",
+            "cutover_authorization",
+        }
+        or envelope.get("schema")
+        != "chutes.legacy-gpu-cutover-authorization-envelope"
+        or envelope.get("version") != 1
+        or envelope.get("legacy_server_id") != state["legacy_server_id"]
+        or envelope.get("target_host_id") != state["target_host_id"]
+        or not isinstance(envelope.get("cutover_authorization"), str)
+        or not envelope["cutover_authorization"]
+    ):
+        raise LegacyCutoverError("persisted authorization envelope is malformed")
+    return envelope["cutover_authorization"]
 
 
 def _generation(root: str) -> int:
@@ -528,9 +588,15 @@ def _capture_source_state(bundle: dict[str, Any], boot_id: str) -> dict[str, Any
         "version": 1,
         "phase": "prepared",
         "boot_id": boot_id,
+        "last_boot_id": boot_id,
         "legacy_server_id": bundle["legacy_server_id"],
-        "cutover_authorization": bundle["cutover_authorization"],
         "target_host_id": bundle["target_host_id"],
+        "connection": {
+            "validator_api": bundle["validator_api"].rstrip("/"),
+            "cert_path": bundle["cert_path"],
+            "key_path": bundle["key_path"],
+            "ca_path": bundle["ca_path"],
+        },
         "storage_luks_uuid": _output(
             ["cryptsetup", "luksUUID", storage_device],
             "legacy storage LUKS UUID",
@@ -563,7 +629,7 @@ def _closure_document(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": "chutes.gpu-legacy-close-request",
         "version": 1,
-        "cutover_authorization": state["cutover_authorization"],
+        "cutover_authorization": _load_authorization(state),
         "target_host_id": state["target_host_id"],
         "storage_luks_uuid": state["storage_luks_uuid"],
         "storage_filesystem_uuid": state["storage_filesystem_uuid"],
@@ -605,6 +671,13 @@ def _require_state_bundle_identity(
     if (
         state["legacy_server_id"] != bundle["legacy_server_id"]
         or state["target_host_id"] != bundle["target_host_id"]
+        or state["connection"]
+        != {
+            "validator_api": bundle["validator_api"].rstrip("/"),
+            "cert_path": bundle["cert_path"],
+            "key_path": bundle["key_path"],
+            "ca_path": bundle["ca_path"],
+        }
     ):
         raise LegacyCutoverError("persisted cutover state belongs to different custody")
 
@@ -621,19 +694,42 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     )
     if state is not None and state["phase"] == "transfer_acknowledged":
         _unlink_private(CLOSURE_PATH)
+        _unlink_private(AUTHORIZATION_PATH)
         _unlink_private(bundle_path)
         if _run(["systemctl", "poweroff", "--no-block"]).returncode != 0:
             raise LegacyCutoverError("legacy guest could not resume final poweroff")
         return state["api_result"]
 
     _verify_shutdown_helper()
-    bundle = _load_bundle(bundle_path)
-    if state is None or state["boot_id"] != current_boot_id:
-        state = _capture_source_state(bundle, current_boot_id)
-        _write_private_json(CUTOVER_STATE_PATH, state)
+    bundle = _load_bundle(bundle_path) if Path(bundle_path).exists() else None
+    if state is None:
+        if bundle is None:
+            raise LegacyCutoverError("cutover has neither prepared state nor an input bundle")
+        _persist_authorization(
+            legacy_server_id=bundle["legacy_server_id"],
+            target_host_id=bundle["target_host_id"],
+            token=bundle["cutover_authorization"],
+        )
+        try:
+            state = _capture_source_state(bundle, current_boot_id)
+            _write_private_json(CUTOVER_STATE_PATH, state)
+        except Exception:
+            if not Path(CUTOVER_STATE_PATH).exists():
+                _unlink_private(AUTHORIZATION_PATH)
+            raise
         _unlink_private(CLOSURE_PATH)
     else:
-        _require_state_bundle_identity(state, bundle)
+        if bundle is not None:
+            _require_state_bundle_identity(state, bundle)
+            _persist_authorization(
+                legacy_server_id=state["legacy_server_id"],
+                target_host_id=state["target_host_id"],
+                token=bundle["cutover_authorization"],
+            )
+        if state["last_boot_id"] != current_boot_id:
+            state = dict(state)
+            state["last_boot_id"] = current_boot_id
+            _write_private_json(CUTOVER_STATE_PATH, state)
 
     if state["phase"] == "prepared":
         if _run([K3S_SHUTDOWN_HELPER]).returncode != 0:
@@ -672,20 +768,29 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
         if Path(CLOSURE_PATH).exists():
             closure = _load_closure(CLOSURE_PATH)
             if closure != expected_closure:
-                raise LegacyCutoverError(
-                    "persisted closure differs from closed source evidence"
-                )
+                without_authorization = dict(closure)
+                without_authorization.pop("cutover_authorization", None)
+                expected_without_authorization = dict(expected_closure)
+                expected_without_authorization.pop("cutover_authorization", None)
+                if without_authorization != expected_without_authorization:
+                    raise LegacyCutoverError(
+                        "persisted closure differs from closed source evidence"
+                    )
+                closure = expected_closure
+                _write_private_json(CLOSURE_PATH, closure)
         else:
             closure = expected_closure
             _write_private_json(CLOSURE_PATH, closure)
 
-        context = ssl.create_default_context(cafile=bundle["ca_path"] or None)
-        context.load_cert_chain(bundle["cert_path"], bundle["key_path"])
+        connection = state["connection"]
+        context = ssl.create_default_context(cafile=connection["ca_path"] or None)
+        context.load_cert_chain(connection["cert_path"], connection["key_path"])
         connector = aiohttp.TCPConnector(ssl=context)
-        target = f"/servers/gpu/{bundle['legacy_server_id']}/legacy-migration/close"
+        target = f"/servers/gpu/{state['legacy_server_id']}/legacy-migration/close"
         async with aiohttp.ClientSession(
-            base_url=bundle["validator_api"].rstrip("/"),
+            base_url=connection["validator_api"],
             connector=connector,
+            timeout=aiohttp.ClientTimeout(total=30, connect=10),
         ) as session:
             async with session.post(
                 target, json=closure, allow_redirects=False
@@ -697,7 +802,12 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
                     )
         if (
             not isinstance(result, dict)
+            or set(result)
+            != {"schema", "version", "migration_id", "legacy_server_id", "status"}
             or result.get("schema") != "chutes.gpu-legacy-closed"
+            or result.get("version") != 1
+            or not isinstance(result.get("migration_id"), str)
+            or not result["migration_id"]
             or result.get("legacy_server_id") != state["legacy_server_id"]
             or result.get("status") != "guest_closed"
         ):
@@ -707,6 +817,7 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
             "version": 1,
             "phase": "transfer_acknowledged",
             "boot_id": state["boot_id"],
+            "last_boot_id": state["last_boot_id"],
             "legacy_server_id": state["legacy_server_id"],
             "target_host_id": state["target_host_id"],
             "closure_sha256": hashlib.sha256(_canonical_json(closure)).hexdigest(),
@@ -714,6 +825,7 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
         }
         _write_private_json(CUTOVER_STATE_PATH, acknowledged)
         _unlink_private(CLOSURE_PATH)
+        _unlink_private(AUTHORIZATION_PATH)
         _unlink_private(bundle_path)
         state = acknowledged
 
@@ -737,6 +849,17 @@ def recover_legacy_cutover() -> None:
     action = "poweroff" if state["phase"] == "transfer_acknowledged" else "reboot"
     if _run(["systemctl", action, "--no-block"]).returncode != 0:
         raise LegacyCutoverError(f"legacy recovery {action} failed")
+
+
+def enforce_reboot_fence() -> None:
+    """Fail a RequiredBy probe while any transferred-source state remains."""
+    if not Path(CUTOVER_STATE_PATH).exists():
+        return
+    state = _load_cutover_state(CUTOVER_STATE_PATH)
+    raise LegacyCutoverError(
+        "legacy GPU cutover state fences K3s and legacy storage unlock "
+        f"through irreversible guest retirement: {state['phase']}"
+    )
 
 
 def run(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:

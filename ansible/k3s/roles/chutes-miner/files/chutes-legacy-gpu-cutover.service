@@ -1,8 +1,9 @@
 [Unit]
 Description=One-use legacy GPU custody cutover
-Requires=chutes-legacy-kubeconfig-prepare.service
-After=network-online.target k3s.service chutes-legacy-kubeconfig-prepare.service
+After=network-online.target
 Wants=network-online.target
+ConditionPathExists=|/run/chutes/legacy-gpu-cutover.json
+ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json
 
 [Service]
 Type=oneshot

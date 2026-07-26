@@ -1,0 +1,12 @@
+[Unit]
+Description=Fence K3s and legacy GPU storage during unfinished custody cutover
+DefaultDependencies=no
+Before=k3s.service systemd-cryptsetup@storage.service systemd-cryptsetup@tdx\x2dcache.service
+ConditionPathExists=/var/lib/chutes/legacy-gpu-cutover/state.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chutes-miner l0 gpu-legacy-cutover-fence
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/chutes/legacy-gpu-cutover

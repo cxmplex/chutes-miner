@@ -33,7 +33,9 @@ def test_normal_boot_copies_before_source_purge(monkeypatch, tmp_path):
     drop_in = (
         ROOT / "ansible/k3s/roles/chutes-miner/files/legacy-cutover-kubeconfig.conf"
     ).read_text(encoding="utf-8")
-    assert "Requires=chutes-legacy-kubeconfig-prepare.service" in service
+    assert "Requires=chutes-legacy-kubeconfig-prepare.service" not in service
+    assert "ConditionPathExists=|/run/chutes/legacy-gpu-cutover.json" in service
+    assert "ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json" in service
     assert "Before=k3s-post-start.service" in prepare_service
     assert "Requires=chutes-legacy-kubeconfig-prepare.service" in drop_in
     assert "KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml" in service

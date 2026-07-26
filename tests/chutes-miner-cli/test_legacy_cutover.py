@@ -32,9 +32,15 @@ def _source_state(phase: str = "prepared") -> dict:
         "version": 1,
         "phase": phase,
         "boot_id": BOOT_ID,
+        "last_boot_id": BOOT_ID,
         "legacy_server_id": "legacy-server",
         "target_host_id": "host-1",
-        "cutover_authorization": "authorization",
+        "connection": {
+            "validator_api": "https://validator.example",
+            "cert_path": "/cert",
+            "key_path": "/key",
+            "ca_path": "",
+        },
         "storage_luks_uuid": "storage-luks",
         "storage_filesystem_uuid": "storage-fs",
         "storage_generation": 4,
@@ -52,11 +58,14 @@ def _acknowledged_state() -> dict:
         "version": 1,
         "phase": "transfer_acknowledged",
         "boot_id": BOOT_ID,
+        "last_boot_id": BOOT_ID,
         "legacy_server_id": "legacy-server",
         "target_host_id": "host-1",
         "closure_sha256": "a" * 64,
         "api_result": {
             "schema": "chutes.gpu-legacy-closed",
+            "version": 1,
+            "migration_id": "migration-1",
             "legacy_server_id": "legacy-server",
             "status": "guest_closed",
         },
@@ -66,10 +75,20 @@ def _acknowledged_state() -> dict:
 def _patch_runtime(monkeypatch, tmp_path, state: dict | None = None):
     state_path = tmp_path / "state.json"
     closure_path = tmp_path / "closure.json"
+    authorization_path = tmp_path / "authorization.json"
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text("bundle", encoding="ascii")
     monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
     monkeypatch.setattr(legacy_cutover, "CLOSURE_PATH", str(closure_path))
+    monkeypatch.setattr(legacy_cutover, "AUTHORIZATION_PATH", str(authorization_path))
+    legacy_cutover._persist_authorization(
+        legacy_server_id="legacy-server",
+        target_host_id="host-1",
+        token="authorization",
+    )
+    monkeypatch.setattr(
+        legacy_cutover, "_load_authorization", lambda _state: "authorization"
+    )
     monkeypatch.setattr(legacy_cutover.os, "geteuid", lambda: 0)
     monkeypatch.setattr(legacy_cutover.os, "sync", lambda: None)
     monkeypatch.setattr(legacy_cutover, "_verify_host_mount_namespace", lambda: None)
@@ -125,6 +144,8 @@ def _patch_successful_api(monkeypatch, events, posted):
         async def json(self):
             return {
                 "schema": "chutes.gpu-legacy-closed",
+                "version": 1,
+                "migration_id": "migration-1",
                 "legacy_server_id": "legacy-server",
                 "status": "guest_closed",
             }
@@ -252,6 +273,127 @@ async def test_restart_resumes_each_phase_without_repeating_prior_work(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    ["prepared", "k3s_quiesced", "filesystems_unmounted", "mappers_closed"],
+)
+async def test_reboot_resumes_every_phase_without_ephemeral_bundle(
+    monkeypatch,
+    tmp_path,
+    phase,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state(phase),
+    )
+    bundle_path.unlink()
+    new_boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    monkeypatch.setattr(legacy_cutover, "_boot_id", lambda: new_boot_id)
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_capture_source_state",
+        lambda *_args: pytest.fail("cross-boot recovery recaptured mutable source state"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_run",
+        lambda _argv: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(legacy_cutover, "_unmount", lambda _path: None)
+    monkeypatch.setattr(legacy_cutover, "_close_mapper", lambda _name: None)
+    _patch_tls(monkeypatch)
+    _patch_successful_api(monkeypatch, [], [])
+
+    await legacy_cutover.run_cutover(str(bundle_path))
+    persisted = json.loads(state_path.read_text(encoding="ascii"))
+    assert persisted["phase"] == "transfer_acknowledged"
+    assert persisted["boot_id"] == BOOT_ID
+    assert persisted["last_boot_id"] == new_boot_id
+
+
+@pytest.mark.asyncio
+async def test_authorization_rebind_rewrites_only_token_in_persisted_closure(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("mappers_closed"),
+    )
+    bundle_path.unlink()
+    old_closure = {
+        **legacy_cutover._closure_document(_source_state("mappers_closed")),
+        "cutover_authorization": "old-authorization",
+    }
+    closure_path.write_text(json.dumps(old_closure), encoding="ascii")
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_closure",
+        lambda path: json.loads(Path(path).read_text(encoding="ascii")),
+    )
+    monkeypatch.setattr(
+        legacy_cutover, "_load_authorization", lambda _state: "new-authorization"
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_run",
+        lambda _argv: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    posted = []
+    _patch_tls(monkeypatch)
+    _patch_successful_api(monkeypatch, [], posted)
+
+    await legacy_cutover.run_cutover(str(bundle_path))
+    assert posted[0]["cutover_authorization"] == "new-authorization"
+    for key, value in old_closure.items():
+        if key != "cutover_authorization":
+            assert posted[0][key] == value
+    assert json.loads(state_path.read_text(encoding="ascii"))["phase"] == (
+        "transfer_acknowledged"
+    )
+
+
+def test_rebind_persists_one_canonical_authorization_envelope(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    authorization_path = tmp_path / "authorization.json"
+    state_path.write_text("state", encoding="ascii")
+    monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
+    monkeypatch.setattr(legacy_cutover, "AUTHORIZATION_PATH", str(authorization_path))
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_cutover_state",
+        lambda _path=None: _source_state("mappers_closed"),
+    )
+
+    legacy_cutover.rebind_closure_authorization("replacement-token")
+    envelope = json.loads(authorization_path.read_text(encoding="ascii"))
+    assert envelope == {
+        "schema": "chutes.legacy-gpu-cutover-authorization-envelope",
+        "version": 1,
+        "legacy_server_id": "legacy-server",
+        "target_host_id": "host-1",
+        "cutover_authorization": "replacement-token",
+    }
+
+
+def test_acknowledged_state_rejects_noncontract_api_receipt_fields(monkeypatch):
+    state = _acknowledged_state()
+    state["api_result"]["unexpected"] = "must-not-persist"
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_private_json",
+        lambda _path, _label: state,
+    )
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="transfer acknowledgement is malformed",
+    ):
+        legacy_cutover._load_cutover_state("unused")
+
+
+@pytest.mark.asyncio
 async def test_lost_api_response_replays_exact_persisted_closure(monkeypatch, tmp_path):
     state_path, closure_path, bundle_path = _patch_runtime(
         monkeypatch,
@@ -285,6 +427,8 @@ async def test_lost_api_response_replays_exact_persisted_closure(monkeypatch, tm
         async def json(self):
             return {
                 "schema": "chutes.gpu-legacy-closed",
+                "version": 1,
+                "migration_id": "migration-1",
                 "legacy_server_id": "legacy-server",
                 "status": "guest_closed",
             }
@@ -371,6 +515,33 @@ def test_recovery_cannot_reopen_source_after_closure_may_have_reached_api(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        _source_state("prepared"),
+        _source_state("k3s_quiesced"),
+        _source_state("filesystems_unmounted"),
+        _source_state("mappers_closed"),
+        _acknowledged_state(),
+    ],
+)
+def test_reboot_fence_blocks_storage_and_k3s_until_guest_retirement(
+    monkeypatch,
+    tmp_path,
+    state,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("state", encoding="ascii")
+    monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_cutover_state",
+        lambda _path=None: state,
+    )
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match="fences K3s"):
+        legacy_cutover.enforce_reboot_fence()
+
+
 def test_private_json_fsyncs_file_and_directory(monkeypatch, tmp_path):
     calls = []
     modes = []
@@ -416,6 +587,12 @@ def test_cutover_service_and_dependencies_are_exactly_pinned():
     service = (role / "files/chutes-legacy-gpu-cutover.service").read_text(
         encoding="utf-8"
     )
+    fence_service = (
+        role / "files/chutes-legacy-gpu-cutover-fence.service"
+    ).read_text(encoding="utf-8")
+    fence_dropin = (role / "files/legacy-cutover-fence.conf").read_text(
+        encoding="utf-8"
+    )
     tasks = (role / "tasks/main.yml").read_text(encoding="utf-8")
     defaults = (role / "defaults/main.yml").read_text(encoding="utf-8")
     helper = role / "files/k3s-killall-v1.33.1+k3s1.sh"
@@ -428,6 +605,11 @@ def test_cutover_service_and_dependencies_are_exactly_pinned():
     )
     assert "PrivateTmp=yes" in service
     assert "ProtectSystem=strict" in service
+    assert "ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json" in service
+    assert "DefaultDependencies=no" in fence_service
+    assert "gpu-legacy-cutover-fence" in fence_service
+    assert "Requires=chutes-legacy-gpu-cutover-fence.service" in fence_dropin
+    assert "systemd-cryptsetup@tdx\\x2dcache.service" in tasks
     assert '"util-linux={{ legacy_cutover_util_linux_version }}"' in tasks
     assert '"psmisc={{ legacy_cutover_psmisc_version }}"' in tasks
     assert "checksum_algorithm: sha256" in tasks
@@ -489,8 +671,13 @@ async def test_missing_admin_kubeconfig_fails_before_quiesce(monkeypatch, tmp_pa
     closure_path = tmp_path / "closure.json"
     bundle = _bundle() | {"kubeconfig_path": str(tmp_path / "missing-kubeconfig")}
     calls = []
+    bundle_path = tmp_path / "bundle"
+    bundle_path.write_text("bundle", encoding="ascii")
     monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
     monkeypatch.setattr(legacy_cutover, "CLOSURE_PATH", str(closure_path))
+    monkeypatch.setattr(
+        legacy_cutover, "AUTHORIZATION_PATH", str(tmp_path / "authorization.json")
+    )
     monkeypatch.setattr(legacy_cutover.os, "geteuid", lambda: 0)
     monkeypatch.setattr(legacy_cutover, "_verify_host_mount_namespace", lambda: None)
     monkeypatch.setattr(legacy_cutover, "_verify_shutdown_helper", lambda: None)
@@ -507,6 +694,7 @@ async def test_missing_admin_kubeconfig_fails_before_quiesce(monkeypatch, tmp_pa
         legacy_cutover.LegacyCutoverError,
         match="kubeconfig is unavailable",
     ):
-        await legacy_cutover.run_cutover(str(tmp_path / "bundle"))
+        await legacy_cutover.run_cutover(str(bundle_path))
     assert not state_path.exists()
+    assert not Path(legacy_cutover.AUTHORIZATION_PATH).exists()
     assert [legacy_cutover.K3S_SHUTDOWN_HELPER] not in calls
