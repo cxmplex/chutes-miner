@@ -319,3 +319,67 @@ def test_down_exclusive_lock_blocks_concurrent_writer_without_catalog_changes():
                 holder.stdin.flush()
             holder.communicate(timeout=5)
         _assert_ok(_psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'))
+
+
+def test_deployment_before_server_lock_order_avoids_parent_child_deadlock():
+    schema = f"miner_teardown_order_{uuid.uuid4().hex}"
+    _assert_ok(_psql(f'CREATE SCHEMA "{schema}";'))
+    child = None
+    try:
+        _create_deployed_baseline(schema)
+        _assert_ok(
+            _psql(
+                """
+                INSERT INTO servers VALUES ('server-1');
+                INSERT INTO chutes VALUES ('chute-1');
+                INSERT INTO deployments (deployment_id, chute_id, server_id) VALUES
+                    ('deployment-1', 'chute-1', 'server-1'),
+                    ('deployment-2', 'chute-1', 'server-1');
+                """,
+                schema=schema,
+            )
+        )
+        url, environment = _connection(schema=schema, lock_timeout="3s")
+        child = subprocess.Popen(
+            ["psql", url, "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        child.stdin.write(
+            "BEGIN;\n"
+            "SELECT deployment_id FROM deployments "
+            "WHERE deployment_id = 'deployment-2' FOR UPDATE;\n"
+            "SELECT 'CHILD_LOCKED';\n"
+            "SELECT pg_sleep(0.5);\n"
+            "SELECT server_id FROM servers WHERE server_id = 'server-1' FOR UPDATE;\n"
+            "COMMIT;\n"
+        )
+        child.stdin.flush()
+        while child.stdout.readline().strip() != "CHILD_LOCKED":
+            assert child.poll() is None, child.stderr.read()
+
+        parent = _psql(
+            """
+            BEGIN;
+            SELECT deployment_id FROM deployments
+            WHERE server_id = 'server-1'
+            ORDER BY deployment_id
+            FOR UPDATE;
+            SELECT server_id FROM servers WHERE server_id = 'server-1' FOR UPDATE;
+            COMMIT;
+            """,
+            schema=schema,
+            lock_timeout="3s",
+        )
+        _assert_ok(parent)
+        _stdout, stderr = child.communicate(timeout=5)
+        assert child.returncode == 0, stderr
+    finally:
+        if child is not None and child.poll() is None:
+            child.stdin.write("ROLLBACK;\\q\n")
+            child.stdin.flush()
+            child.communicate(timeout=5)
+        _assert_ok(_psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'))

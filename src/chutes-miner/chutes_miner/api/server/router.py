@@ -7,7 +7,6 @@ from typing import Optional
 import aiohttp
 from chutes_miner.api.k8s.config import KubeConfig
 from loguru import logger
-import orjson as json
 from fastapi import APIRouter, Depends, HTTPException, status
 from starlette.responses import StreamingResponse
 from sqlalchemy import select, exists, or_
@@ -191,19 +190,21 @@ async def delete_server(
     Remove a kubernetes node from the cluster.
     """
     server = await _get_server(db, id_or_name)
-    await settings.redis_client.publish(
-        "miner_events",
-        json.dumps(
-            {
-                "event_type": "server_deleted",
-                "event_data": {
-                    "server_id": server.server_id,
-                },
-            }
-        ).decode(),
+    gepetto = Gepetto()
+    operation_id = await gepetto.teardown.request_parent(
+        "server",
+        server.server_id,
+        "management_delete_server",
     )
+    if operation_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Server deletion could not be durably requested.",
+        )
+    asyncio.create_task(gepetto.teardown.run_parent(operation_id))
     return {
         "status": "started",
+        "operation_id": operation_id,
         "detail": f"Deletion of {server.name=} {server.server_id=} started, and will be processed asynchronously by gepetto.",
     }
 

@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import aiohttp
 from chutes_common.auth import sign_request
+from chutes_common.exceptions import AgentError
 from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
 from chutes_common.schemas.gpu import GPU
@@ -1801,17 +1802,6 @@ class DeploymentTeardownCoordinator:
                     return None
                 return existing.operation_id
             if parent_type == "server":
-                parent = (
-                    (
-                        await session.execute(
-                            select(Server)
-                            .where(Server.server_id == parent_id)
-                            .with_for_update(of=Server)
-                        )
-                    )
-                    .unique()
-                    .scalar_one_or_none()
-                )
                 deployments = (
                     (
                         await session.execute(
@@ -1826,6 +1816,17 @@ class DeploymentTeardownCoordinator:
                     .scalars()
                     .all()
                 )
+                parent = (
+                    (
+                        await session.execute(
+                            select(Server)
+                            .where(Server.server_id == parent_id)
+                            .with_for_update(of=Server)
+                        )
+                    )
+                    .unique()
+                    .scalar_one_or_none()
+                )
                 snapshot = {
                     "name": parent.name,
                     "agent_api": parent.agent_api,
@@ -1833,13 +1834,6 @@ class DeploymentTeardownCoordinator:
                     "node_generation": parent.kubernetes_node_generation,
                 } if parent else None
             else:
-                parent = (
-                    await session.execute(
-                        select(Chute)
-                        .where(Chute.chute_id == parent_id)
-                        .with_for_update(of=Chute)
-                    )
-                ).scalar_one_or_none()
                 deployments = (
                     (
                         await session.execute(
@@ -1854,6 +1848,13 @@ class DeploymentTeardownCoordinator:
                     .scalars()
                     .all()
                 )
+                parent = (
+                    await session.execute(
+                        select(Chute)
+                        .where(Chute.chute_id == parent_id)
+                        .with_for_update(of=Chute)
+                    )
+                ).scalar_one_or_none()
                 snapshot = {"version": parent.version, "name": parent.name} if parent else None
             if parent is None:
                 return None
@@ -2042,6 +2043,24 @@ class DeploymentTeardownCoordinator:
                                 stop_server_monitoring(agent_api), timeout=30
                             )
                             monitor_ack = {"status": "stopped", "agent_api": agent_api}
+                        except AgentError as exc:
+                            try:
+                                await asyncio.wait_for(
+                                    clear_server_cache(snapshot["name"]), timeout=30
+                                )
+                            except Exception as cache_exc:
+                                raise DeploymentFailure(
+                                    "server monitor cache clear was not acknowledged"
+                                ) from cache_exc
+                            if exc.status_code == 409:
+                                monitor_ack = {
+                                    "status": "already_absent",
+                                    "agent_api": agent_api,
+                                }
+                            else:
+                                raise DeploymentFailure(
+                                    f"server monitor stop was not acknowledged: {exc}"
+                                ) from exc
                         except Exception as exc:
                             try:
                                 await asyncio.wait_for(

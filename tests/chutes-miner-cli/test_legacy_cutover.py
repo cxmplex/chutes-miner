@@ -623,6 +623,44 @@ def test_cutover_rejects_service_private_mount_namespace(monkeypatch):
     legacy_cutover._verify_host_mount_namespace()
 
 
+def test_cutover_holder_probes_use_supported_silent_fuser_argv(monkeypatch):
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(legacy_cutover, "_run", run)
+    monkeypatch.setattr(legacy_cutover, "_mountpoint", lambda _path: True)
+    monkeypatch.setattr(legacy_cutover.os.path, "exists", lambda _path: True)
+
+    legacy_cutover._require_no_mount_holders("/cache/storage")
+    legacy_cutover._require_no_mapper_holders("tdx-cache")
+
+    assert calls == [
+        ["/usr/bin/fuser", "-s", "-m", "/cache/storage"],
+        ["/usr/bin/fuser", "-s", "/dev/mapper/tdx-cache"],
+    ]
+
+
+@pytest.mark.parametrize("returncode", [0, 2])
+def test_cutover_holder_probes_fail_closed(monkeypatch, returncode):
+    monkeypatch.setattr(legacy_cutover, "_mountpoint", lambda _path: True)
+    monkeypatch.setattr(legacy_cutover.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_run",
+        lambda _argv: SimpleNamespace(returncode=returncode, stdout="", stderr=""),
+    )
+
+    mount_message = "open holders" if returncode == 0 else "holders are unavailable"
+    mapper_message = "open holders" if returncode == 0 else "holders are unavailable"
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match=mount_message):
+        legacy_cutover._require_no_mount_holders("/cache/storage")
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match=mapper_message):
+        legacy_cutover._require_no_mapper_holders("tdx-cache")
+
+
 def test_cutover_service_and_dependencies_are_exactly_pinned():
     root = Path(__file__).resolve().parents[2]
     source = (

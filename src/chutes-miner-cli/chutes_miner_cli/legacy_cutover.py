@@ -405,7 +405,7 @@ def _mountpoint(path: str) -> bool:
 def _require_no_mount_holders(path: str) -> None:
     if not _mountpoint(path):
         return
-    result = _run(["/usr/bin/fuser", "-m", "--", path])
+    result = _run(["/usr/bin/fuser", "-s", "-m", path])
     if result.returncode == 0:
         raise LegacyCutoverError(f"legacy mount still has open holders: {path}")
     if result.returncode != 1:
@@ -433,7 +433,7 @@ def _require_no_mapper_holders(name: str) -> None:
     mapper = f"/dev/mapper/{name}"
     if not os.path.exists(mapper):
         return
-    result = _run(["/usr/bin/fuser", "--", mapper])
+    result = _run(["/usr/bin/fuser", "-s", mapper])
     if result.returncode == 0:
         raise LegacyCutoverError(f"legacy mapper still has open holders: {name}")
     if result.returncode != 1:

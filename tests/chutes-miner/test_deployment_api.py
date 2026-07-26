@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 
 from chutes_miner.api.deployment.router import router, purge, purge_deployment
 from chutes_common.schemas.deployment import Deployment
-from chutes_miner.api.server.router import purge_server
+from chutes_miner.api.server.router import delete_server, purge_server
 
 # Create test app
 app = FastAPI()
@@ -21,6 +21,8 @@ def _durable_gepetto(operation_id="operation-1"):
     teardown = SimpleNamespace(
         request=AsyncMock(return_value=operation_id),
         run=AsyncMock(return_value=True),
+        request_parent=AsyncMock(return_value=operation_id),
+        run_parent=AsyncMock(return_value=True),
     )
     return SimpleNamespace(teardown=teardown)
 
@@ -179,6 +181,36 @@ async def test_purge_server_endpoint(mock_db_session, mock_deployment):
             mock_gepetto.teardown.request.assert_awaited_once_with(
                 "test-deployment-id", "management_purge_server"
             )
+
+
+@pytest.mark.asyncio
+async def test_delete_server_persists_parent_operation_before_scheduling(mock_db_session):
+    server = SimpleNamespace(server_id="server-1", name="node-a")
+    gepetto = _durable_gepetto("parent-operation-1")
+
+    def schedule_after_persist(coroutine):
+        coroutine.close()
+        gepetto.teardown.request_parent.assert_awaited_once_with(
+            "server", "server-1", "management_delete_server"
+        )
+        return MagicMock()
+
+    with (
+        patch(
+            "chutes_miner.api.server.router._get_server",
+            new=AsyncMock(return_value=server),
+        ),
+        patch("chutes_miner.api.server.router.Gepetto", return_value=gepetto),
+        patch(
+            "chutes_miner.api.server.router.asyncio.create_task",
+            side_effect=schedule_after_persist,
+        ),
+    ):
+        response = await delete_server("server-1", db=mock_db_session)
+
+    assert response["status"] == "started"
+    assert response["operation_id"] == "parent-operation-1"
+    gepetto.teardown.run_parent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

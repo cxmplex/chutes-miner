@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from chutes_common.exceptions import AgentError
 from chutes_miner.api.deployment import teardown
 from chutes_miner.api.deployment.teardown import (
     DirectKubernetesClosure,
@@ -547,7 +548,52 @@ async def test_parent_deletion_readopts_children_before_external_work(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_server_monitor_failure_is_not_persisted_as_an_ack(monkeypatch):
+async def test_parent_request_locks_sorted_deployments_before_server(monkeypatch):
+    deployment = SimpleNamespace(deployment_id="deployment-1")
+    parent = SimpleNamespace(
+        validator="validator-1",
+        name="node-a",
+        agent_api="https://agent",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    child = SimpleNamespace(operation_id="child-operation-1")
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(None),
+                _QueryResult([deployment]),
+                _QueryResult(parent),
+            ]
+        ),
+        add=lambda _value: None,
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
+    )
+    coordinator._request_in_session = AsyncMock(return_value=child)
+
+    operation_id = await coordinator.request_parent(
+        "server", "server-1", "management_delete_server"
+    )
+
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert operation_id
+    assert "FROM deployments" in statements[1]
+    assert "ORDER BY deployments.deployment_id" in statements[1]
+    assert "FROM servers" in statements[2]
+
+
+@pytest.mark.asyncio
+async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatch):
     operation = SimpleNamespace(
         operation_id="parent-1",
         parent_type="server",
@@ -557,14 +603,25 @@ async def test_server_monitor_failure_is_not_persisted_as_an_ack(monkeypatch):
         retry_lease_expires_at=None,
         attempt_count=0,
         last_failure=None,
-        snapshot={"agent_api": "https://agent", "name": "node-a"},
+        validator="validator-1",
+        snapshot={
+            "agent_api": "https://agent",
+            "name": "node-a",
+            "node_uid": None,
+            "node_generation": None,
+        },
         monitor_stop_ack=None,
         monitor_stopped_at=None,
         validator_server_deletion_ack=None,
+        validator_server_deleted_at=None,
     )
     session = SimpleNamespace(
         get=AsyncMock(return_value=operation),
         scalar=AsyncMock(return_value=None),
+        execute=AsyncMock(
+            side_effect=[_QueryResult(None), _QueryResult(None)]
+        ),
+        flush=AsyncMock(),
         commit=AsyncMock(),
     )
 
@@ -573,7 +630,12 @@ async def test_server_monitor_failure_is_not_persisted_as_an_ack(monkeypatch):
         yield session
 
     monkeypatch.setattr(teardown, "get_session", fake_session)
-    stop = AsyncMock(side_effect=ConnectionError("response lost"))
+    stop = AsyncMock(
+        side_effect=[
+            ConnectionError("response lost"),
+            AgentError("monitor is already absent", status_code=409),
+        ]
+    )
     clear = AsyncMock()
     monkeypatch.setattr("chutes_miner.api.server.util.stop_server_monitoring", stop)
     monkeypatch.setattr("chutes_miner.api.server.util.clear_server_cache", clear)
@@ -581,12 +643,24 @@ async def test_server_monitor_failure_is_not_persisted_as_an_ack(monkeypatch):
         kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
     )
     coordinator._adopt_parent_children = AsyncMock(return_value=[])
+    coordinator._delete_validator_server = AsyncMock(
+        return_value={"status": "already_absent", "server_id": "server-1"}
+    )
 
     assert await coordinator.run_parent("parent-1") is False
     assert operation.monitor_stop_ack is None
     assert operation.monitor_stopped_at is None
     assert "was not acknowledged" in operation.last_failure
-    clear.assert_awaited_once_with("node-a")
+    assert await coordinator.run_parent("parent-1") is True
+    assert operation.monitor_stop_ack == {
+        "status": "already_absent",
+        "agent_api": "https://agent",
+    }
+    assert operation.monitor_stopped_at is not None
+    assert operation.phase == "completed"
+    assert operation.last_failure is None
+    assert stop.await_count == 2
+    assert clear.await_count == 2
 
 
 @pytest.mark.asyncio
