@@ -36,6 +36,8 @@ def test_normal_boot_copies_before_source_purge(monkeypatch, tmp_path):
     assert "Requires=chutes-legacy-kubeconfig-prepare.service" not in service
     assert "ConditionPathExists=|/run/chutes/legacy-gpu-cutover.json" in service
     assert "ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json" in service
+    assert "ConditionPathExists=|/etc/chutes/legacy-gpu-cutover/fence.json" in service
+    assert "RequiresMountsFor=/var/lib/chutes/legacy-gpu-cutover" in service
     assert "Before=k3s-post-start.service" in prepare_service
     assert "Requires=chutes-legacy-kubeconfig-prepare.service" in drop_in
     assert "KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml" in service

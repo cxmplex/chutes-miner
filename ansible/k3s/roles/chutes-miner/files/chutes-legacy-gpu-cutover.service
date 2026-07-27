@@ -2,8 +2,10 @@
 Description=One-use legacy GPU custody cutover
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/var/lib/chutes/legacy-gpu-cutover
 ConditionPathExists=|/run/chutes/legacy-gpu-cutover.json
 ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json
+ConditionPathExists=|/etc/chutes/legacy-gpu-cutover/fence.json
 
 [Service]
 Type=oneshot
@@ -15,7 +17,7 @@ ExecStopPost=/usr/bin/rm -f /run/chutes/legacy-k3s-admin.yaml
 RemainAfterExit=no
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/run/chutes /cache/storage /var/snap /var/lib/rancher /var/lib/kubelet /var/lib/chutes /etc/rancher /etc/admission-controller
+ReadWritePaths=/run/chutes /cache/storage /var/snap /var/lib/rancher /var/lib/kubelet /var/lib/chutes /etc/chutes/legacy-gpu-cutover /etc/rancher /etc/admission-controller
 NoNewPrivileges=yes
 TimeoutStartSec=600
 

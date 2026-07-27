@@ -33,6 +33,14 @@
     group: root
     mode: "0700"
 
+- name: Create root-visible legacy cutover fence directory
+  ansible.builtin.file:
+    path: /etc/chutes/legacy-gpu-cutover
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
 - name: Install checksum-pinned K3s shutdown helper
   ansible.builtin.copy:
     src: k3s-killall-v1.33.1+k3s1.sh
@@ -96,6 +104,8 @@
     - k3s.service
     - systemd-cryptsetup@storage.service
     - systemd-cryptsetup@tdx\x2dcache.service
+    - cache-storage.mount
+    - var-snap.mount
 
 - name: Require the cutover fence before K3s or legacy mapper unlock
   ansible.builtin.copy:
@@ -108,6 +118,8 @@
     - k3s.service
     - systemd-cryptsetup@storage.service
     - systemd-cryptsetup@tdx\x2dcache.service
+    - cache-storage.mount
+    - var-snap.mount
 
 - name: Create k3s post-start drop-in directory
   ansible.builtin.file:
