@@ -230,6 +230,83 @@ def test_followup_failed_down_preserves_catalog_and_history():
         _assert_ok(_psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'))
 
 
+def test_followup_triggers_require_validator_job_release_ack():
+    schema = f"miner_lifecycle_job_ack_{uuid.uuid4().hex}"
+    _assert_ok(_psql(f'CREATE SCHEMA "{schema}";'))
+    try:
+        _create_deployed_baseline(schema)
+        _assert_ok(_psql(f"BEGIN;\n{FOLLOWUP_UP}\nCOMMIT;", schema=schema))
+        _assert_ok(
+            _psql(
+                """
+                INSERT INTO servers (server_id) VALUES ('server-1');
+                INSERT INTO chutes (chute_id) VALUES ('chute-1');
+                INSERT INTO deployments (deployment_id, chute_id, server_id)
+                VALUES
+                    ('deployment-gpu', 'chute-1', 'server-1'),
+                    ('deployment-delete', 'chute-1', 'server-1');
+                INSERT INTO gpus (gpu_id, server_id, deployment_id)
+                VALUES ('gpu-1', 'server-1', 'deployment-gpu');
+                INSERT INTO deployment_teardown_operations (
+                    operation_id, deployment_id, phase, reason, validator,
+                    server_id, chute_id, job_id, cluster_context,
+                    cluster_context_sha256, namespace,
+                    kubernetes_node_generation, gpu_hardware_uuids,
+                    immutable_labels, controllers_absent_at,
+                    services_absent_at, pods_absent_at
+                ) VALUES
+                    (
+                        'operation-gpu', 'deployment-gpu', 'finalizing', 'delete',
+                        'validator-1', 'server-1', 'chute-1', 'job-gpu', 'node-1',
+                        repeat('a', 64), 'chutes', 1, '["GPU-1"]', '{}',
+                        NOW(), NOW(), NOW()
+                    ),
+                    (
+                        'operation-delete', 'deployment-delete', 'finalizing', 'delete',
+                        'validator-1', 'server-1', 'chute-1', 'job-delete', 'node-1',
+                        repeat('b', 64), 'chutes', 1, '[]', '{}',
+                        NOW(), NOW(), NOW()
+                    );
+                UPDATE deployments
+                SET teardown_operation_id = CASE deployment_id
+                    WHEN 'deployment-gpu' THEN 'operation-gpu'
+                    ELSE 'operation-delete'
+                END;
+                """,
+                schema=schema,
+            )
+        )
+
+        gpu_release = _psql(
+            "UPDATE gpus SET deployment_id = NULL WHERE gpu_id = 'gpu-1';",
+            schema=schema,
+        )
+        assert gpu_release.returncode != 0
+        assert b"cannot be released before teardown" in gpu_release.stderr
+        deployment_delete = _psql(
+            "DELETE FROM deployments WHERE deployment_id = 'deployment-delete';",
+            schema=schema,
+        )
+        assert deployment_delete.returncode != 0
+        assert b"has no verified durable teardown" in deployment_delete.stderr
+
+        _assert_ok(
+            _psql(
+                """
+                UPDATE deployment_teardown_operations
+                SET validator_job_release_ack = '{"status":"released"}',
+                    validator_job_released_at = NOW();
+                UPDATE gpus SET deployment_id = NULL WHERE gpu_id = 'gpu-1';
+                DELETE FROM deployments
+                WHERE deployment_id IN ('deployment-gpu', 'deployment-delete');
+                """,
+                schema=schema,
+            )
+        )
+    finally:
+        _assert_ok(_psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'))
+
+
 def test_followup_down_lock_blocks_concurrent_writer_without_catalog_changes():
     schema = f"miner_lifecycle_lock_{uuid.uuid4().hex}"
     _assert_ok(_psql(f'CREATE SCHEMA "{schema}";'))

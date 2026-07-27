@@ -28,6 +28,7 @@ from chutes_common.schemas.teardown import (
     DeploymentTeardownOperation,
     KubernetesOrphanTombstone,
     KubernetesOrphanTombstoneResource,
+    MinerLaunchIntent,
     ParentDeletionChild,
     ParentDeletionOperation,
 )
@@ -51,11 +52,11 @@ from sqlalchemy.orm import selectinload
 LEASE_SECONDS = 300
 EXTERNAL_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 DELETE_ORDER = {
-    "Pod": 0,
-    "ReplicaSet": 1,
-    "Job": 2,
-    "Deployment": 2,
-    "Service": 3,
+    "Job": 0,
+    "Deployment": 0,
+    "Service": 1,
+    "ReplicaSet": 2,
+    "Pod": 3,
     "Secret": 4,
 }
 VERIFY_ORDER = {
@@ -68,9 +69,17 @@ VERIFY_ORDER = {
 }
 CONTROLLER_KINDS = frozenset({"Job", "Deployment", "ReplicaSet"})
 EXPECTED_OWNER_KINDS = {
-    "ReplicaSet": frozenset({"Deployment"}),
-    "Pod": frozenset({"Job", "ReplicaSet"}),
+    "ReplicaSet": frozenset({("apps/v1", "Deployment")}),
+    "Pod": frozenset({("batch/v1", "Job"), ("apps/v1", "ReplicaSet")}),
 }
+
+
+class LineageConflict(DeploymentFailure):
+    """A cryptographically/immutably conflicting Kubernetes lineage."""
+
+
+class UnresolvedOwnerLineage(DeploymentFailure):
+    """A same-lineage child whose controller was not in this non-atomic list."""
 
 
 def utc_now() -> datetime:
@@ -113,6 +122,7 @@ class ResourceIdentity:
     namespace: str
     uid: str
     labels: dict[str, str]
+    owner_api_version: str | None
     owner_kind: str | None
     owner_name: str | None
     owner_uid: str | None
@@ -290,18 +300,25 @@ def authorized_node_incarnation_handoff_values(
     }
 
 
-def _owner(metadata: Any) -> tuple[str | None, str | None, str | None]:
+def _owner(
+    metadata: Any,
+) -> tuple[str | None, str | None, str | None, str | None]:
     references = list(getattr(metadata, "owner_references", None) or [])
     if not references:
-        return None, None, None
+        return None, None, None, None
     controller = next((ref for ref in references if getattr(ref, "controller", False)), None)
     reference = controller or references[0]
-    return str(reference.kind), str(reference.name), str(reference.uid)
+    return (
+        str(reference.api_version),
+        str(reference.kind),
+        str(reference.name),
+        str(reference.uid),
+    )
 
 
 def _identity(kind: str, resource: Any) -> ResourceIdentity:
     metadata = resource.metadata
-    owner_kind, owner_name, owner_uid = _owner(metadata)
+    owner_api_version, owner_kind, owner_name, owner_uid = _owner(metadata)
     node_name = None
     if kind == "Pod":
         node_name = getattr(resource.spec, "node_name", None)
@@ -315,6 +332,7 @@ def _identity(kind: str, resource: Any) -> ResourceIdentity:
         namespace=str(metadata.namespace),
         uid=str(metadata.uid),
         labels=dict(metadata.labels or {}),
+        owner_api_version=owner_api_version,
         owner_kind=owner_kind,
         owner_name=owner_name,
         owner_uid=owner_uid,
@@ -326,29 +344,83 @@ def replacement_matches(
     *,
     expected_labels: dict[str, str],
     expected_node_name: str,
-    accepted_owner_uids: set[str],
+    accepted_owners: dict[str, tuple[str, str, str]],
     resource: ResourceIdentity,
 ) -> bool:
-    """Return true only for a replacement in the immutable workload lineage."""
+    """Validate the full typed owner chain for a same-lineage resource."""
     if resource.kind == "Secret":
         config_id = expected_labels.get("chutes/config-id")
-        return bool(
-            config_id
-            and resource.labels.get("chutes/launch-config-id") == config_id
-            and resource.owner_uid is None
-        )
+        if not config_id or resource.labels.get("chutes/launch-config-id") != config_id:
+            raise LineageConflict("Secret launch configuration lineage conflicts")
+        if any(
+            value is not None
+            for value in (
+                resource.owner_api_version,
+                resource.owner_kind,
+                resource.owner_name,
+                resource.owner_uid,
+            )
+        ):
+            raise LineageConflict("Secret unexpectedly has an owner")
+        return True
     for key in expected_labels:
         if resource.labels.get(key) != expected_labels.get(key):
-            return False
-    if resource.node_name and resource.node_name != expected_node_name:
-        return False
+            raise LineageConflict(f"{resource.kind} immutable labels conflict")
+    if resource.kind in {"Job", "Deployment", "Pod"}:
+        if resource.node_name != expected_node_name:
+            raise LineageConflict(f"{resource.kind} stable node lineage conflicts")
     expected_owner_kinds = EXPECTED_OWNER_KINDS.get(resource.kind)
     if expected_owner_kinds is None:
-        return resource.owner_uid is None
-    return bool(
-        resource.owner_kind in expected_owner_kinds
-        and resource.owner_uid in accepted_owner_uids
-    )
+        if any(
+            value is not None
+            for value in (
+                resource.owner_api_version,
+                resource.owner_kind,
+                resource.owner_name,
+                resource.owner_uid,
+            )
+        ):
+            raise LineageConflict(f"{resource.kind} unexpectedly has an owner")
+        return True
+    owner_type = (resource.owner_api_version, resource.owner_kind)
+    if owner_type not in expected_owner_kinds:
+        raise LineageConflict(f"{resource.kind} owner type conflicts")
+    if not resource.owner_uid:
+        raise LineageConflict(f"{resource.kind} owner UID is missing")
+    accepted = accepted_owners.get(resource.owner_uid)
+    if accepted is None:
+        raise UnresolvedOwnerLineage(
+            f"{resource.kind} owner {resource.owner_uid} was not observed"
+        )
+    if accepted != (
+        resource.owner_api_version,
+        resource.owner_kind,
+        resource.owner_name,
+    ):
+        raise LineageConflict(f"{resource.kind} owner identity conflicts")
+    return True
+
+
+def _accept_owner(
+    accepted: dict[str, tuple[str, str, str]], resource: ResourceIdentity
+) -> None:
+    accepted[resource.uid] = (resource.api_version, resource.kind, resource.name)
+
+
+def _resource_delete_ready(resource: Any, resources: Iterable[Any]) -> bool:
+    """Delete children only after their captured controller is directly absent."""
+    by_uid = {item.uid: item for item in resources}
+    if resource.owner_uid:
+        owner = by_uid.get(resource.owner_uid)
+        if owner is not None and owner.state not in {"absent", "replaced"}:
+            return False
+    if resource.kind == "Secret":
+        return all(
+            item.state in {"absent", "replaced"}
+            for item in resources
+            if item.kind in {"Job", "Deployment", "ReplicaSet", "Pod"}
+        )
+    return True
 
 
 class DirectKubernetesClosure:
@@ -574,11 +646,32 @@ class DeploymentTeardownCoordinator:
             )
             if launch is None or launch.deployment_id != deployment.deployment_id:
                 raise DeploymentFailure("deployment launch journal binding is invalid")
+            if launch.launch_intent_id and not all(
+                (
+                    launch.cluster_context,
+                    launch.cluster_context_sha256,
+                    launch.namespace,
+                    launch.server_name,
+                )
+            ):
+                raise DeploymentFailure(
+                    "durable miner launch lacks its original Kubernetes context closure"
+                )
             was_creating = launch.phase == "creating"
             launch.phase = "teardown_fenced"
             if not was_creating:
                 launch.lease_owner = None
                 launch.lease_expires_at = None
+            if launch.launch_intent_id:
+                intent = await session.get(
+                    MinerLaunchIntent,
+                    launch.launch_intent_id,
+                    with_for_update=True,
+                )
+                if intent is None or intent.deployment_id != deployment.deployment_id:
+                    raise DeploymentFailure("deployment launch intent binding is invalid")
+                if intent.phase != "completed":
+                    intent.phase = "cleanup_required"
         existing = (
             (
                 await session.execute(
@@ -636,9 +729,12 @@ class DeploymentTeardownCoordinator:
             config_id=deployment.config_id,
             job_id=deployment.job_id,
             instance_id=deployment.instance_id,
-            cluster_context=server.name,
-            cluster_context_sha256=cluster_context_sha256(server),
-            namespace=settings.namespace,
+            cluster_context=(launch.cluster_context if launch else None) or server.name,
+            cluster_context_sha256=(
+                (launch.cluster_context_sha256 if launch else None)
+                or cluster_context_sha256(server)
+            ),
+            namespace=(launch.namespace if launch else None) or settings.namespace,
             kubernetes_node_uid=server.kubernetes_node_uid,
             kubernetes_node_generation=server.kubernetes_node_generation,
             registration_attestation_id=server.registration_attestation_id,
@@ -967,6 +1063,7 @@ class DeploymentTeardownCoordinator:
                         kind=resource.kind,
                         name=resource.name,
                         uid=resource.uid,
+                        owner_api_version=resource.owner_api_version,
                         owner_kind=resource.owner_kind,
                         owner_name=resource.owner_name,
                         owner_uid=resource.owner_uid,
@@ -976,6 +1073,72 @@ class DeploymentTeardownCoordinator:
                     )
                 )
             operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
+            await session.commit()
+
+    async def _adopt_replacement(
+        self,
+        operation_id: str,
+        live: ResourceIdentity,
+        *,
+        predecessor_resource_id: str | None = None,
+    ) -> None:
+        """Atomically bind a successor and return the operation to deletion."""
+        async with get_session() as session:
+            operation = await session.get(
+                DeploymentTeardownOperation,
+                operation_id,
+                with_for_update=True,
+            )
+            if (
+                operation is None
+                or operation.retry_lease_owner != self.worker_id
+                or operation.phase != "verifying"
+            ):
+                raise DeploymentFailure("teardown changed during replacement adoption")
+            successor = (
+                await session.execute(
+                    select(DeploymentTeardownK8sResource)
+                    .where(
+                        DeploymentTeardownK8sResource.operation_id == operation_id,
+                        DeploymentTeardownK8sResource.kind == live.kind,
+                        DeploymentTeardownK8sResource.uid == live.uid,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if successor is None:
+                successor = DeploymentTeardownK8sResource(
+                    resource_id=str(uuid.uuid4()),
+                    operation_id=operation_id,
+                    cluster_context=operation.cluster_context,
+                    namespace=live.namespace,
+                    api_version=live.api_version,
+                    kind=live.kind,
+                    name=live.name,
+                    uid=live.uid,
+                    owner_api_version=live.owner_api_version,
+                    owner_kind=live.owner_kind,
+                    owner_name=live.owner_name,
+                    owner_uid=live.owner_uid,
+                    node_name=live.node_name,
+                    labels=live.labels,
+                    labels_sha256=live.labels_sha256,
+                )
+                session.add(successor)
+                await session.flush()
+            if predecessor_resource_id:
+                predecessor = await session.get(
+                    DeploymentTeardownK8sResource,
+                    predecessor_resource_id,
+                    with_for_update=True,
+                )
+                if predecessor is None or predecessor.operation_id != operation_id:
+                    raise DeploymentFailure("replacement predecessor binding changed")
+                predecessor.state = "replaced"
+                predecessor.replaced_by_resource_id = successor.resource_id
+            operation.phase = "deleting"
+            operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
+            operation.last_failure = None
             await session.commit()
 
     async def _require_launch_quiesced(self, deployment_id: str) -> None:
@@ -1010,35 +1173,34 @@ class DeploymentTeardownCoordinator:
             config_id=operation.config_id,
         )
         await self._renew_operation_lease(operation.operation_id, "discovering")
-        accepted_owner_uids: set[str] = set()
-        for resource in resources:
-            if resource.kind in {"Job", "Deployment", "Service", "Secret"} and replacement_matches(
-                expected_labels=operation.immutable_labels,
-                expected_node_name=operation.cluster_context,
-                accepted_owner_uids=accepted_owner_uids,
-                resource=resource,
-            ):
-                accepted_owner_uids.add(resource.uid)
+        accepted_owners: dict[str, tuple[str, str, str]] = {}
         pending = list(resources)
         changed = True
         while changed:
             changed = False
             for resource in list(pending):
-                if replacement_matches(
-                    expected_labels=operation.immutable_labels,
-                    expected_node_name=operation.cluster_context,
-                    accepted_owner_uids=accepted_owner_uids,
-                    resource=resource,
-                ):
-                    accepted_owner_uids.add(resource.uid)
-                    pending.remove(resource)
-                    changed = True
+                try:
+                    replacement_matches(
+                        expected_labels=operation.immutable_labels,
+                        expected_node_name=operation.cluster_context,
+                        accepted_owners=accepted_owners,
+                        resource=resource,
+                    )
+                except UnresolvedOwnerLineage:
+                    continue
+                except LineageConflict as exc:
+                    await self._record_conflict(operation.operation_id, str(exc))
+                    raise
+                _accept_owner(accepted_owners, resource)
+                pending.remove(resource)
+                changed = True
         if pending:
             identities = ", ".join(
                 f"{resource.kind}/{resource.name}:{resource.uid}" for resource in pending
             )
-            await self._record_conflict(operation.operation_id, f"lineage conflict: {identities}")
-            raise DeploymentFailure("Kubernetes resource lineage conflict")
+            raise UnresolvedOwnerLineage(
+                f"Kubernetes owner lineage was not observed: {identities}"
+            )
         await self._record_resources(operation.operation_id, resources)
         await self._advance(operation.operation_id, "discovering", "revoking")
 
@@ -1076,6 +1238,35 @@ class DeploymentTeardownCoordinator:
             chute_id=operation.chute_id,
             instance_id=operation.instance_id,
         )
+
+    async def _release_validator_job(
+        self,
+        operation: DeploymentTeardownOperation,
+    ) -> dict[str, Any]:
+        if not operation.job_id:
+            return {"status": "not_required", "job_id": None}
+        validator = validator_by_hotkey(operation.validator)
+        if validator is None:
+            raise DeploymentFailure("validator job owner is unavailable")
+        headers, _ = sign_request(purpose="miner")
+        async with aiohttp.ClientSession(
+            raise_for_status=False,
+            timeout=EXTERNAL_HTTP_TIMEOUT,
+        ) as http:
+            async with http.delete(
+                f"{validator.api}/miner/jobs/{operation.job_id}",
+                headers=headers,
+            ) as response:
+                body = await response.read()
+                if response.status not in {200, 404}:
+                    raise DeploymentFailure(
+                        f"validator job release returned HTTP {response.status}"
+                    )
+        return {
+            "status": "released" if response.status == 200 else "already_absent",
+            "job_id": operation.job_id,
+            "response_sha256": hashlib.sha256(body).hexdigest(),
+        }
 
     async def _delete_validator_instance_exact(
         self,
@@ -1271,6 +1462,23 @@ class DeploymentTeardownCoordinator:
                 )
                 await session.commit()
             operation = await self._load(operation.operation_id)
+        if operation.job_id and operation.validator_job_release_ack is None:
+            ack = await self._release_validator_job(operation)
+            async with get_session() as session:
+                current = await session.get(
+                    DeploymentTeardownOperation,
+                    operation.operation_id,
+                    with_for_update=True,
+                )
+                if current.retry_lease_owner != self.worker_id or current.phase != "revoking":
+                    raise DeploymentFailure("teardown changed during validator job release")
+                current.validator_job_release_ack = ack
+                current.validator_job_released_at = utc_now()
+                current.retry_lease_expires_at = utc_now() + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                await session.commit()
+            operation = await self._load(operation.operation_id)
         if operation.instance_id and operation.validator_instance_deletion_ack is None:
             ack = await self._delete_validator_instance(operation)
             async with get_session() as session:
@@ -1294,7 +1502,8 @@ class DeploymentTeardownCoordinator:
             (
                 resource
                 for resource in operation.resources
-                if resource.state not in {"absent", "replaced"}
+                if resource.state == "observed"
+                and _resource_delete_ready(resource, operation.resources)
             ),
             key=lambda item: (DELETE_ORDER[item.kind], item.name, item.uid),
         )
@@ -1317,9 +1526,11 @@ class DeploymentTeardownCoordinator:
                 if current and outcome == "absent":
                     current.state = "absent"
                     current.absent_at = utc_now()
+                    resource.state = "absent"
                 elif current and outcome == "delete_requested" and current.state == "observed":
                     current.state = "delete_requested"
                     current.delete_requested_at = utc_now()
+                    resource.state = "delete_requested"
                 await session.commit()
         await self._advance(operation.operation_id, "deleting", "verifying")
 
@@ -1337,10 +1548,9 @@ class DeploymentTeardownCoordinator:
             await session.commit()
 
     async def _verify(self, operation: DeploymentTeardownOperation) -> bool:
-        accepted_owner_uids = {
-            resource.uid
+        accepted_owners = {
+            resource.uid: (resource.api_version, resource.kind, resource.name)
             for resource in operation.resources
-            if resource.state != "replaced"
         }
         delete_needed = False
         absence_pending = False
@@ -1368,40 +1578,38 @@ class DeploymentTeardownCoordinator:
                     current.state = "absent"
                     current.absent_at = utc_now()
                     await session.commit()
+                resource.state = "absent"
                 continue
             if live.uid == resource.uid:
-                absence_pending = True
+                if resource.state == "observed" and _resource_delete_ready(
+                    resource, operation.resources
+                ):
+                    delete_needed = True
+                else:
+                    absence_pending = True
                 continue
-            if not replacement_matches(
-                expected_labels=operation.immutable_labels,
-                expected_node_name=operation.cluster_context,
-                accepted_owner_uids=accepted_owner_uids,
-                resource=live,
-            ):
+            try:
+                replacement_matches(
+                    expected_labels=operation.immutable_labels,
+                    expected_node_name=operation.cluster_context,
+                    accepted_owners=accepted_owners,
+                    resource=live,
+                )
+            except UnresolvedOwnerLineage as exc:
+                await self._pause_for_retry(operation.operation_id, str(exc))
+                return False
+            except LineageConflict as exc:
                 await self._record_conflict(
                     operation.operation_id,
-                    f"lineage conflict for replacement {live.kind}/{live.name}:{live.uid}",
+                    str(exc),
                 )
                 return False
-            await self._record_resources(operation.operation_id, [live])
-            async with get_session() as session:
-                old = await session.get(
-                    DeploymentTeardownK8sResource,
-                    resource.resource_id,
-                    with_for_update=True,
-                )
-                replacement_id = await session.scalar(
-                    select(DeploymentTeardownK8sResource.resource_id).where(
-                        DeploymentTeardownK8sResource.operation_id == operation.operation_id,
-                        DeploymentTeardownK8sResource.kind == live.kind,
-                        DeploymentTeardownK8sResource.uid == live.uid,
-                    )
-                )
-                old.state = "replaced"
-                old.replaced_by_resource_id = replacement_id
-                await session.commit()
-            accepted_owner_uids.add(live.uid)
-            delete_needed = True
+            await self._adopt_replacement(
+                operation.operation_id,
+                live,
+                predecessor_resource_id=resource.resource_id,
+            )
+            return True
 
         await self._require_launch_quiesced(operation.deployment_id)
         current = await asyncio.to_thread(
@@ -1420,20 +1628,24 @@ class DeploymentTeardownCoordinator:
             if resource.uid in known_uids:
                 absence_pending = True
                 continue
-            if not replacement_matches(
-                expected_labels=operation.immutable_labels,
-                expected_node_name=operation.cluster_context,
-                accepted_owner_uids=accepted_owner_uids,
-                resource=resource,
-            ):
+            try:
+                replacement_matches(
+                    expected_labels=operation.immutable_labels,
+                    expected_node_name=operation.cluster_context,
+                    accepted_owners=accepted_owners,
+                    resource=resource,
+                )
+            except UnresolvedOwnerLineage as exc:
+                await self._pause_for_retry(operation.operation_id, str(exc))
+                return False
+            except LineageConflict as exc:
                 await self._record_conflict(
                     operation.operation_id,
-                    f"lineage conflict for new {resource.kind}/{resource.name}:{resource.uid}",
+                    str(exc),
                 )
                 return False
-            await self._record_resources(operation.operation_id, [resource])
-            accepted_owner_uids.add(resource.uid)
-            delete_needed = True
+            await self._adopt_replacement(operation.operation_id, resource)
+            return True
 
         if delete_needed:
             await self._advance(operation.operation_id, "verifying", "deleting")
@@ -1495,6 +1707,7 @@ class DeploymentTeardownCoordinator:
                 and current.pods_absent_at
                 and (not current.config_id or current.registry_revocation_ack)
                 and (not current.config_id or current.pull_secret_deletion_ack)
+                and (not current.job_id or current.validator_job_release_ack)
                 and (not current.instance_id or current.validator_instance_deletion_ack)
             ):
                 raise DeploymentFailure("teardown finalization lacks persisted acknowledgements")
@@ -1594,6 +1807,22 @@ class DeploymentTeardownCoordinator:
                 if deployment.teardown_operation_id != current.operation_id:
                     raise DeploymentFailure("deployment is bound to another teardown")
                 await session.delete(deployment)
+            if current.config_id:
+                launch_intent_id = await session.scalar(
+                    select(DeploymentLaunchOperation.launch_intent_id).where(
+                        DeploymentLaunchOperation.deployment_id == current.deployment_id
+                    )
+                )
+                if launch_intent_id:
+                    intent = await session.get(
+                        MinerLaunchIntent,
+                        launch_intent_id,
+                        with_for_update=True,
+                    )
+                    if intent is not None and intent.phase == "cleanup_required":
+                        intent.phase = "completed"
+                        intent.completed_at = utc_now()
+                        intent.last_failure = None
             current.phase = "completed"
             current.completed_at = utc_now()
             current.retry_lease_owner = None
@@ -2245,6 +2474,69 @@ class DeploymentTeardownCoordinator:
             await session.commit()
             return tombstone.tombstone_id
 
+    async def _adopt_orphan_replacement(
+        self,
+        tombstone_id: str,
+        live: ResourceIdentity,
+        *,
+        predecessor_resource_id: str | None = None,
+    ) -> None:
+        """Atomically bind an orphan successor and resume UID-scoped deletion."""
+        async with get_session() as session:
+            tombstone = await session.get(
+                KubernetesOrphanTombstone,
+                tombstone_id,
+                with_for_update=True,
+            )
+            if (
+                tombstone is None
+                or tombstone.retry_lease_owner != self.worker_id
+                or tombstone.phase != "verifying"
+            ):
+                raise DeploymentFailure("orphan changed during replacement adoption")
+            successor = (
+                await session.execute(
+                    select(KubernetesOrphanTombstoneResource)
+                    .where(
+                        KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id,
+                        KubernetesOrphanTombstoneResource.kind == live.kind,
+                        KubernetesOrphanTombstoneResource.uid == live.uid,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if successor is None:
+                successor = KubernetesOrphanTombstoneResource(
+                    resource_id=str(uuid.uuid4()),
+                    tombstone_id=tombstone_id,
+                    api_version=live.api_version,
+                    kind=live.kind,
+                    name=live.name,
+                    uid=live.uid,
+                    owner_api_version=live.owner_api_version,
+                    owner_kind=live.owner_kind,
+                    owner_name=live.owner_name,
+                    owner_uid=live.owner_uid,
+                    node_name=live.node_name,
+                    labels=live.labels,
+                    labels_sha256=live.labels_sha256,
+                )
+                session.add(successor)
+            if predecessor_resource_id:
+                predecessor = await session.get(
+                    KubernetesOrphanTombstoneResource,
+                    predecessor_resource_id,
+                    with_for_update=True,
+                )
+                if predecessor is None or predecessor.tombstone_id != tombstone_id:
+                    raise DeploymentFailure("orphan replacement predecessor changed")
+                predecessor.state = "absent"
+                predecessor.absent_at = utc_now()
+            tombstone.phase = "deleting"
+            tombstone.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
+            tombstone.last_failure = None
+            await session.commit()
+
     async def run_orphan(self, tombstone_id: str) -> bool:
         async with self._run_lock("orphan", tombstone_id):
             marker = self._claim_owner.set(f"{self.worker_id}:{uuid.uuid4()}")
@@ -2306,23 +2598,28 @@ class DeploymentTeardownCoordinator:
                     config_id=tombstone.immutable_labels.get("chutes/config-id"),
                 )
                 await self._renew_orphan_lease(tombstone_id, "recorded")
-                accepted: set[str] = set()
+                accepted: dict[str, tuple[str, str, str]] = {}
                 pending = list(resources)
                 changed = True
                 while changed:
                     changed = False
                     for resource in list(pending):
-                        if replacement_matches(
-                            expected_labels=tombstone.immutable_labels,
-                            expected_node_name=tombstone.cluster_context,
-                            accepted_owner_uids=accepted,
-                            resource=resource,
-                        ):
-                            accepted.add(resource.uid)
-                            pending.remove(resource)
-                            changed = True
+                        try:
+                            replacement_matches(
+                                expected_labels=tombstone.immutable_labels,
+                                expected_node_name=tombstone.cluster_context,
+                                accepted_owners=accepted,
+                                resource=resource,
+                            )
+                        except UnresolvedOwnerLineage:
+                            continue
+                        _accept_owner(accepted, resource)
+                        pending.remove(resource)
+                        changed = True
                 if pending:
-                    raise DeploymentFailure("orphan resource lineage conflict")
+                    raise UnresolvedOwnerLineage(
+                        "orphan owner lineage was not observed in one direct list"
+                    )
                 async with get_session() as session:
                     current = await session.get(
                         KubernetesOrphanTombstone,
@@ -2338,6 +2635,7 @@ class DeploymentTeardownCoordinator:
                                 kind=resource.kind,
                                 name=resource.name,
                                 uid=resource.uid,
+                                owner_api_version=resource.owner_api_version,
                                 owner_kind=resource.owner_kind,
                                 owner_name=resource.owner_name,
                                 owner_uid=resource.owner_uid,
@@ -2364,7 +2662,12 @@ class DeploymentTeardownCoordinator:
                 )
             if tombstone.phase == "deleting":
                 for resource in sorted(
-                    resources,
+                    (
+                        resource
+                        for resource in resources
+                        if resource.state == "observed"
+                        and _resource_delete_ready(resource, resources)
+                    ),
                     key=lambda item: (DELETE_ORDER[item.kind], item.name, item.uid),
                 ):
                     outcome = await asyncio.to_thread(
@@ -2385,8 +2688,10 @@ class DeploymentTeardownCoordinator:
                         if outcome == "absent":
                             current.state = "absent"
                             current.absent_at = utc_now()
+                            resource.state = "absent"
                         elif outcome == "delete_requested":
                             current.state = "delete_requested"
+                            resource.state = "delete_requested"
                         await session.commit()
                 async with get_session() as session:
                     current = await session.get(
@@ -2398,8 +2703,10 @@ class DeploymentTeardownCoordinator:
                     await session.commit()
                 return await self._run_orphan_claimed(tombstone_id)
 
-            accepted_owner_uids = {resource.uid for resource in resources}
-            replacement_uids: set[str] = set()
+            accepted_owners = {
+                resource.uid: (resource.api_version, resource.kind, resource.name)
+                for resource in resources
+            }
             delete_needed = False
             absence_pending = False
             for resource in sorted(
@@ -2424,45 +2731,28 @@ class DeploymentTeardownCoordinator:
                         current.state = "absent"
                         current.absent_at = utc_now()
                         await session.commit()
+                    resource.state = "absent"
                     continue
                 if live.uid == resource.uid:
-                    absence_pending = True
+                    if resource.state == "observed" and _resource_delete_ready(
+                        resource, resources
+                    ):
+                        delete_needed = True
+                    else:
+                        absence_pending = True
                     continue
-                if not replacement_matches(
+                replacement_matches(
                     expected_labels=tombstone.immutable_labels,
                     expected_node_name=tombstone.cluster_context,
-                    accepted_owner_uids=accepted_owner_uids,
+                    accepted_owners=accepted_owners,
                     resource=live,
-                ):
-                    raise DeploymentFailure("orphan object replacement has conflicting lineage")
-                async with get_session() as session:
-                    old = await session.get(
-                        KubernetesOrphanTombstoneResource,
-                        resource.resource_id,
-                        with_for_update=True,
-                    )
-                    old.state = "absent"
-                    old.absent_at = utc_now()
-                    session.add(
-                        KubernetesOrphanTombstoneResource(
-                            resource_id=str(uuid.uuid4()),
-                            tombstone_id=tombstone_id,
-                            api_version=live.api_version,
-                            kind=live.kind,
-                            name=live.name,
-                            uid=live.uid,
-                            owner_kind=live.owner_kind,
-                            owner_name=live.owner_name,
-                            owner_uid=live.owner_uid,
-                            node_name=live.node_name,
-                            labels=live.labels,
-                            labels_sha256=live.labels_sha256,
-                        )
-                    )
-                    await session.commit()
-                accepted_owner_uids.add(live.uid)
-                replacement_uids.add(live.uid)
-                delete_needed = True
+                )
+                await self._adopt_orphan_replacement(
+                    tombstone_id,
+                    live,
+                    predecessor_resource_id=resource.resource_id,
+                )
+                return await self._run_orphan_claimed(tombstone_id)
             current_resources = await asyncio.to_thread(
                 self.kubernetes.list_resources,
                 cluster_context=tombstone.cluster_context,
@@ -2472,7 +2762,6 @@ class DeploymentTeardownCoordinator:
             )
             await self._renew_orphan_lease(tombstone_id, "verifying")
             known_uids = {resource.uid for resource in resources}
-            known_uids.update(replacement_uids)
             for resource in sorted(
                 current_resources,
                 key=lambda item: (VERIFY_ORDER[item.kind], item.name, item.uid),
@@ -2480,33 +2769,14 @@ class DeploymentTeardownCoordinator:
                 if resource.uid in known_uids:
                     absence_pending = True
                     continue
-                if not replacement_matches(
+                replacement_matches(
                     expected_labels=tombstone.immutable_labels,
                     expected_node_name=tombstone.cluster_context,
-                    accepted_owner_uids=accepted_owner_uids,
+                    accepted_owners=accepted_owners,
                     resource=resource,
-                ):
-                    raise DeploymentFailure("new orphan object has conflicting lineage")
-                async with get_session() as session:
-                    session.add(
-                        KubernetesOrphanTombstoneResource(
-                            resource_id=str(uuid.uuid4()),
-                            tombstone_id=tombstone_id,
-                            api_version=resource.api_version,
-                            kind=resource.kind,
-                            name=resource.name,
-                            uid=resource.uid,
-                            owner_kind=resource.owner_kind,
-                            owner_name=resource.owner_name,
-                            owner_uid=resource.owner_uid,
-                            node_name=resource.node_name,
-                            labels=resource.labels,
-                            labels_sha256=resource.labels_sha256,
-                        )
-                    )
-                    await session.commit()
-                accepted_owner_uids.add(resource.uid)
-                delete_needed = True
+                )
+                await self._adopt_orphan_replacement(tombstone_id, resource)
+                return await self._run_orphan_claimed(tombstone_id)
             if delete_needed:
                 async with get_session() as session:
                     current = await session.get(
@@ -2554,7 +2824,7 @@ class DeploymentTeardownCoordinator:
                 )
                 if current and current.retry_lease_owner == self.worker_id:
                     current.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
-                    if "lineage" in str(exc):
+                    if isinstance(exc, LineageConflict):
                         current.lineage_conflict_at = utc_now()
                     current.retry_lease_owner = None
                     current.retry_lease_expires_at = None

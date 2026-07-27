@@ -4,14 +4,16 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from chutes_common.exceptions import AgentError
 from chutes_miner.api.deployment import teardown
 from chutes_miner.api.deployment.teardown import (
     DirectKubernetesClosure,
+    LineageConflict,
     ResourceIdentity,
+    UnresolvedOwnerLineage,
     authorized_node_incarnation_handoff_values,
     replacement_matches,
 )
@@ -30,12 +32,15 @@ def _resource(
     uid: str,
     *,
     owner_kind: str | None = None,
+    owner_name: str | None = None,
     owner_uid: str | None = None,
     node_name: str | None = "node-a",
     labels: dict[str, str] | None = None,
 ) -> ResourceIdentity:
     return ResourceIdentity(
-        api_version="v1",
+        api_version=(
+            "batch/v1" if kind == "Job" else "apps/v1" if kind in {"Deployment", "ReplicaSet"} else "v1"
+        ),
         kind=kind,
         name=f"resource-{kind.lower()}",
         namespace="chutes",
@@ -46,8 +51,11 @@ def _resource(
             "chutes/chute-id": "chute-1",
             "chutes/config-id": "config-1",
         },
+        owner_api_version=(
+            "batch/v1" if owner_kind == "Job" else "apps/v1" if owner_kind else None
+        ),
         owner_kind=owner_kind,
-        owner_name=f"owner-{owner_kind.lower()}" if owner_kind else None,
+        owner_name=owner_name or (f"resource-{owner_kind.lower()}" if owner_kind else None),
         owner_uid=owner_uid,
         node_name=node_name,
     )
@@ -213,6 +221,280 @@ async def test_teardown_snapshot_uses_locked_server_lineage_before_gpu_rows():
 
 
 @pytest.mark.asyncio
+async def test_teardown_uses_original_launch_context_not_mutable_server_settings():
+    deployment = SimpleNamespace(
+        launch_operation_id="launch-1",
+        teardown_operation_id=None,
+        deployment_id="deployment-1",
+        validator="validator-1",
+        server_id="server-1",
+        chute_id="chute-1",
+        config_id="config-1",
+        job_id=None,
+        instance_id=None,
+        active=True,
+    )
+    launch = SimpleNamespace(
+        operation_id="launch-1",
+        deployment_id="deployment-1",
+        launch_intent_id="intent-1",
+        phase="created",
+        lease_owner=None,
+        lease_expires_at=None,
+        cluster_context="original-node",
+        cluster_context_sha256="a" * 64,
+        namespace="original-namespace",
+        server_name="original-node",
+        create_results={},
+        service_name=None,
+        service_uid=None,
+        secret_name=None,
+        secret_uid=None,
+        job_name=None,
+        job_uid=None,
+    )
+    intent = SimpleNamespace(
+        deployment_id="deployment-1",
+        phase="completed",
+    )
+    mutable_server = SimpleNamespace(
+        name="renamed-node",
+        kubeconfig="changed-kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=1,
+        registration_attestation_id="attestation-1",
+        gpu_allocation_group_id="group-1",
+        gpu_allocation_group_generation=1,
+    )
+    gpu = SimpleNamespace(gpu_id="gpu-1", hardware_uuid="GPU-1")
+
+    async def get(model, *_args, **_kwargs):
+        return launch if model.__name__ == "DeploymentLaunchOperation" else intent
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(None),
+                _QueryResult(mutable_server),
+                _QueryResult([gpu]),
+            ]
+        ),
+        add=Mock(),
+        flush=AsyncMock(),
+        scalar=AsyncMock(return_value=None),
+    )
+
+    operation = await teardown.DeploymentTeardownCoordinator()._request_in_session(
+        session,
+        deployment,
+        "delete",
+    )
+
+    assert operation.cluster_context == "original-node"
+    assert operation.cluster_context_sha256 == "a" * 64
+    assert operation.namespace == "original-namespace"
+
+
+@pytest.mark.asyncio
+async def test_replacement_adoption_commits_successor_predecessor_and_phase_atomically(
+    monkeypatch,
+):
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        retry_lease_owner=coordinator.worker_id,
+        retry_lease_expires_at=None,
+        phase="verifying",
+        cluster_context="node-a",
+        last_failure="old",
+    )
+    predecessor = SimpleNamespace(
+        resource_id="resource-old",
+        operation_id="operation-1",
+        state="delete_requested",
+        replaced_by_resource_id=None,
+    )
+    added = []
+
+    async def get(model, identity, **_kwargs):
+        if model.__name__ == "DeploymentTeardownOperation":
+            return operation
+        return predecessor if identity == "resource-old" else None
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(return_value=_QueryResult(None)),
+        add=lambda value: added.append(value),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    replacement = _resource("Job", "job-new")
+    await coordinator._adopt_replacement(
+        "operation-1",
+        replacement,
+        predecessor_resource_id="resource-old",
+    )
+
+    assert len(added) == 1
+    assert added[0].uid == "job-new"
+    assert predecessor.state == "replaced"
+    assert predecessor.replaced_by_resource_id == added[0].resource_id
+    assert operation.phase == "deleting"
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_orphan_replacement_adoption_is_one_durable_transition(monkeypatch):
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    tombstone = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        retry_lease_owner=coordinator.worker_id,
+        retry_lease_expires_at=None,
+        phase="verifying",
+        last_failure="old",
+    )
+    predecessor = SimpleNamespace(
+        resource_id="resource-old",
+        tombstone_id="tombstone-1",
+        state="delete_requested",
+        absent_at=None,
+    )
+    added = []
+
+    async def get(model, identity, **_kwargs):
+        if model.__name__ == "KubernetesOrphanTombstone":
+            return tombstone
+        return predecessor if identity == "resource-old" else None
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(return_value=_QueryResult(None)),
+        add=lambda value: added.append(value),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    replacement = _resource("Job", "job-new")
+    await coordinator._adopt_orphan_replacement(
+        "tombstone-1",
+        replacement,
+        predecessor_resource_id="resource-old",
+    )
+
+    assert len(added) == 1
+    assert added[0].uid == "job-new"
+    assert predecessor.state == "absent"
+    assert predecessor.absent_at is not None
+    assert tombstone.phase == "deleting"
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(delete_resource=Mock(return_value="delete_requested"))
+    )
+    job = SimpleNamespace(
+        resource_id="job-row",
+        kind="Job",
+        name="job-1",
+        uid="job-uid",
+        namespace="chutes",
+        owner_uid=None,
+        state="observed",
+        delete_requested_at=None,
+    )
+    pod = SimpleNamespace(
+        resource_id="pod-row",
+        kind="Pod",
+        name="pod-1",
+        uid="pod-uid",
+        namespace="chutes",
+        owner_uid="job-uid",
+        state="observed",
+        delete_requested_at=None,
+    )
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        cluster_context="node-a",
+        resources=[pod, job],
+    )
+    by_id = {"job-row": job, "pod-row": pod}
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=lambda _model, identity, **_kwargs: by_id[identity]),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator._renew_operation_lease = AsyncMock()
+    coordinator._advance = AsyncMock()
+
+    await coordinator._delete_resources(operation)
+    assert coordinator.kubernetes.delete_resource.call_args.kwargs["kind"] == "Job"
+    assert coordinator.kubernetes.delete_resource.call_count == 1
+    assert pod.state == "observed"
+
+    job.state = "absent"
+    await coordinator._delete_resources(operation)
+    assert coordinator.kubernetes.delete_resource.call_count == 2
+    assert coordinator.kubernetes.delete_resource.call_args.kwargs["kind"] == "Pod"
+
+
+@pytest.mark.asyncio
+async def test_validator_job_release_ack_is_required_and_retryable(monkeypatch):
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        phase="revoking",
+        retry_lease_owner=coordinator.worker_id,
+        retry_lease_expires_at=None,
+        config_id=None,
+        job_id="job-1",
+        validator_job_release_ack=None,
+        validator_job_released_at=None,
+        instance_id=None,
+    )
+    coordinator._release_validator_job = AsyncMock(
+        side_effect=DeploymentFailure("validator unavailable")
+    )
+    coordinator._advance = AsyncMock()
+    with pytest.raises(DeploymentFailure, match="validator unavailable"):
+        await coordinator._revoke(operation)
+    assert operation.validator_job_release_ack is None
+    coordinator._advance.assert_not_awaited()
+
+    ack = {"status": "already_absent", "job_id": "job-1"}
+    coordinator._release_validator_job = AsyncMock(return_value=ack)
+    coordinator._load = AsyncMock(return_value=operation)
+    session = SimpleNamespace(get=AsyncMock(return_value=operation), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    await coordinator._revoke(operation)
+    assert operation.validator_job_release_ack == ack
+    assert operation.validator_job_released_at is not None
+    coordinator._advance.assert_awaited_once_with("operation-1", "revoking", "deleting")
+
+
+@pytest.mark.asyncio
 async def test_old_generation_teardown_persists_authorized_node_rotation(monkeypatch):
     operation, deployment, server, gpus, history = _rotation_lineage()
     added = []
@@ -319,7 +601,7 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
     assert replacement_matches(
         expected_labels=EXPECTED_LABELS,
         expected_node_name="node-a",
-        accepted_owner_uids=set(),
+        accepted_owners={},
         resource=replacement_job,
     )
     replacement_pod = _resource(
@@ -331,31 +613,24 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
     assert replacement_matches(
         expected_labels=EXPECTED_LABELS,
         expected_node_name="node-a",
-        accepted_owner_uids={"job-new"},
+        accepted_owners={"job-new": ("batch/v1", "Job", "resource-job")},
         resource=replacement_pod,
     )
-    assert not replacement_matches(
-        expected_labels=EXPECTED_LABELS,
-        expected_node_name="node-a",
-        accepted_owner_uids={"job-new"},
-        resource=_resource(
-            "Pod",
-            "pod-conflict",
-            owner_kind="Job",
-            owner_uid="other-job",
-        ),
-    )
-    assert not replacement_matches(
-        expected_labels=EXPECTED_LABELS,
-        expected_node_name="node-a",
-        accepted_owner_uids=set(),
-        resource=_resource("Job", "wrong-node", node_name="node-b"),
-    )
-    assert not replacement_matches(
-        expected_labels=EXPECTED_LABELS,
-        expected_node_name="node-a",
-        accepted_owner_uids=set(),
-        resource=_resource(
+    with pytest.raises(UnresolvedOwnerLineage):
+        replacement_matches(
+            expected_labels=EXPECTED_LABELS,
+            expected_node_name="node-a",
+            accepted_owners={"job-new": ("batch/v1", "Job", "resource-job")},
+            resource=_resource(
+                "Pod",
+                "pod-conflict",
+                owner_kind="Job",
+                owner_uid="other-job",
+            ),
+        )
+    for conflict in (
+        _resource("Job", "wrong-node", node_name="node-b"),
+        _resource(
             "Service",
             "missing-config",
             labels={
@@ -363,24 +638,33 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
                 "chutes/chute-id": "chute-1",
             },
         ),
-    )
-    assert not replacement_matches(
-        expected_labels={**EXPECTED_LABELS, "chutes/job-id": "job-1"},
-        expected_node_name="node-a",
-        accepted_owner_uids=set(),
-        resource=_resource(
+        _resource(
             "Job",
             "wrong-job",
             labels={**EXPECTED_LABELS, "chutes/job-id": "job-2"},
         ),
-    )
+    ):
+        with pytest.raises(LineageConflict):
+            replacement_matches(
+                expected_labels={
+                    **EXPECTED_LABELS,
+                    **(
+                        {"chutes/job-id": "job-1"}
+                        if conflict.uid == "wrong-job"
+                        else {}
+                    ),
+                },
+                expected_node_name="node-a",
+                accepted_owners={},
+                resource=conflict,
+            )
 
 
 def test_registry_secret_replacement_requires_exact_launch_config_lineage():
     assert replacement_matches(
         expected_labels=EXPECTED_LABELS,
         expected_node_name="node-a",
-        accepted_owner_uids=set(),
+        accepted_owners={},
         resource=_resource(
             "Secret",
             "secret-new",
@@ -388,17 +672,18 @@ def test_registry_secret_replacement_requires_exact_launch_config_lineage():
             labels={"chutes/launch-config-id": "config-1"},
         ),
     )
-    assert not replacement_matches(
-        expected_labels=EXPECTED_LABELS,
-        expected_node_name="node-a",
-        accepted_owner_uids=set(),
-        resource=_resource(
-            "Secret",
-            "secret-conflict",
-            node_name=None,
-            labels={"chutes/launch-config-id": "config-2"},
-        ),
-    )
+    with pytest.raises(LineageConflict):
+        replacement_matches(
+            expected_labels=EXPECTED_LABELS,
+            expected_node_name="node-a",
+            accepted_owners={},
+            resource=_resource(
+                "Secret",
+                "secret-conflict",
+                node_name=None,
+                labels={"chutes/launch-config-id": "config-2"},
+            ),
+        )
 
 
 def test_direct_delete_uses_kubernetes_uid_precondition(monkeypatch):
@@ -679,6 +964,9 @@ async def test_inflight_launch_finishes_into_exact_teardown_uid_closure(monkeypa
         lease_owner=token,
         lease_expires_at=object(),
         immutable_labels=EXPECTED_LABELS,
+        canonical_workload_spec={},
+        server_name="node-a",
+        cluster_context="node-a",
         service_name=None,
         service_uid=None,
         create_results={},
@@ -708,7 +996,19 @@ async def test_inflight_launch_finishes_into_exact_teardown_uid_closure(monkeypa
             uid="service-uid",
             labels=EXPECTED_LABELS,
         ),
+        spec=SimpleNamespace(
+            type="NodePort",
+            external_traffic_policy="Local",
+            selector={"chutes/deployment-id": "dep-1"},
+            ports=[],
+            external_i_ps=None,
+            load_balancer_ip=None,
+            load_balancer_source_ranges=None,
+        ),
     )
+    launch.canonical_workload_spec = {
+        "service": k8s_operator.canonical_workload_resource("Service", service)
+    }
 
     with pytest.raises(DeploymentFailure, match="fenced while Kubernetes create"):
         await K8sOperator._record_launch_resource(

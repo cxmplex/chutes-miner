@@ -156,6 +156,69 @@ ALTER TABLE deployment_teardown_operations
         (validator_job_released_at IS NULL)
     );
 
+CREATE OR REPLACE FUNCTION require_finished_deployment_teardown()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM deployment_teardown_operations op
+        WHERE op.deployment_id = OLD.deployment_id
+          AND op.operation_id = OLD.teardown_operation_id
+          AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
+          AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
+          AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
+          AND (op.job_id IS NULL OR op.validator_job_release_ack IS NOT NULL)
+          AND op.controllers_absent_at IS NOT NULL
+          AND op.services_absent_at IS NOT NULL
+          AND op.pods_absent_at IS NOT NULL
+          AND (op.config_id IS NULL OR op.pull_secret_deletion_ack IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'deployment % has no verified durable teardown', OLD.deployment_id
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION require_finished_gpu_teardown()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.deployment_id IS NULL OR (
+        TG_OP = 'UPDATE' AND NEW.deployment_id IS NOT DISTINCT FROM OLD.deployment_id
+    ) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM deployments deployment
+        JOIN deployment_teardown_operations op
+          ON op.operation_id = deployment.teardown_operation_id
+        WHERE deployment.deployment_id = OLD.deployment_id
+          AND op.deployment_id = OLD.deployment_id
+          AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
+          AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
+          AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
+          AND (op.job_id IS NULL OR op.validator_job_release_ack IS NOT NULL)
+          AND op.controllers_absent_at IS NOT NULL
+          AND op.services_absent_at IS NOT NULL
+          AND op.pods_absent_at IS NOT NULL
+          AND (op.config_id IS NULL OR op.pull_secret_deletion_ack IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'GPU ownership for deployment % cannot be released before teardown',
+            OLD.deployment_id USING ERRCODE = '23503';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 ALTER TABLE kubernetes_orphan_tombstone_resources
     ADD COLUMN IF NOT EXISTS owner_api_version TEXT;
 UPDATE kubernetes_orphan_tombstone_resources
@@ -223,6 +286,67 @@ BEGIN
     END IF;
 END
 $$;
+
+CREATE OR REPLACE FUNCTION require_finished_deployment_teardown()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM deployment_teardown_operations op
+        WHERE op.deployment_id = OLD.deployment_id
+          AND op.operation_id = OLD.teardown_operation_id
+          AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
+          AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
+          AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
+          AND op.controllers_absent_at IS NOT NULL
+          AND op.services_absent_at IS NOT NULL
+          AND op.pods_absent_at IS NOT NULL
+          AND (op.config_id IS NULL OR op.pull_secret_deletion_ack IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'deployment % has no verified durable teardown', OLD.deployment_id
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION require_finished_gpu_teardown()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.deployment_id IS NULL OR (
+        TG_OP = 'UPDATE' AND NEW.deployment_id IS NOT DISTINCT FROM OLD.deployment_id
+    ) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM deployments deployment
+        JOIN deployment_teardown_operations op
+          ON op.operation_id = deployment.teardown_operation_id
+        WHERE deployment.deployment_id = OLD.deployment_id
+          AND op.deployment_id = OLD.deployment_id
+          AND op.phase IN ('finalizing', 'completed')
+          AND op.lineage_conflict_at IS NULL
+          AND (op.config_id IS NULL OR op.registry_revocation_ack IS NOT NULL)
+          AND (op.instance_id IS NULL OR op.validator_instance_deletion_ack IS NOT NULL)
+          AND op.controllers_absent_at IS NOT NULL
+          AND op.services_absent_at IS NOT NULL
+          AND op.pods_absent_at IS NOT NULL
+          AND (op.config_id IS NULL OR op.pull_secret_deletion_ack IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'GPU ownership for deployment % cannot be released before teardown',
+            OLD.deployment_id USING ERRCODE = '23503';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
 ALTER TABLE deployment_teardown_operations
     DROP CONSTRAINT IF EXISTS ck_deployment_teardown_job_ack,
