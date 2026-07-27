@@ -58,6 +58,7 @@ from chutes_miner.api.k8s.util import (
     registry_pull_secret_name,
     require_supported_chutes_version,
     resolve_deployment_validator,
+    validated_miner_launch_lineage,
 )
 from kubernetes import watch
 from kubernetes.client import (
@@ -1539,10 +1540,23 @@ class K8sOperator(abc.ABC):
             "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
             "job_id": job_id,
         }
+        try:
+            persisted_lineage = validated_miner_launch_lineage(
+                intent,
+                miner_hotkey=settings.miner_ss58,
+                validator=chute.validator,
+                chute_id=chute.chute_id,
+                chute_version=chute.version,
+                server_id=server.server_id,
+                job_id=job_id,
+                require_gpu_lineage=settings.gpu_tee_only,
+            )
+        except DeploymentFailure:
+            persisted_lineage = None
         if (
             intent is None
             or intent.phase != "registry_acked"
-            or intent.request_payload.get("lineage") != expected_lineage
+            or persisted_lineage != expected_lineage
             or (intent.response_payload or {}).get("config_id") != config_id
             or launch_token_sha256 not in set(intent.authorized_token_sha256s or [])
             or (intent.response_payload or {}).get("registry")
@@ -1670,6 +1684,16 @@ class K8sOperator(abc.ABC):
             or server is None
         ):
             raise DeploymentFailure("durable miner launch lineage disappeared")
+        persisted_lineage = validated_miner_launch_lineage(
+            intent,
+            miner_hotkey=settings.miner_ss58,
+            validator=deployment.validator,
+            chute_id=deployment.chute_id,
+            chute_version=deployment.version,
+            server_id=deployment.server_id,
+            job_id=deployment.job_id,
+            require_gpu_lineage=True,
+        )
         expected_lineage = {
             "schema": "chutes.miner-launch-lineage",
             "version": 1,
@@ -1685,7 +1709,7 @@ class K8sOperator(abc.ABC):
             "job_id": deployment.job_id,
         }
         if (
-            intent.request_payload.get("lineage") != expected_lineage
+            persisted_lineage != expected_lineage
             or server.validator != deployment.validator
             or launch.server_name != server.name
             or launch.cluster_context != server.name

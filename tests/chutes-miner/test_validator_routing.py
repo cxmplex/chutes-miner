@@ -11,6 +11,7 @@ from chutes_common.schemas.chute import Chute
 from chutes_miner.api.config import settings
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
+from chutes_miner.api.k8s.util import canonical_miner_launch_sha256
 import chutes_miner.gepetto as gepetto_module
 from chutes_miner.gepetto import Gepetto
 
@@ -747,24 +748,31 @@ class _ClaimSession:
         self.statement = None
         self.flushed = False
         self.committed = False
+        lineage = {
+            "schema": "chutes.miner-launch-lineage",
+            "version": 1,
+            "miner_hotkey": settings.miner_ss58,
+            "validator": chute.validator,
+            "chute_id": chute.chute_id,
+            "chute_version": chute.version,
+            "server_id": server.server_id,
+            "kubernetes_node_uid": server.kubernetes_node_uid,
+            "kubernetes_node_generation": server.kubernetes_node_generation,
+            "gpu_allocation_group_id": server.gpu_allocation_group_id,
+            "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+            "job_id": job_id,
+        }
+        request = {
+            "schema": "chutes.miner-launch-request.v1",
+            "miner_launch_request_id": "launch-intent-1",
+            "lineage": lineage,
+        }
         self.intent = SimpleNamespace(
+            intent_id="launch-intent-1",
             phase="registry_acked",
-            request_payload={
-                "lineage": {
-                    "schema": "chutes.miner-launch-lineage",
-                    "version": 1,
-                    "miner_hotkey": settings.miner_ss58,
-                    "validator": chute.validator,
-                    "chute_id": chute.chute_id,
-                    "chute_version": chute.version,
-                    "server_id": server.server_id,
-                    "kubernetes_node_uid": server.kubernetes_node_uid,
-                    "kubernetes_node_generation": server.kubernetes_node_generation,
-                    "gpu_allocation_group_id": server.gpu_allocation_group_id,
-                    "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
-                    "job_id": job_id,
-                }
-            },
+            request_payload=request,
+            request_sha256=canonical_miner_launch_sha256(request),
+            lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": None, "registry": None},
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
             deployment_id=None,
@@ -885,6 +893,39 @@ async def test_atomic_gpu_claim_rejects_token_not_returned_for_launch_intent():
             launch_token_sha256=hashlib.sha256(b"attacker-token").hexdigest(),
         )
 
+    assert not session.added
+    assert not session.committed
+
+
+@pytest.mark.asyncio
+async def test_atomic_gpu_claim_rejects_noncanonical_launch_intent_before_assignment():
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    session.intent.request_sha256 = "0" * 64
+
+    with pytest.raises(DeploymentFailure, match="launch intent lineage conflicts"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+        )
+
+    assert session.statement is None
     assert not session.added
     assert not session.committed
 

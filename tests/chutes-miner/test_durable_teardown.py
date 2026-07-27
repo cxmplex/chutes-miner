@@ -222,7 +222,10 @@ async def test_teardown_snapshot_uses_locked_server_lineage_before_gpu_rows():
 
 
 @pytest.mark.asyncio
-async def test_teardown_after_supported_rotation_uses_original_launch_lineage():
+async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
+    monkeypatch,
+):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
     deployment = SimpleNamespace(
         launch_operation_id="launch-1",
         teardown_operation_id=None,

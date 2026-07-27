@@ -42,6 +42,7 @@ from chutes_miner.api.k8s.operator import (
     _adopt_named_resource_after_create_error,
     canonical_workload_resource,
 )
+from chutes_miner.api.k8s.util import canonical_miner_launch_sha256
 import chutes_miner.gepetto as gepetto_module
 from chutes_miner.gepetto import Gepetto
 
@@ -485,9 +486,17 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
         "gpu_allocation_group_generation": 1,
         "job_id": None,
     }
+    request = {
+        "schema": "chutes.miner-launch-request.v1",
+        "miner_launch_request_id": "intent-1",
+        "lineage": lineage,
+    }
     intent = SimpleNamespace(
+        intent_id="intent-1",
         deployment_id="deployment-1",
-        request_payload={"lineage": lineage},
+        request_payload=request,
+        request_sha256=canonical_miner_launch_sha256(request),
+        lineage_sha256=canonical_miner_launch_sha256(lineage),
     )
     intended = _service()
     canonical = canonical_workload_resource("Service", intended)
@@ -547,6 +556,123 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
     assert launch.lease_owner is None
     assert "server/node lineage changed" in launch.last_failure
     session.commit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["schema", "request_id", "extra_field", "request_digest", "lineage_digest"],
+)
+@pytest.mark.asyncio
+async def test_noncanonical_launch_intent_fails_before_external_create(
+    monkeypatch,
+    tamper,
+):
+    monkeypatch.setattr(operator_module.settings, "gpu_tee_only", True)
+    deployment = SimpleNamespace(
+        deployment_id="deployment-1",
+        launch_operation_id="launch-1",
+        teardown_operation_id=None,
+        validator="validator-1",
+        chute_id="chute-1",
+        version="1.0.0",
+        server_id="server-1",
+        job_id=None,
+    )
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-1",
+        kubeconfig=None,
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=1,
+        registration_attestation_id="attestation-1",
+        gpu_allocation_group_id="group-1",
+        gpu_allocation_group_generation=1,
+    )
+    lineage = {
+        "schema": "chutes.miner-launch-lineage",
+        "version": 1,
+        "miner_hotkey": operator_module.settings.miner_ss58,
+        "validator": "validator-1",
+        "chute_id": "chute-1",
+        "chute_version": "1.0.0",
+        "server_id": "server-1",
+        "kubernetes_node_uid": "node-uid-1",
+        "kubernetes_node_generation": 1,
+        "gpu_allocation_group_id": "group-1",
+        "gpu_allocation_group_generation": 1,
+        "job_id": None,
+    }
+    request = {
+        "schema": "chutes.miner-launch-request.v1",
+        "miner_launch_request_id": "intent-1",
+        "lineage": lineage,
+    }
+    intent = SimpleNamespace(
+        intent_id="intent-1",
+        deployment_id="deployment-1",
+        request_payload=request,
+        request_sha256=canonical_miner_launch_sha256(request),
+        lineage_sha256=canonical_miner_launch_sha256(lineage),
+    )
+    if tamper == "schema":
+        request["schema"] = "chutes.miner-launch-request.v0"
+        intent.request_sha256 = canonical_miner_launch_sha256(request)
+    elif tamper == "request_id":
+        request["miner_launch_request_id"] = "other-intent"
+        intent.request_sha256 = canonical_miner_launch_sha256(request)
+    elif tamper == "extra_field":
+        request["unexpected"] = True
+        intent.request_sha256 = canonical_miner_launch_sha256(request)
+    elif tamper == "request_digest":
+        intent.request_sha256 = "0" * 64
+    else:
+        intent.lineage_sha256 = "0" * 64
+    launch = SimpleNamespace(
+        launch_intent_id="intent-1",
+        lease_owner="lease-1",
+        lease_expires_at=object(),
+        phase="creating",
+        canonical_workload_spec=None,
+        canonical_workload_spec_sha256=None,
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(
+            side_effect=lambda model, *_args, **_kwargs: {
+                "Deployment": deployment,
+                "DeploymentLaunchOperation": launch,
+                "MinerLaunchIntent": intent,
+            }[model.__name__]
+        ),
+        execute=AsyncMock(return_value=_QueryResult(server)),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(operator_module, "get_session", fake_session)
+    external_create = Mock()
+    operator = SimpleNamespace()
+    operator._lock_current_miner_launch_lineage = (
+        K8sOperator._lock_current_miner_launch_lineage.__get__(operator)
+    )
+
+    async def persist_then_create():
+        await K8sOperator._persist_launch_resource_intent(
+            operator,
+            "deployment-1",
+            "lease-1",
+            "Service",
+            _service(),
+        )
+        external_create()
+
+    with pytest.raises(DeploymentFailure, match="launch lineage is invalid"):
+        await persist_then_create()
+    external_create.assert_not_called()
+    session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,10 @@ from chutes_miner.api.config import (
 )
 from chutes_miner.api.database import get_session
 from chutes_miner.api.exceptions import DeploymentFailure
-from chutes_miner.api.k8s.util import registry_pull_secret_name
+from chutes_miner.api.k8s.util import (
+    registry_pull_secret_name,
+    validated_miner_launch_lineage,
+)
 from kubernetes.client import V1DeleteOptions, V1Preconditions
 from kubernetes.client.rest import ApiException
 from loguru import logger
@@ -141,58 +144,6 @@ class NodeIncarnationLineage:
     gpu_allocation_group_id: str | None
     gpu_allocation_group_generation: int | None
     cluster_context_sha256: str
-
-
-def _validated_launch_lineage(
-    intent: MinerLaunchIntent,
-    deployment: Deployment,
-) -> dict[str, Any]:
-    request = intent.request_payload
-    lineage = request.get("lineage") if isinstance(request, dict) else None
-    fields = {
-        "schema",
-        "version",
-        "miner_hotkey",
-        "validator",
-        "chute_id",
-        "chute_version",
-        "server_id",
-        "kubernetes_node_uid",
-        "kubernetes_node_generation",
-        "gpu_allocation_group_id",
-        "gpu_allocation_group_generation",
-        "job_id",
-    }
-    if (
-        not isinstance(lineage, dict)
-        or set(lineage) != fields
-        or request.get("schema") != "chutes.miner-launch-request.v1"
-        or request.get("miner_launch_request_id") != intent.intent_id
-        or lineage.get("schema") != "chutes.miner-launch-lineage"
-        or lineage.get("version") != 1
-        or intent.request_sha256 != canonical_sha256(request)
-        or intent.lineage_sha256 != canonical_sha256(lineage)
-    ):
-        raise DeploymentFailure("durable miner launch lineage is invalid")
-    expected = {
-        "miner_hotkey": settings.miner_ss58,
-        "validator": deployment.validator,
-        "chute_id": deployment.chute_id,
-        "chute_version": deployment.version,
-        "server_id": deployment.server_id,
-        "job_id": deployment.job_id,
-    }
-    if any(lineage.get(key) != value for key, value in expected.items()) or any(
-        not lineage.get(key)
-        for key in ("kubernetes_node_uid", "gpu_allocation_group_id")
-    ):
-        raise DeploymentFailure("durable miner launch lineage changed")
-    if any(
-        not isinstance(lineage.get(key), int) or lineage[key] <= 0
-        for key in ("kubernetes_node_generation", "gpu_allocation_group_generation")
-    ):
-        raise DeploymentFailure("durable miner launch generation is invalid")
-    return lineage
 
 
 def _operation_node_lineage(
@@ -764,8 +715,17 @@ class DeploymentTeardownCoordinator:
             .scalar_one()
         )
         snapshot_lineage = _server_node_lineage(server)
-        if launch is not None and launch_intent is not None:
-            lineage = _validated_launch_lineage(launch_intent, deployment)
+        if settings.gpu_tee_only and launch is not None and launch_intent is not None:
+            lineage = validated_miner_launch_lineage(
+                launch_intent,
+                miner_hotkey=settings.miner_ss58,
+                validator=deployment.validator,
+                chute_id=deployment.chute_id,
+                chute_version=deployment.version,
+                server_id=deployment.server_id,
+                job_id=deployment.job_id,
+                require_gpu_lineage=True,
+            )
             predecessor = (
                 await session.execute(
                     select(ServerNodeIdentity)

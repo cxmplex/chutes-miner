@@ -30,6 +30,7 @@ from chutes_miner.api.deployment.teardown import DeploymentTeardownCoordinator
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.api.k8s.util import (
+    canonical_miner_launch_sha256,
     require_supported_chutes_version,
     resolve_deployment_validator,
 )
@@ -49,9 +50,7 @@ SCALE_UP_CANDIDATE_POOL = 2
 
 
 def _canonical_sha256(document: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(document, option=json.OPT_SORT_KEYS)
-    ).hexdigest()
+    return canonical_miner_launch_sha256(document)
 
 
 class Gepetto:

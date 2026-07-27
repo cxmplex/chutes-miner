@@ -18,31 +18,39 @@ import chutes_miner.api.k8s as k8s
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.config import settings
 from chutes_miner.api.k8s.operator import K8sOperator, SingleClusterK8sOperator
+from chutes_miner.api.k8s.util import canonical_miner_launch_sha256
 from chutes_common.k8s import serializer
 
 
 @contextmanager
 def _mock_durable_launch(mock_db_session, deployment, chute, server):
+    lineage = {
+        "schema": "chutes.miner-launch-lineage",
+        "version": 1,
+        "miner_hotkey": settings.miner_ss58,
+        "validator": chute.validator,
+        "chute_id": chute.chute_id,
+        "chute_version": chute.version,
+        "server_id": server.server_id,
+        "kubernetes_node_uid": server.kubernetes_node_uid,
+        "kubernetes_node_generation": server.kubernetes_node_generation,
+        "gpu_allocation_group_id": server.gpu_allocation_group_id,
+        "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+        "job_id": None,
+    }
+    request = {
+        "schema": "chutes.miner-launch-request.v1",
+        "miner_launch_request_id": "launch-intent-1",
+        "lineage": lineage,
+    }
     mock_db_session.scalar = AsyncMock(return_value=None)
     mock_db_session.get = AsyncMock(
         return_value=SimpleNamespace(
+            intent_id="launch-intent-1",
             phase="registry_acked",
-            request_payload={
-                "lineage": {
-                    "schema": "chutes.miner-launch-lineage",
-                    "version": 1,
-                    "miner_hotkey": settings.miner_ss58,
-                    "validator": chute.validator,
-                    "chute_id": chute.chute_id,
-                    "chute_version": chute.version,
-                    "server_id": server.server_id,
-                    "kubernetes_node_uid": server.kubernetes_node_uid,
-                    "kubernetes_node_generation": server.kubernetes_node_generation,
-                    "gpu_allocation_group_id": server.gpu_allocation_group_id,
-                    "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
-                    "job_id": None,
-                }
-            },
+            request_payload=request,
+            request_sha256=canonical_miner_launch_sha256(request),
+            lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": "config-1", "registry": None},
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
             deployment_id=None,

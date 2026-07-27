@@ -2,6 +2,7 @@ import hashlib
 import re
 from typing import Any, Optional
 
+import orjson
 from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.server import Server
 from chutes_miner.api.config import settings, validator_by_hotkey
@@ -32,6 +33,85 @@ from kubernetes.client import (
 
 _VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
 MIN_SUPPORTED_CHUTES_VERSION = "0.3.61"
+MINER_LAUNCH_REQUEST_FIELDS = frozenset(
+    {"schema", "miner_launch_request_id", "lineage"}
+)
+MINER_LAUNCH_LINEAGE_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "miner_hotkey",
+        "validator",
+        "chute_id",
+        "chute_version",
+        "server_id",
+        "kubernetes_node_uid",
+        "kubernetes_node_generation",
+        "gpu_allocation_group_id",
+        "gpu_allocation_group_generation",
+        "job_id",
+    }
+)
+
+
+def canonical_miner_launch_sha256(document: Any) -> str:
+    return hashlib.sha256(orjson.dumps(document, option=orjson.OPT_SORT_KEYS)).hexdigest()
+
+
+def validated_miner_launch_lineage(
+    intent: Any,
+    *,
+    miner_hotkey: str,
+    validator: str,
+    chute_id: str,
+    chute_version: str,
+    server_id: str,
+    job_id: str | None,
+    require_gpu_lineage: bool,
+) -> dict[str, Any]:
+    """Return one byte-canonical, exact-schema durable launch lineage."""
+    request = getattr(intent, "request_payload", None)
+    lineage = request.get("lineage") if isinstance(request, dict) else None
+    if (
+        not isinstance(request, dict)
+        or set(request) != MINER_LAUNCH_REQUEST_FIELDS
+        or request.get("schema") != "chutes.miner-launch-request.v1"
+        or request.get("miner_launch_request_id") != getattr(intent, "intent_id", None)
+        or not isinstance(lineage, dict)
+        or set(lineage) != MINER_LAUNCH_LINEAGE_FIELDS
+        or lineage.get("schema") != "chutes.miner-launch-lineage"
+        or lineage.get("version") != 1
+        or getattr(intent, "request_sha256", None)
+        != canonical_miner_launch_sha256(request)
+        or getattr(intent, "lineage_sha256", None)
+        != canonical_miner_launch_sha256(lineage)
+    ):
+        raise DeploymentFailure("durable miner launch lineage is invalid")
+    expected = {
+        "miner_hotkey": miner_hotkey,
+        "validator": validator,
+        "chute_id": chute_id,
+        "chute_version": chute_version,
+        "server_id": server_id,
+        "job_id": job_id,
+    }
+    if any(lineage.get(key) != value for key, value in expected.items()):
+        raise DeploymentFailure("durable miner launch lineage changed")
+    if require_gpu_lineage:
+        if any(
+            not lineage.get(key)
+            for key in ("kubernetes_node_uid", "gpu_allocation_group_id")
+        ):
+            raise DeploymentFailure("durable miner launch lineage changed")
+        if any(
+            type(lineage.get(key)) is not int or lineage[key] <= 0
+            for key in (
+                "kubernetes_node_generation",
+                "gpu_allocation_group_generation",
+            )
+        ):
+            raise DeploymentFailure("durable miner launch generation is invalid")
+    return lineage
 
 
 def registry_pull_secret_name(config_id: str) -> str:
