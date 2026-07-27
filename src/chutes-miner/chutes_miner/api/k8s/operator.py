@@ -27,7 +27,7 @@ from chutes_common.redis import MonitoringRedisClient
 from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
 from chutes_common.schemas.gpu import GPU
-from chutes_common.schemas.server import Server
+from chutes_common.schemas.server import Server, ServerNodeIdentity
 from chutes_common.schemas.teardown import (
     DeploymentLaunchOperation,
     DeploymentTeardownK8sResource,
@@ -1634,6 +1634,134 @@ class K8sOperator(abc.ABC):
 
         return deployment_id, gpu_uuids
 
+    async def _lock_current_miner_launch_lineage(
+        self,
+        session: AsyncSession,
+        deployment: Deployment,
+        launch: DeploymentLaunchOperation,
+        intent: MinerLaunchIntent | None = None,
+    ) -> Server | None:
+        """Lock and compare the registrar-backed placement around external work."""
+        if not settings.gpu_tee_only:
+            return None
+        if not launch.launch_intent_id:
+            raise DeploymentFailure("durable miner launch intent disappeared")
+        if intent is None:
+            intent = await session.get(
+                MinerLaunchIntent,
+                launch.launch_intent_id,
+                with_for_update=True,
+            )
+        server = (
+            (
+                await session.execute(
+                    select(Server)
+                    .where(Server.server_id == deployment.server_id)
+                    .with_for_update(of=Server)
+                )
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
+        if (
+            intent is None
+            or intent.deployment_id != deployment.deployment_id
+            or not isinstance(intent.request_payload, dict)
+            or server is None
+        ):
+            raise DeploymentFailure("durable miner launch lineage disappeared")
+        expected_lineage = {
+            "schema": "chutes.miner-launch-lineage",
+            "version": 1,
+            "miner_hotkey": settings.miner_ss58,
+            "validator": deployment.validator,
+            "chute_id": deployment.chute_id,
+            "chute_version": deployment.version,
+            "server_id": deployment.server_id,
+            "kubernetes_node_uid": server.kubernetes_node_uid,
+            "kubernetes_node_generation": server.kubernetes_node_generation,
+            "gpu_allocation_group_id": server.gpu_allocation_group_id,
+            "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+            "job_id": deployment.job_id,
+        }
+        if (
+            intent.request_payload.get("lineage") != expected_lineage
+            or server.validator != deployment.validator
+            or launch.server_name != server.name
+            or launch.cluster_context != server.name
+            or launch.namespace != settings.namespace
+            or launch.cluster_context_sha256 != _launch_cluster_context_sha256(server)
+        ):
+            raise DeploymentFailure("server/node lineage changed during Kubernetes launch")
+        identity = (
+            await session.execute(
+                select(ServerNodeIdentity)
+                .where(
+                    ServerNodeIdentity.server_id == server.server_id,
+                    ServerNodeIdentity.generation == server.kubernetes_node_generation,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            identity is None
+            or identity.kubernetes_node_uid != server.kubernetes_node_uid
+            or identity.registration_attestation_id != server.registration_attestation_id
+            or identity.retired_at is not None
+        ):
+            raise DeploymentFailure("registrar node identity changed during Kubernetes launch")
+        gpu_rows = (
+            (
+                await session.execute(
+                    select(GPU)
+                    .where(GPU.deployment_id == deployment.deployment_id)
+                    .order_by(GPU.gpu_id)
+                    .with_for_update(of=GPU)
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+        gpu_uuids = sorted(str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows)
+        if (
+            not gpu_uuids
+            or len(set(gpu_uuids)) != len(gpu_uuids)
+            or any(not value.startswith("GPU-") for value in gpu_uuids)
+            or any(
+                gpu.server_id != server.server_id
+                or gpu.validator != deployment.validator
+                or gpu.gpu_allocation_group_id != server.gpu_allocation_group_id
+                or gpu.gpu_allocation_group_generation != server.gpu_allocation_group_generation
+                for gpu in gpu_rows
+            )
+        ):
+            raise DeploymentFailure("GPU assignment lineage changed during Kubernetes launch")
+        job = _verified_launch_closure(launch).get("job")
+        if job is not None:
+            try:
+                env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+            except (KeyError, IndexError, TypeError):
+                raise DeploymentFailure("canonical Job GPU closure is malformed") from None
+            gpu_env = [
+                item
+                for item in env
+                if item.get("name") in {"NVIDIA_VISIBLE_DEVICES", "CHUTES_NVIDIA_DEVICES"}
+            ]
+            values = {
+                item.get("name"): item.get("value")
+                for item in gpu_env
+            }
+            if (
+                len(gpu_env) != 2
+                or set(values) != {"NVIDIA_VISIBLE_DEVICES", "CHUTES_NVIDIA_DEVICES"}
+                or not all(isinstance(value, str) for value in values.values())
+                or values["NVIDIA_VISIBLE_DEVICES"] != values["CHUTES_NVIDIA_DEVICES"]
+                or sorted(values["NVIDIA_VISIBLE_DEVICES"].split(",")) != gpu_uuids
+            ):
+                raise DeploymentFailure("canonical Job GPU UUIDs changed from database ownership")
+        return server
+
     async def _claim_launch(self, deployment_id: str) -> str:
         now = _utc_now()
         token = f"{deployment_id}:{uuid.uuid4()}"
@@ -1689,6 +1817,7 @@ class K8sOperator(abc.ABC):
                 or deployment.teardown_operation_id is not None
             ):
                 raise DeploymentFailure("launch creation is fenced by teardown")
+            await self._lock_current_miner_launch_lineage(session, deployment, launch)
             launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
             await session.commit()
 
@@ -1724,6 +1853,7 @@ class K8sOperator(abc.ABC):
             existing = closure.get(kind.lower())
             if existing is not None and existing != canonical:
                 raise DeploymentFailure(f"canonical {kind} launch intent changed")
+            intent = None
             closure[kind.lower()] = canonical
             if kind == "Job":
                 token_sha256 = _launch_jwt_sha256(resource)
@@ -1749,6 +1879,9 @@ class K8sOperator(abc.ABC):
                 closure["authorized_launch_token_sha256s"] = sorted(authorized)
             launch.canonical_workload_spec = closure
             launch.canonical_workload_spec_sha256 = _canonical_document_sha256(closure)
+            await self._lock_current_miner_launch_lineage(
+                session, deployment, launch, intent
+            )
             launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
             await session.commit()
 
@@ -1871,12 +2004,26 @@ class K8sOperator(abc.ABC):
                         )
                     )
             fenced = launch.phase == "teardown_fenced"
+            lineage_error = None
             if fenced:
                 launch.lease_owner = None
                 launch.lease_expires_at = None
             else:
-                launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
+                try:
+                    await self._lock_current_miner_launch_lineage(
+                        session, deployment, launch
+                    )
+                except DeploymentFailure as exc:
+                    lineage_error = exc
+                    launch.phase = "failed"
+                    launch.lease_owner = None
+                    launch.lease_expires_at = None
+                    launch.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
+                else:
+                    launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
             await session.commit()
+        if lineage_error is not None:
+            raise lineage_error
         if fenced:
             raise DeploymentFailure("launch was fenced while Kubernetes create was in flight")
 
@@ -1971,7 +2118,10 @@ class K8sOperator(abc.ABC):
                 or intent.deployment_id != deployment_id
             ):
                 raise DeploymentFailure("launch preflight journal changed before completion")
-            deployment.host = server.ip_address
+            current_server = await self._lock_current_miner_launch_lineage(
+                session, deployment, launch, intent
+            )
+            deployment.host = (current_server or server).ip_address
             deployment.port = deployment_port
             deployment.stub = False
             launch.phase = "created"

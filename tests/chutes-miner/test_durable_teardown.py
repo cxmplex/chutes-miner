@@ -222,7 +222,7 @@ async def test_teardown_snapshot_uses_locked_server_lineage_before_gpu_rows():
 
 
 @pytest.mark.asyncio
-async def test_teardown_uses_original_launch_context_not_mutable_server_settings():
+async def test_teardown_after_supported_rotation_uses_original_launch_lineage():
     deployment = SimpleNamespace(
         launch_operation_id="launch-1",
         teardown_operation_id=None,
@@ -230,10 +230,20 @@ async def test_teardown_uses_original_launch_context_not_mutable_server_settings
         validator="validator-1",
         server_id="server-1",
         chute_id="chute-1",
+        version="1.0.0",
         config_id="config-1",
         job_id=None,
         instance_id=None,
         active=True,
+    )
+    old_server = SimpleNamespace(
+        name="node-a",
+        kubeconfig="old-kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=1,
+        registration_attestation_id="attestation-1",
+        gpu_allocation_group_id="group-1",
+        gpu_allocation_group_generation=1,
     )
     launch = SimpleNamespace(
         operation_id="launch-1",
@@ -242,10 +252,10 @@ async def test_teardown_uses_original_launch_context_not_mutable_server_settings
         phase="created",
         lease_owner=None,
         lease_expires_at=None,
-        cluster_context="original-node",
-        cluster_context_sha256="a" * 64,
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(old_server),
         namespace="original-namespace",
-        server_name="original-node",
+        server_name="node-a",
         create_results={},
         service_name=None,
         service_uid=None,
@@ -254,20 +264,67 @@ async def test_teardown_uses_original_launch_context_not_mutable_server_settings
         job_name=None,
         job_uid=None,
     )
+    lineage = {
+        "schema": "chutes.miner-launch-lineage",
+        "version": 1,
+        "miner_hotkey": teardown.settings.miner_ss58,
+        "validator": "validator-1",
+        "chute_id": "chute-1",
+        "chute_version": "1.0.0",
+        "server_id": "server-1",
+        "kubernetes_node_uid": "node-uid-1",
+        "kubernetes_node_generation": 1,
+        "gpu_allocation_group_id": "group-1",
+        "gpu_allocation_group_generation": 1,
+        "job_id": None,
+    }
+    request = {
+        "schema": "chutes.miner-launch-request.v1",
+        "miner_launch_request_id": "intent-1",
+        "lineage": lineage,
+    }
     intent = SimpleNamespace(
+        intent_id="intent-1",
         deployment_id="deployment-1",
         phase="completed",
+        request_payload=request,
+        request_sha256=teardown.canonical_sha256(request),
+        lineage_sha256=teardown.canonical_sha256(lineage),
     )
-    mutable_server = SimpleNamespace(
-        name="renamed-node",
-        kubeconfig="changed-kubeconfig",
+    current_server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="new-kubeconfig",
+        kubernetes_node_uid="node-uid-2",
+        kubernetes_node_generation=2,
+        registration_attestation_id="attestation-2",
+        gpu_allocation_group_id="group-2",
+        gpu_allocation_group_generation=2,
+    )
+    predecessor = SimpleNamespace(
+        server_id="server-1",
+        generation=1,
         kubernetes_node_uid="node-uid-1",
-        kubernetes_node_generation=1,
         registration_attestation_id="attestation-1",
-        gpu_allocation_group_id="group-1",
-        gpu_allocation_group_generation=1,
+        retired_at=object(),
     )
-    gpu = SimpleNamespace(gpu_id="gpu-1", hardware_uuid="GPU-1")
+    current_identity = SimpleNamespace(
+        server_id="server-1",
+        generation=2,
+        kubernetes_node_uid="node-uid-2",
+        registration_attestation_id="attestation-2",
+        retired_at=None,
+    )
+    gpu = SimpleNamespace(
+        gpu_id="gpu-1",
+        hardware_uuid="GPU-1",
+        server_id="server-1",
+        deployment_id="deployment-1",
+        validator="validator-1",
+        gpu_allocation_group_id="group-2",
+        gpu_allocation_group_generation=2,
+    )
 
     async def get(model, *_args, **_kwargs):
         return launch if model.__name__ == "DeploymentLaunchOperation" else intent
@@ -277,7 +334,8 @@ async def test_teardown_uses_original_launch_context_not_mutable_server_settings
         execute=AsyncMock(
             side_effect=[
                 _QueryResult(None),
-                _QueryResult(mutable_server),
+                _QueryResult(current_server),
+                _QueryResult(predecessor),
                 _QueryResult([gpu]),
             ]
         ),
@@ -292,9 +350,25 @@ async def test_teardown_uses_original_launch_context_not_mutable_server_settings
         "delete",
     )
 
-    assert operation.cluster_context == "original-node"
-    assert operation.cluster_context_sha256 == "a" * 64
+    assert operation.cluster_context == "node-a"
+    assert operation.cluster_context_sha256 == launch.cluster_context_sha256
     assert operation.namespace == "original-namespace"
+    assert operation.kubernetes_node_uid == "node-uid-1"
+    assert operation.kubernetes_node_generation == 1
+    assert operation.registration_attestation_id == "attestation-1"
+    assert operation.gpu_allocation_group_id == "group-1"
+    assert operation.gpu_allocation_group_generation == 1
+    handoff = authorized_node_incarnation_handoff_values(
+        operation=operation,
+        latest_handoff=None,
+        deployment=deployment,
+        server=current_server,
+        gpu_rows=[gpu],
+        node_history=[predecessor, current_identity],
+    )
+    assert handoff is not None
+    assert handoff["from_kubernetes_node_uid"] == "node-uid-1"
+    assert handoff["to_kubernetes_node_uid"] == "node-uid-2"
 
 
 @pytest.mark.asyncio

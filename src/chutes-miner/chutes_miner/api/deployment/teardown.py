@@ -143,6 +143,58 @@ class NodeIncarnationLineage:
     cluster_context_sha256: str
 
 
+def _validated_launch_lineage(
+    intent: MinerLaunchIntent,
+    deployment: Deployment,
+) -> dict[str, Any]:
+    request = intent.request_payload
+    lineage = request.get("lineage") if isinstance(request, dict) else None
+    fields = {
+        "schema",
+        "version",
+        "miner_hotkey",
+        "validator",
+        "chute_id",
+        "chute_version",
+        "server_id",
+        "kubernetes_node_uid",
+        "kubernetes_node_generation",
+        "gpu_allocation_group_id",
+        "gpu_allocation_group_generation",
+        "job_id",
+    }
+    if (
+        not isinstance(lineage, dict)
+        or set(lineage) != fields
+        or request.get("schema") != "chutes.miner-launch-request.v1"
+        or request.get("miner_launch_request_id") != intent.intent_id
+        or lineage.get("schema") != "chutes.miner-launch-lineage"
+        or lineage.get("version") != 1
+        or intent.request_sha256 != canonical_sha256(request)
+        or intent.lineage_sha256 != canonical_sha256(lineage)
+    ):
+        raise DeploymentFailure("durable miner launch lineage is invalid")
+    expected = {
+        "miner_hotkey": settings.miner_ss58,
+        "validator": deployment.validator,
+        "chute_id": deployment.chute_id,
+        "chute_version": deployment.version,
+        "server_id": deployment.server_id,
+        "job_id": deployment.job_id,
+    }
+    if any(lineage.get(key) != value for key, value in expected.items()) or any(
+        not lineage.get(key)
+        for key in ("kubernetes_node_uid", "gpu_allocation_group_id")
+    ):
+        raise DeploymentFailure("durable miner launch lineage changed")
+    if any(
+        not isinstance(lineage.get(key), int) or lineage[key] <= 0
+        for key in ("kubernetes_node_generation", "gpu_allocation_group_generation")
+    ):
+        raise DeploymentFailure("durable miner launch generation is invalid")
+    return lineage
+
+
 def _operation_node_lineage(
     operation: DeploymentTeardownOperation,
     handoff: DeploymentTeardownNodeIncarnationHandoff | None,
@@ -640,6 +692,7 @@ class DeploymentTeardownCoordinator:
         reason: str,
     ) -> DeploymentTeardownOperation:
         launch = None
+        launch_intent = None
         if deployment.launch_operation_id:
             launch = await session.get(
                 DeploymentLaunchOperation,
@@ -665,15 +718,18 @@ class DeploymentTeardownCoordinator:
                 launch.lease_owner = None
                 launch.lease_expires_at = None
             if launch.launch_intent_id:
-                intent = await session.get(
+                launch_intent = await session.get(
                     MinerLaunchIntent,
                     launch.launch_intent_id,
                     with_for_update=True,
                 )
-                if intent is None or intent.deployment_id != deployment.deployment_id:
+                if (
+                    launch_intent is None
+                    or launch_intent.deployment_id != deployment.deployment_id
+                ):
                     raise DeploymentFailure("deployment launch intent binding is invalid")
-                if intent.phase != "completed":
-                    intent.phase = "cleanup_required"
+                if launch_intent.phase != "completed":
+                    launch_intent.phase = "cleanup_required"
         existing = (
             (
                 await session.execute(
@@ -707,6 +763,44 @@ class DeploymentTeardownCoordinator:
             .unique()
             .scalar_one()
         )
+        snapshot_lineage = _server_node_lineage(server)
+        if launch is not None and launch_intent is not None:
+            lineage = _validated_launch_lineage(launch_intent, deployment)
+            predecessor = (
+                await session.execute(
+                    select(ServerNodeIdentity)
+                    .where(
+                        ServerNodeIdentity.server_id == deployment.server_id,
+                        ServerNodeIdentity.generation
+                        == lineage["kubernetes_node_generation"],
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                predecessor is None
+                or predecessor.kubernetes_node_uid != lineage["kubernetes_node_uid"]
+                or not predecessor.registration_attestation_id
+                or server.kubernetes_node_generation
+                < lineage["kubernetes_node_generation"]
+                or (
+                    server.kubernetes_node_generation == lineage["kubernetes_node_generation"]
+                    and predecessor.retired_at is not None
+                )
+                or (
+                    server.kubernetes_node_generation > lineage["kubernetes_node_generation"]
+                    and predecessor.retired_at is None
+                )
+            ):
+                raise DeploymentFailure("original registrar lineage is unavailable")
+            snapshot_lineage = NodeIncarnationLineage(
+                kubernetes_node_uid=lineage["kubernetes_node_uid"],
+                kubernetes_node_generation=lineage["kubernetes_node_generation"],
+                registration_attestation_id=predecessor.registration_attestation_id,
+                gpu_allocation_group_id=lineage["gpu_allocation_group_id"],
+                gpu_allocation_group_generation=lineage["gpu_allocation_group_generation"],
+                cluster_context_sha256=launch.cluster_context_sha256,
+            )
         gpu_rows = (
             (
                 await session.execute(
@@ -732,16 +826,13 @@ class DeploymentTeardownCoordinator:
             job_id=deployment.job_id,
             instance_id=deployment.instance_id,
             cluster_context=(launch.cluster_context if launch else None) or server.name,
-            cluster_context_sha256=(
-                (launch.cluster_context_sha256 if launch else None)
-                or cluster_context_sha256(server)
-            ),
+            cluster_context_sha256=snapshot_lineage.cluster_context_sha256,
             namespace=(launch.namespace if launch else None) or settings.namespace,
-            kubernetes_node_uid=server.kubernetes_node_uid,
-            kubernetes_node_generation=server.kubernetes_node_generation,
-            registration_attestation_id=server.registration_attestation_id,
-            gpu_allocation_group_id=server.gpu_allocation_group_id,
-            gpu_allocation_group_generation=server.gpu_allocation_group_generation,
+            kubernetes_node_uid=snapshot_lineage.kubernetes_node_uid,
+            kubernetes_node_generation=snapshot_lineage.kubernetes_node_generation,
+            registration_attestation_id=snapshot_lineage.registration_attestation_id,
+            gpu_allocation_group_id=snapshot_lineage.gpu_allocation_group_id,
+            gpu_allocation_group_generation=snapshot_lineage.gpu_allocation_group_generation,
             gpu_hardware_uuids=sorted(
                 str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
             ),

@@ -53,6 +53,23 @@ LABELS = {
 }
 
 
+class _QueryResult:
+    def __init__(self, value):
+        self.value = value
+
+    def unique(self):
+        return self
+
+    def scalar_one_or_none(self):
+        return self.value
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.value
+
+
 def _service() -> V1Service:
     return V1Service(
         api_version="v1",
@@ -426,6 +443,110 @@ async def test_first_captured_kubernetes_uid_is_immutable(monkeypatch):
         )
     assert launch.service_uid == "first-uid"
     session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
+    monkeypatch,
+):
+    monkeypatch.setattr(operator_module.settings, "gpu_tee_only", True)
+    deployment = SimpleNamespace(
+        deployment_id="deployment-1",
+        launch_operation_id="launch-1",
+        teardown_operation_id=None,
+        validator="validator-1",
+        chute_id="chute-1",
+        version="1.0.0",
+        server_id="server-1",
+        job_id=None,
+    )
+    original_server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-1",
+        kubeconfig=None,
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=1,
+        registration_attestation_id="attestation-1",
+        gpu_allocation_group_id="group-1",
+        gpu_allocation_group_generation=1,
+    )
+    lineage = {
+        "schema": "chutes.miner-launch-lineage",
+        "version": 1,
+        "miner_hotkey": operator_module.settings.miner_ss58,
+        "validator": "validator-1",
+        "chute_id": "chute-1",
+        "chute_version": "1.0.0",
+        "server_id": "server-1",
+        "kubernetes_node_uid": "node-uid-1",
+        "kubernetes_node_generation": 1,
+        "gpu_allocation_group_id": "group-1",
+        "gpu_allocation_group_generation": 1,
+        "job_id": None,
+    }
+    intent = SimpleNamespace(
+        deployment_id="deployment-1",
+        request_payload={"lineage": lineage},
+    )
+    intended = _service()
+    canonical = canonical_workload_resource("Service", intended)
+    launch = SimpleNamespace(
+        launch_intent_id="intent-1",
+        lease_owner="lease-1",
+        lease_expires_at=object(),
+        phase="creating",
+        canonical_workload_spec={"service": canonical},
+        canonical_workload_spec_sha256=_canonical_document_sha256(
+            {"service": canonical}
+        ),
+        immutable_labels=LABELS,
+        server_name="node-1",
+        cluster_context="node-1",
+        cluster_context_sha256=operator_module._launch_cluster_context_sha256(original_server),
+        namespace=operator_module.settings.namespace,
+        service_name=None,
+        service_uid=None,
+        create_results={},
+        last_failure=None,
+    )
+    current_server = deepcopy(original_server)
+    current_server.kubernetes_node_uid = "node-uid-2"
+    current_server.kubernetes_node_generation = 2
+    current_server.registration_attestation_id = "attestation-2"
+    session = SimpleNamespace(
+        get=AsyncMock(
+            side_effect=lambda model, *_args, **_kwargs: {
+                "Deployment": deployment,
+                "DeploymentLaunchOperation": launch,
+                "MinerLaunchIntent": intent,
+            }[model.__name__]
+        ),
+        execute=AsyncMock(return_value=_QueryResult(current_server)),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(operator_module, "get_session", fake_session)
+    readback = deepcopy(intended)
+    readback.metadata.uid = "service-uid-1"
+    operator = SimpleNamespace()
+    operator._lock_current_miner_launch_lineage = (
+        K8sOperator._lock_current_miner_launch_lineage.__get__(operator)
+    )
+    with pytest.raises(DeploymentFailure, match="server/node lineage changed"):
+        await K8sOperator._record_launch_resource(
+            operator, "deployment-1", "lease-1", "Service", readback
+        )
+
+    assert launch.service_uid == "service-uid-1"
+    assert launch.phase == "failed"
+    assert launch.lease_owner is None
+    assert "server/node lineage changed" in launch.last_failure
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
