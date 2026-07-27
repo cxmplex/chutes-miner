@@ -41,6 +41,8 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
     assert {
         "registry_revocation_ack",
         "registry_revoked_at",
+        "validator_job_release_ack",
+        "validator_job_released_at",
         "validator_instance_deletion_ack",
         "validator_instance_deleted_at",
         "controllers_absent_at",
@@ -102,6 +104,7 @@ def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
         "job_uid",
         "create_results",
         "cluster_context",
+        "cluster_context_sha256",
         "namespace",
         "server_name",
         "canonical_workload_spec",
@@ -133,7 +136,10 @@ def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
         "response_payload",
         "response_sha256",
         "token_sha256",
+        "authorized_token_sha256s",
         "registry_ack",
+        "job_release_ack",
+        "job_released_at",
         "deployment_id",
         "last_failure",
         "completed_at",
@@ -190,3 +196,4 @@ def test_followup_migration_has_specific_locked_down_guard():
     assert "canonical_workload_spec_sha256" in sql
     assert "miner_launch_intent_active_lineage_key" in sql
     assert "launch intent history exists" in sql
+    assert "validator job release history exists" in sql

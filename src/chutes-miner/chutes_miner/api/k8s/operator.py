@@ -31,6 +31,7 @@ from chutes_common.schemas.server import Server
 from chutes_common.schemas.teardown import (
     DeploymentLaunchOperation,
     DeploymentTeardownK8sResource,
+    MinerLaunchIntent,
     ParentDeletionOperation,
 )
 from chutes_miner.api.config import (
@@ -60,6 +61,7 @@ from chutes_miner.api.k8s.util import (
 )
 from kubernetes import watch
 from kubernetes.client import (
+    ApiClient,
     CoreV1Api,
     V1ConfigMap,
     V1ConfigMapList,
@@ -91,6 +93,252 @@ _disk_info_locks: dict[str, asyncio.Lock] = {}
 # registration and never changes, so a long TTL is safe.
 _tee_cluster_cache: dict[str, tuple[bool, datetime]] = {}
 _TEE_CACHE_TTL = timedelta(minutes=10)
+
+
+def _without_none(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_none(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_without_none(item) for item in value]
+    return value
+
+
+def _model_value(value: Any) -> Any:
+    if value is None:
+        return None
+    return _without_none(ApiClient().sanitize_for_serialization(value))
+
+
+def _wire_field(value: Any, name: str, default: Any = None) -> Any:
+    wire = _model_value(value)
+    if not isinstance(wire, dict):
+        return default
+    return wire.get(name, default)
+
+
+def _canonical_container_ports(values: list[Any]) -> list[dict[str, Any]]:
+    return [
+        _without_none(
+            {
+                "containerPort": _wire_field(value, "containerPort"),
+                "hostIP": _wire_field(value, "hostIP"),
+                "hostPort": _wire_field(value, "hostPort"),
+                "name": _wire_field(value, "name"),
+                "protocol": _wire_field(value, "protocol", "TCP") or "TCP",
+            }
+        )
+        for value in values
+    ]
+
+
+def _canonical_volume_mounts(values: list[Any]) -> list[dict[str, Any]]:
+    return [
+        _without_none(
+            {
+                "name": _wire_field(value, "name"),
+                "mountPath": _wire_field(value, "mountPath"),
+                "mountPropagation": _wire_field(value, "mountPropagation"),
+                "readOnly": bool(_wire_field(value, "readOnly", False)),
+                "recursiveReadOnly": _wire_field(value, "recursiveReadOnly"),
+                "subPath": _wire_field(value, "subPath"),
+                "subPathExpr": _wire_field(value, "subPathExpr"),
+            }
+        )
+        for value in values
+    ]
+
+
+def canonical_workload_resource(kind: str, resource: Any) -> dict[str, Any]:
+    """Canonical immutable closure used for create-response-loss adoption."""
+    metadata = resource.metadata
+    base: dict[str, Any] = {
+        "api_version": str(
+            getattr(resource, "api_version", None)
+            or ("batch/v1" if kind == "Job" else "v1")
+        ),
+        "kind": kind,
+        "metadata": {
+            "name": str(metadata.name),
+            "labels": dict(metadata.labels or {}),
+            "annotations": dict(getattr(metadata, "annotations", None) or {}),
+        },
+    }
+    if kind == "Service":
+        spec = resource.spec
+        base["spec"] = _without_none(
+            {
+                "type": spec.type,
+                "external_traffic_policy": spec.external_traffic_policy,
+                "selector": dict(spec.selector or {}),
+                "ports": [
+                    {
+                        "name": port.name,
+                        "port": port.port,
+                        "protocol": port.protocol,
+                        "target_port": port.target_port,
+                        "app_protocol": getattr(port, "app_protocol", None),
+                    }
+                    for port in spec.ports or []
+                ],
+                "external_ips": spec.external_i_ps,
+                "load_balancer_ip": spec.load_balancer_ip,
+                "load_balancer_source_ranges": spec.load_balancer_source_ranges,
+            }
+        )
+        return base
+    if kind == "Secret":
+        base["type"] = resource.type
+        base["data_sha256"] = {
+            key: hashlib.sha256(value.encode()).hexdigest()
+            for key, value in sorted((resource.data or {}).items())
+        }
+        return base
+    if kind != "Job":
+        raise DeploymentFailure(f"unsupported canonical launch resource {kind}")
+
+    job_spec = resource.spec
+    pod_spec = job_spec.template.spec
+    containers = []
+    for container in pod_spec.containers or []:
+        env = []
+        for item in container.env or []:
+            value = item.value
+            if item.name == "CHUTES_LAUNCH_JWT" and value is not None:
+                value = {
+                    "launch_config_id": (metadata.labels or {}).get(
+                        "chutes/config-id"
+                    )
+                }
+            env.append(
+                _without_none(
+                    {
+                        "name": item.name,
+                        "value": value,
+                        "value_from": _model_value(item.value_from),
+                    }
+                )
+            )
+        containers.append(
+            _without_none(
+                {
+                    "name": container.name,
+                    "image": container.image,
+                    "image_pull_policy": container.image_pull_policy,
+                    "command": list(container.command or []),
+                    "args": list(container.args or []),
+                    "env": env,
+                    "resources": _model_value(container.resources),
+                    "volume_mounts": _canonical_volume_mounts(
+                        container.volume_mounts or []
+                    ),
+                    "security_context": _model_value(container.security_context),
+                    "ports": _canonical_container_ports(container.ports or []),
+                    "readiness_probe": _model_value(container.readiness_probe),
+                    "liveness_probe": _model_value(container.liveness_probe),
+                    "startup_probe": _model_value(container.startup_probe),
+                }
+            )
+        )
+    base["spec"] = _without_none(
+        {
+            "parallelism": job_spec.parallelism,
+            "completions": job_spec.completions,
+            "backoff_limit": job_spec.backoff_limit,
+            "ttl_seconds_after_finished": job_spec.ttl_seconds_after_finished,
+            "active_deadline_seconds": job_spec.active_deadline_seconds,
+            "template": {
+                "metadata": {
+                    "labels": {
+                        key: value
+                        for key, value in (job_spec.template.metadata.labels or {}).items()
+                        if key
+                        not in {
+                            "controller-uid",
+                            "job-name",
+                            "batch.kubernetes.io/controller-uid",
+                            "batch.kubernetes.io/job-name",
+                        }
+                    },
+                    "annotations": dict(job_spec.template.metadata.annotations or {}),
+                },
+                "spec": _without_none(
+                    {
+                        "node_name": pod_spec.node_name,
+                        "runtime_class_name": pod_spec.runtime_class_name,
+                        "restart_policy": pod_spec.restart_policy,
+                        "automount_service_account_token": (
+                            pod_spec.automount_service_account_token
+                        ),
+                        "termination_grace_period_seconds": (
+                            pod_spec.termination_grace_period_seconds
+                        ),
+                        "image_pull_secrets": [
+                            {"name": str(secret.name)}
+                            for secret in pod_spec.image_pull_secrets or []
+                        ],
+                        "security_context": _model_value(pod_spec.security_context),
+                        "volumes": _model_value(pod_spec.volumes or []),
+                        "containers": containers,
+                        "init_containers": _model_value(pod_spec.init_containers or []),
+                        "ephemeral_containers": _model_value(
+                            pod_spec.ephemeral_containers or []
+                        ),
+                        "host_network": bool(pod_spec.host_network),
+                        "host_pid": bool(pod_spec.host_pid),
+                        "host_ipc": bool(pod_spec.host_ipc),
+                        "service_account_name": pod_spec.service_account_name,
+                        "node_selector": _model_value(pod_spec.node_selector or {}),
+                        "affinity": _model_value(pod_spec.affinity),
+                        "tolerations": _model_value(pod_spec.tolerations or []),
+                    }
+                ),
+            },
+        }
+    )
+    return base
+
+
+def _launch_jwt_sha256(resource: Any) -> str | None:
+    if not isinstance(resource, V1Job):
+        return None
+    pod_spec = resource.spec.template.spec
+    for container in pod_spec.containers or []:
+        for item in container.env or []:
+            if item.name == "CHUTES_LAUNCH_JWT" and item.value:
+                return hashlib.sha256(item.value.encode()).hexdigest()
+    return None
+
+
+def _canonical_document_sha256(document: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _launch_cluster_context_sha256(server: Server) -> str:
+    return _canonical_document_sha256(
+        {
+            "context": server.name,
+            "kubeconfig_sha256": (
+                hashlib.sha256(server.kubeconfig.encode()).hexdigest()
+                if server.kubeconfig
+                else None
+            ),
+            "node_uid": server.kubernetes_node_uid,
+            "node_generation": server.kubernetes_node_generation,
+            "namespace": settings.namespace,
+        }
+    )
 
 
 def _is_tee_cluster(cluster_name: str) -> bool:
@@ -1032,6 +1280,7 @@ class K8sOperator(abc.ABC):
         chute_id: Union[str | Chute],
         server_id: Union[str | Server],
         token: str = None,
+        launch_intent_id: str = None,
         job_id: str = None,
         config_id: str = None,
         registry_repository: str = None,
@@ -1077,7 +1326,6 @@ class K8sOperator(abc.ABC):
                 server = await self._get_server(session, server_id)
                 resolve_deployment_validator(chute, server)
                 available_gpus = self._verify_gpus(chute, server)
-                await self._verify_disk_space(server, disk_gb)
                 deployment_id, gpu_uuids = await self._track_deployment(
                     session,
                     chute,
@@ -1087,18 +1335,35 @@ class K8sOperator(abc.ABC):
                     config_id,
                     registry_repository,
                     registry_manifest_digest,
+                    launch_intent_id,
+                    hashlib.sha256(token.encode()).hexdigest(),
                 )
-                launch_token = await self._claim_launch(deployment_id)
+
+            # The placement transaction is committed before any Kubernetes/node I/O.
+            await self._verify_disk_space(server, disk_gb)
+            launch_token = await self._claim_launch(deployment_id)
 
             # Build the service that exposes it.
             await self._assert_launch_creation_allowed(deployment_id, launch_token)
-            service = self._create_service_for_deployment(
+            service_intent = build_chute_service(
+                chute,
+                deployment_id,
+                extra_service_ports,
+                config_id=config_id,
+                job_id=job_id,
+            )
+            await self._persist_launch_resource_intent(
+                deployment_id, launch_token, "Service", service_intent
+            )
+            service = await asyncio.to_thread(
+                self._create_service_for_deployment,
                 chute,
                 server,
                 deployment_id,
                 extra_service_ports,
                 config_id=config_id,
                 job_id=job_id,
+                service_intent=service_intent,
             )
             await self._record_launch_resource(
                 deployment_id, launch_token, "Service", service
@@ -1106,14 +1371,42 @@ class K8sOperator(abc.ABC):
 
             if settings.gpu_tee_only:
                 await self._assert_launch_creation_allowed(deployment_id, launch_token)
-                secret = self._create_registry_pull_secret(config_id, server.validator)
+                secret_intent = self._build_registry_pull_secret(config_id, server.validator)
+                await self._persist_launch_resource_intent(
+                    deployment_id, launch_token, "Secret", secret_intent
+                )
+                secret = await asyncio.to_thread(
+                    self._create_registry_pull_secret,
+                    config_id,
+                    server.validator,
+                    secret_intent,
+                )
                 await self._record_launch_resource(
                     deployment_id, launch_token, "Secret", secret
                 )
 
             # Create the deployment.
             await self._assert_launch_creation_allowed(deployment_id, launch_token)
-            job = self._create_job_for_deployment(
+            job_intent = build_chute_job(
+                deployment_id,
+                chute,
+                server,
+                service,
+                gpu_uuids,
+                self._get_probe_port(chute),
+                token=token,
+                job_id=job_id,
+                config_id=config_id,
+                registry_repository=registry_repository,
+                registry_manifest_digest=registry_manifest_digest,
+                disk_gb=disk_gb,
+                vm_version=vm_version,
+            )
+            await self._persist_launch_resource_intent(
+                deployment_id, launch_token, "Job", job_intent
+            )
+            job = await asyncio.to_thread(
+                self._create_job_for_deployment,
                 deployment_id,
                 chute,
                 server,
@@ -1126,6 +1419,7 @@ class K8sOperator(abc.ABC):
                 registry_manifest_digest=registry_manifest_digest,
                 disk_gb=disk_gb,
                 vm_version=vm_version,
+                job_intent=job_intent,
             )
             await self._record_launch_resource(deployment_id, launch_token, "Job", job)
 
@@ -1212,6 +1506,8 @@ class K8sOperator(abc.ABC):
         config_id: str = None,
         registry_repository: str = None,
         registry_manifest_digest: str = None,
+        launch_intent_id: str = None,
+        launch_token_sha256: str = None,
     ):
         # Immediately track this deployment (before actually creating it) to avoid allocation contention.
         parent_fence = await session.scalar(
@@ -1233,6 +1529,44 @@ class K8sOperator(abc.ABC):
         )
         if parent_fence:
             raise DeploymentFailure("deployment placement is fenced by parent deletion")
+        if not launch_intent_id:
+            raise DeploymentFailure("durable miner launch intent is required")
+        intent = await session.get(
+            MinerLaunchIntent,
+            launch_intent_id,
+            with_for_update=True,
+        )
+        expected_lineage = {
+            "schema": "chutes.miner-launch-lineage",
+            "version": 1,
+            "miner_hotkey": settings.miner_ss58,
+            "validator": chute.validator,
+            "chute_id": chute.chute_id,
+            "chute_version": chute.version,
+            "server_id": server.server_id,
+            "kubernetes_node_uid": server.kubernetes_node_uid,
+            "kubernetes_node_generation": server.kubernetes_node_generation,
+            "gpu_allocation_group_id": server.gpu_allocation_group_id,
+            "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+            "job_id": job_id,
+        }
+        if (
+            intent is None
+            or intent.phase != "registry_acked"
+            or intent.request_payload.get("lineage") != expected_lineage
+            or (intent.response_payload or {}).get("config_id") != config_id
+            or launch_token_sha256 not in set(intent.authorized_token_sha256s or [])
+            or (intent.response_payload or {}).get("registry")
+            != (
+                {
+                    "repository": registry_repository,
+                    "manifest_digest": registry_manifest_digest,
+                }
+                if registry_repository is not None
+                else None
+            )
+        ):
+            raise DeploymentFailure("durable miner launch intent lineage conflicts")
         deployment_id = str(uuid.uuid4())
         gpu_candidates = [gpu for gpu in server.gpus if gpu.gpu_id in available_gpus][
             : chute.gpu_count
@@ -1277,6 +1611,11 @@ class K8sOperator(abc.ABC):
             deployment_id=deployment_id,
             phase="reserved",
             immutable_labels=immutable_labels,
+            launch_intent_id=launch_intent_id,
+            cluster_context=server.name,
+            cluster_context_sha256=_launch_cluster_context_sha256(server),
+            namespace=settings.namespace,
+            server_name=server.name,
         )
         session.add(launch)
         await session.flush()
@@ -1299,6 +1638,9 @@ class K8sOperator(abc.ABC):
                 f"Could only claim {claimed}/{chute.gpu_count} GPUs on {server.name} "
                 f"(contention with concurrent deployment)"
             )
+        intent.phase = "consumed"
+        intent.deployment_id = deployment_id
+        intent.last_failure = None
         await session.commit()
 
         return deployment_id, gpu_uuids
@@ -1361,6 +1703,66 @@ class K8sOperator(abc.ABC):
             launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
             await session.commit()
 
+    async def _persist_launch_resource_intent(
+        self,
+        deployment_id: str,
+        token: str | None,
+        kind: str,
+        resource: Any,
+    ) -> None:
+        canonical = canonical_workload_resource(kind, resource)
+        async with get_session() as session:
+            deployment = await session.get(
+                Deployment,
+                deployment_id,
+                with_for_update={"of": Deployment},
+            )
+            if deployment is None or not deployment.launch_operation_id:
+                raise DeploymentFailure("launch disappeared before intent persistence")
+            launch = await session.get(
+                DeploymentLaunchOperation,
+                deployment.launch_operation_id,
+                with_for_update=True,
+            )
+            if (
+                not token
+                or launch.lease_owner != token
+                or launch.phase != "creating"
+                or deployment.teardown_operation_id is not None
+            ):
+                raise DeploymentFailure("launch intent persistence was fenced")
+            closure = dict(launch.canonical_workload_spec or {})
+            existing = closure.get(kind.lower())
+            if existing is not None and existing != canonical:
+                raise DeploymentFailure(f"canonical {kind} launch intent changed")
+            closure[kind.lower()] = canonical
+            if kind == "Job":
+                token_sha256 = _launch_jwt_sha256(resource)
+                if token_sha256 is None:
+                    raise DeploymentFailure("canonical Job lacks a launch JWT")
+                intent = await session.get(
+                    MinerLaunchIntent,
+                    launch.launch_intent_id,
+                    with_for_update=True,
+                )
+                if (
+                    intent is None
+                    or intent.deployment_id != deployment_id
+                    or token_sha256 not in set(intent.authorized_token_sha256s or [])
+                ):
+                    raise DeploymentFailure(
+                        "canonical Job token was not authorized by the validator response"
+                    )
+                authorized = set(
+                    closure.get("authorized_launch_token_sha256s") or []
+                )
+                authorized.add(token_sha256)
+                closure["authorized_launch_token_sha256s"] = sorted(authorized)
+            launch.canonical_workload_spec = closure
+            launch.canonical_workload_spec_sha256 = _canonical_document_sha256(closure)
+            launch.lease_expires_at = _utc_now() + timedelta(seconds=300)
+            await session.commit()
+
     async def _record_launch_resource(
         self,
         deployment_id: str,
@@ -1378,6 +1780,7 @@ class K8sOperator(abc.ABC):
             node_name = getattr(getattr(template, "spec", None), "node_name", None)
         if not name or not uid:
             raise DeploymentFailure(f"created {kind} has no stable Kubernetes identity")
+        canonical = canonical_workload_resource(kind, resource)
         async with get_session() as session:
             deployment = await session.get(
                 Deployment,
@@ -1396,6 +1799,21 @@ class K8sOperator(abc.ABC):
                 "teardown_fenced",
             }:
                 raise DeploymentFailure("launch lease changed before UID persistence")
+            expected_canonical = (launch.canonical_workload_spec or {}).get(kind.lower())
+            if expected_canonical is None or canonical != expected_canonical:
+                raise DeploymentFailure(f"created {kind} conflicts with canonical launch spec")
+            if kind == "Job":
+                token_sha256 = _launch_jwt_sha256(resource)
+                authorized = set(
+                    (launch.canonical_workload_spec or {}).get(
+                        "authorized_launch_token_sha256s"
+                    )
+                    or []
+                )
+                if token_sha256 is None or token_sha256 not in authorized:
+                    raise DeploymentFailure(
+                        "created Job launch token was not authorized by this intent"
+                    )
             if kind == "Secret":
                 if labels.get("chutes/launch-config-id") != launch.immutable_labels.get(
                     "chutes/config-id"
@@ -1406,9 +1824,15 @@ class K8sOperator(abc.ABC):
                 for key, value in launch.immutable_labels.items()
             ):
                 raise DeploymentFailure(f"created {kind} conflicts with launch lineage")
-            if kind == "Job" and node_name != deployment.server.name:
+            if kind == "Job" and node_name != launch.server_name:
                 raise DeploymentFailure("created Job conflicts with stable server lineage")
             prefix = kind.lower()
+            captured_uid = getattr(launch, f"{prefix}_uid")
+            captured_name = getattr(launch, f"{prefix}_name")
+            if captured_uid is not None and (
+                captured_uid != uid or captured_name != name
+            ):
+                raise DeploymentFailure(f"created {kind} UID changed after capture")
             setattr(launch, f"{prefix}_name", name)
             setattr(launch, f"{prefix}_uid", uid)
             results = dict(launch.create_results or {})
@@ -1432,7 +1856,7 @@ class K8sOperator(abc.ABC):
                         DeploymentTeardownK8sResource(
                             resource_id=str(uuid.uuid4()),
                             operation_id=deployment.teardown_operation_id,
-                            cluster_context=deployment.server.name,
+                            cluster_context=launch.cluster_context,
                             namespace=str(getattr(metadata, "namespace", None) or settings.namespace),
                             api_version=str(
                                 getattr(resource, "api_version", None)
@@ -1441,6 +1865,7 @@ class K8sOperator(abc.ABC):
                             kind=kind,
                             name=name,
                             uid=uid,
+                            owner_api_version=None,
                             owner_kind=None,
                             owner_name=None,
                             owner_uid=None,
@@ -1542,6 +1967,17 @@ class K8sOperator(abc.ABC):
                 or (settings.gpu_tee_only and not launch.secret_uid)
             ):
                 raise DeploymentFailure("launch completion was fenced or lacks exact UIDs")
+            intent = await session.get(
+                MinerLaunchIntent,
+                launch.launch_intent_id,
+                with_for_update=True,
+            )
+            if (
+                intent is None
+                or intent.phase != "consumed"
+                or intent.deployment_id != deployment_id
+            ):
+                raise DeploymentFailure("launch preflight journal changed before completion")
             deployment.host = server.ip_address
             deployment.port = deployment_port
             deployment.stub = False
@@ -1550,6 +1986,9 @@ class K8sOperator(abc.ABC):
             launch.lease_owner = None
             launch.lease_expires_at = None
             launch.last_failure = None
+            intent.phase = "completed"
+            intent.completed_at = _utc_now()
+            intent.last_failure = None
             await session.commit()
             await session.refresh(deployment)
 
@@ -1773,8 +2212,9 @@ class K8sOperator(abc.ABC):
         *,
         config_id: str,
         job_id: str | None,
+        service_intent: V1Service | None = None,
     ):
-        service = build_chute_service(
+        service = service_intent or build_chute_service(
             chute,
             deployment_id,
             extra_service_ports,
@@ -1799,8 +2239,12 @@ class K8sOperator(abc.ABC):
                 namespace=settings.namespace,
                 _request_timeout=30,
             )
-            if dict(created_service.metadata.labels or {}) != dict(service.metadata.labels or {}):
-                raise DeploymentFailure("existing Service conflicts with launch lineage") from exc
+            if canonical_workload_resource(
+                "Service", created_service
+            ) != canonical_workload_resource("Service", service):
+                raise DeploymentFailure(
+                    "existing Service conflicts with canonical launch spec"
+                ) from exc
         except Exception as exc:
             raise DeploymentFailure(
                 f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
@@ -1822,9 +2266,10 @@ class K8sOperator(abc.ABC):
         registry_manifest_digest: Optional[str] = None,
         disk_gb: int = 10,
         vm_version: Optional[str] = None,
+        job_intent: V1Job | None = None,
     ) -> V1Job:
         probe_port = self._get_probe_port(chute)
-        job = build_chute_job(
+        job = job_intent or build_chute_job(
             deployment_id,
             chute,
             server,
@@ -1857,8 +2302,12 @@ class K8sOperator(abc.ABC):
                 namespace=settings.namespace,
                 _request_timeout=30,
             )
-            if dict(created_job.metadata.labels or {}) != dict(job.metadata.labels or {}):
-                raise DeploymentFailure("existing Job conflicts with launch lineage") from exc
+            if canonical_workload_resource(
+                "Job", created_job
+            ) != canonical_workload_resource("Job", job):
+                raise DeploymentFailure(
+                    "existing Job conflicts with canonical launch spec"
+                ) from exc
         except Exception as exc:
             raise DeploymentFailure(
                 f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
@@ -1875,7 +2324,7 @@ class K8sOperator(abc.ABC):
             raise DeploymentFailure("launch config ID is invalid for registry scope secret")
         return registry_pull_secret_name(config_id)
 
-    def _create_registry_pull_secret(self, config_id: str, validator: str) -> V1Secret:
+    def _build_registry_pull_secret(self, config_id: str, validator: str) -> V1Secret:
         name = self._registry_pull_secret_name(config_id)
         host = f"{validator.lower()}.localregistry.chutes.ai:{settings.registry_proxy_port}"
         credential = base64.b64encode(f"{config_id}:chutes-registry-scope".encode("ascii")).decode(
@@ -1895,7 +2344,7 @@ class K8sOperator(abc.ABC):
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
-        body = V1Secret(
+        return V1Secret(
             metadata=V1ObjectMeta(
                 name=name,
                 labels={
@@ -1906,6 +2355,14 @@ class K8sOperator(abc.ABC):
             type="kubernetes.io/dockerconfigjson",
             data={".dockerconfigjson": base64.b64encode(docker_config).decode("ascii")},
         )
+
+    def _create_registry_pull_secret(
+        self,
+        config_id: str,
+        validator: str,
+        secret_intent: V1Secret | None = None,
+    ) -> V1Secret:
+        body = secret_intent or self._build_registry_pull_secret(config_id, validator)
         try:
             return k8s_core_client().create_namespaced_secret(
                 namespace=settings.namespace,
@@ -1916,17 +2373,15 @@ class K8sOperator(abc.ABC):
             if exc.status != 409:
                 raise
             current = k8s_core_client().read_namespaced_secret(
-                name=name,
+                name=body.metadata.name,
                 namespace=settings.namespace,
                 _request_timeout=30,
             )
-            if (
-                current.type != body.type
-                or current.data != body.data
-                or (current.metadata.labels or {}).get("chutes/launch-config-id") != config_id
-            ):
+            if canonical_workload_resource(
+                "Secret", current
+            ) != canonical_workload_resource("Secret", body):
                 raise DeploymentFailure(
-                    "existing registry scope secret conflicts with launch lifecycle"
+                    "existing registry scope secret conflicts with canonical launch spec"
                 ) from exc
             return current
 

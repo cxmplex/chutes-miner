@@ -58,6 +58,8 @@ class DeploymentTeardownOperation(Base):
 
     registry_revocation_ack = Column(JSONB, nullable=True)
     registry_revoked_at = Column(DateTime(timezone=True), nullable=True)
+    validator_job_release_ack = Column(JSONB, nullable=True)
+    validator_job_released_at = Column(DateTime(timezone=True), nullable=True)
     validator_instance_deletion_ack = Column(JSONB, nullable=True)
     validator_instance_deleted_at = Column(DateTime(timezone=True), nullable=True)
     controllers_absent_at = Column(DateTime(timezone=True), nullable=True)
@@ -133,6 +135,11 @@ class DeploymentTeardownOperation(Base):
             "(validator_instance_deletion_ack IS NULL) = "
             "(validator_instance_deleted_at IS NULL)",
             name="ck_deployment_teardown_validator_ack",
+        ),
+        CheckConstraint(
+            "(validator_job_release_ack IS NULL) = "
+            "(validator_job_released_at IS NULL)",
+            name="ck_deployment_teardown_job_ack",
         ),
         CheckConstraint(
             "(pull_secret_deletion_ack IS NULL) = (pull_secret_deleted_at IS NULL)",
@@ -287,6 +294,7 @@ class DeploymentLaunchOperation(Base):
         nullable=True,
     )
     cluster_context = Column(String, nullable=True)
+    cluster_context_sha256 = Column(String, nullable=True)
     namespace = Column(String, nullable=True)
     server_name = Column(String, nullable=True)
     canonical_workload_spec = Column(JSONB, nullable=True)
@@ -326,6 +334,11 @@ class DeploymentLaunchOperation(Base):
             "canonical_workload_spec_sha256 IS NULL OR "
             "canonical_workload_spec_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_deployment_launch_canonical_workload_sha256",
+        ),
+        CheckConstraint(
+            "cluster_context_sha256 IS NULL OR "
+            "cluster_context_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_deployment_launch_cluster_context_sha256",
         ),
         CheckConstraint(
             "(service_name IS NULL) = (service_uid IS NULL)",
@@ -372,7 +385,15 @@ class MinerLaunchIntent(Base):
     response_payload = Column(JSONB, nullable=True)
     response_sha256 = Column(String, nullable=True)
     token_sha256 = Column(String, nullable=True)
+    authorized_token_sha256s = Column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
     registry_ack = Column(JSONB, nullable=True)
+    job_release_ack = Column(JSONB, nullable=True)
+    job_released_at = Column(DateTime(timezone=True), nullable=True)
     deployment_id = Column(String, nullable=True)
     last_failure = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -405,6 +426,14 @@ class MinerLaunchIntent(Base):
             "AND response_sha256 ~ '^[0-9a-f]{64}$' "
             "AND token_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_miner_launch_intent_response",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(authorized_token_sha256s) = 'array'",
+            name="ck_miner_launch_intent_authorized_tokens",
+        ),
+        CheckConstraint(
+            "(job_release_ack IS NULL) = (job_released_at IS NULL)",
+            name="ck_miner_launch_intent_job_ack",
         ),
         Index(
             "miner_launch_intent_recovery_idx",

@@ -86,6 +86,13 @@ async def adopt_seedless_gpu_server() -> str:
             {"metadata": {"labels": labels}},
         )
         labels = dict(node.metadata.labels or labels)
+    if labels.get("chutes/seedless-adopted") != logical_server_id:
+        labels["chutes/seedless-adopted"] = logical_server_id
+        node = k8s_core_client().patch_node(
+            node.metadata.name,
+            {"metadata": {"labels": labels}},
+        )
+        labels = dict(node.metadata.labels or labels)
     gpu_count, cpu_per_gpu, memory_per_gpu = _node_resources(node)
 
     async with get_session() as session:
@@ -295,10 +302,4 @@ async def adopt_seedless_gpu_server() -> str:
             gpu.gpu_allocation_group_id = identity["allocation_group_id"]
             gpu.gpu_allocation_group_generation = identity["allocation_group_generation"]
         await session.commit()
-    if labels.get("chutes/seedless-adopted") != logical_server_id:
-        labels["chutes/seedless-adopted"] = logical_server_id
-        k8s_core_client().patch_node(
-            node.metadata.name,
-            {"metadata": {"labels": labels}},
-        )
     return logical_server_id

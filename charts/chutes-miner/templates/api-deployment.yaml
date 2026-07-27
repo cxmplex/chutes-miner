@@ -142,6 +142,13 @@ spec:
             periodSeconds: 2
             timeoutSeconds: 1
             failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 180
           livenessProbe:
             httpGet:
               path: /ping

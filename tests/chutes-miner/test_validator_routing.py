@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
@@ -22,6 +23,10 @@ def _gepetto() -> Gepetto:
     gepetto.remote_server_versions = {VALIDATOR: {"server-1": "1.8.0"}}
     gepetto.remote_chutes = {VALIDATOR: {}}
     gepetto.global_active_instances = {VALIDATOR: []}
+    gepetto._begin_launch_intent = AsyncMock(return_value="request-1")
+    gepetto._record_launch_response = AsyncMock()
+    gepetto._record_registry_ack = AsyncMock()
+    gepetto._record_launch_intent_failure = AsyncMock()
     return gepetto
 
 
@@ -48,8 +53,13 @@ def _server(**overrides):
         "validator": VALIDATOR,
         "name": "gpu-1",
         "ip_address": "192.0.2.10",
+        "kubeconfig": None,
         "is_tee": False,
         "hourly_cost": 1.0,
+        "kubernetes_node_uid": "node-uid-1",
+        "kubernetes_node_generation": 1,
+        "gpu_allocation_group_id": "group-1",
+        "gpu_allocation_group_generation": 1,
         "gpus": [SimpleNamespace(deployment_id=None, model_short_ref="h100")],
         "deployments": [],
     }
@@ -183,6 +193,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
     assert await gepetto.get_launch_token(_chute(), _server()) == {
         "token": "launch-token",
         "config_id": "config-1",
+        "_miner_launch_request_id": "request-1",
     }
 
     mock_aiohttp_response.json.return_value = {
@@ -225,6 +236,31 @@ async def test_seedless_launch_token_registers_exact_descriptor_scope(
     assert result["registry"]["manifest_digest"] == root
     gepetto._register_registry_scope.assert_awaited_once()
     assert gepetto._register_registry_scope.await_args.args[1] is server
+
+
+@pytest.mark.asyncio
+async def test_launch_token_replay_uses_persisted_request_id(
+    mock_aiohttp_response,
+    mock_aiohttp_client_session,
+):
+    gepetto = _gepetto()
+    mock_aiohttp_response.status = 200
+    mock_aiohttp_response.json.return_value = {
+        "token": "fresh-token",
+        "config_id": "config-1",
+    }
+
+    await gepetto.get_launch_token(_chute(), _server(), job_id="job-1")
+
+    request = mock_aiohttp_client_session.return_value.get
+    assert request.call_args.kwargs["params"] == {
+        "chute_id": "chute-1",
+        "server_id": "server-1",
+        "job_id": "job-1",
+        "miner_launch_request_id": "request-1",
+    }
+    gepetto._record_launch_response.assert_awaited_once()
+    gepetto._record_registry_ack.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -396,7 +432,11 @@ async def test_run_job_propagates_version_and_launch_context():
     chute = _chute()
     server = _server()
     gepetto.get_launch_token = AsyncMock(
-        return_value={"token": "launch-jwt", "config_id": "config-1"}
+        return_value={
+            "token": "launch-jwt",
+            "config_id": "config-1",
+            "_miner_launch_request_id": "request-1",
+        }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[{"port": 9000}])
     gepetto.release_job = AsyncMock()
@@ -461,7 +501,11 @@ async def test_normal_scale_up_propagates_server_version():
     gepetto.count_non_job_deployments = AsyncMock(side_effect=[0, 1])
     gepetto.optimal_scale_up_server = AsyncMock(return_value=server)
     gepetto.get_launch_token = AsyncMock(
-        return_value={"token": "launch-jwt", "config_id": "config-1"}
+        return_value={
+            "token": "launch-jwt",
+            "config_id": "config-1",
+            "_miner_launch_request_id": "request-1",
+        }
     )
     deployment = SimpleNamespace(deployment_id="deployment-1")
 
@@ -486,7 +530,11 @@ async def test_preemption_job_propagates_version_and_job_identity():
         _ScalarResult(scalars=[server]),
     ]
     gepetto.get_launch_token = AsyncMock(
-        return_value={"token": "launch-jwt", "config_id": "config-1"}
+        return_value={
+            "token": "launch-jwt",
+            "config_id": "config-1",
+            "_miner_launch_request_id": "request-1",
+        }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[])
     gepetto.release_job = AsyncMock()
@@ -586,7 +634,11 @@ async def test_rolling_update_propagates_version_on_matching_server():
     gepetto.undeploy = AsyncMock()
     gepetto.load_chute = AsyncMock(return_value=chute)
     gepetto.get_launch_token = AsyncMock(
-        return_value={"token": "launch-jwt", "config_id": "config-2"}
+        return_value={
+            "token": "launch-jwt",
+            "config_id": "config-2",
+            "_miner_launch_request_id": "request-2",
+        }
     )
     created = SimpleNamespace(deployment_id="deployment-new")
 
@@ -688,12 +740,35 @@ async def test_rolling_update_does_not_remove_cross_validator_server():
 
 
 class _ClaimSession:
-    def __init__(self, claimed):
+    def __init__(self, claimed, *, chute, server, job_id=None):
         self.claimed = claimed
         self.added = []
         self.statement = None
         self.flushed = False
         self.committed = False
+        self.intent = SimpleNamespace(
+            phase="registry_acked",
+            request_payload={
+                "lineage": {
+                    "schema": "chutes.miner-launch-lineage",
+                    "version": 1,
+                    "miner_hotkey": settings.miner_ss58,
+                    "validator": chute.validator,
+                    "chute_id": chute.chute_id,
+                    "chute_version": chute.version,
+                    "server_id": server.server_id,
+                    "kubernetes_node_uid": server.kubernetes_node_uid,
+                    "kubernetes_node_generation": server.kubernetes_node_generation,
+                    "gpu_allocation_group_id": server.gpu_allocation_group_id,
+                    "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+                    "job_id": job_id,
+                }
+            },
+            response_payload={"config_id": None, "registry": None},
+            authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
+            deployment_id=None,
+            last_failure=None,
+        )
 
     def add(self, value):
         self.added.append(value)
@@ -707,6 +782,9 @@ class _ClaimSession:
 
     async def scalar(self, _statement):
         return None
+
+    async def get(self, _model, identity, **_kwargs):
+        return self.intent if identity == "launch-intent-1" else None
 
     async def commit(self):
         self.committed = True
@@ -729,9 +807,16 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
         ]
     )
     available = {gpu.gpu_id for gpu in server.gpus}
-    session = _ClaimSession(claimed=2)
+    session = _ClaimSession(claimed=2, chute=chute, server=server)
 
-    deployment_id, gpu_uuids = await operator._track_deployment(session, chute, server, available)
+    deployment_id, gpu_uuids = await operator._track_deployment(
+        session,
+        chute,
+        server,
+        available,
+        launch_intent_id="launch-intent-1",
+        launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+    )
 
     assert deployment_id
     assert len(gpu_uuids) == 2
@@ -757,7 +842,7 @@ async def test_atomic_gpu_claim_fails_on_partial_contention():
             for _ in range(2)
         ]
     )
-    session = _ClaimSession(claimed=1)
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
 
     with pytest.raises(DeploymentFailure, match="Could only claim 1/2"):
         await operator._track_deployment(
@@ -765,8 +850,41 @@ async def test_atomic_gpu_claim_fails_on_partial_contention():
             chute,
             server,
             {gpu.gpu_id for gpu in server.gpus},
+            launch_intent_id="launch-intent-1",
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
         )
 
+    assert not session.committed
+
+
+@pytest.mark.asyncio
+async def test_atomic_gpu_claim_rejects_token_not_returned_for_launch_intent():
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+
+    with pytest.raises(DeploymentFailure, match="launch intent lineage conflicts"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_token_sha256=hashlib.sha256(b"attacker-token").hexdigest(),
+        )
+
+    assert not session.added
     assert not session.committed
 
 

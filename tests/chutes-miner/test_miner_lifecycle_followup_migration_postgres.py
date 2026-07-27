@@ -139,7 +139,7 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
             WHERE table_schema = current_schema()
               AND table_name = 'deployment_launch_operations'
               AND column_name IN (
-                  'cluster_context', 'namespace', 'server_name',
+                  'cluster_context', 'cluster_context_sha256', 'namespace', 'server_name',
                   'canonical_workload_spec', 'canonical_workload_spec_sha256',
                   'launch_intent_id'
               );
@@ -158,7 +158,7 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
         _assert_ok(inspected)
         assert [
             line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["t", "6", "2"]
+        ] == ["t", "7", "2"]
 
         _assert_ok(_psql(f"BEGIN;\n{FOLLOWUP_DOWN}\nCOMMIT;", schema=schema))
         restored = _psql(
@@ -169,7 +169,7 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
             WHERE table_schema = current_schema()
               AND table_name = 'deployment_launch_operations'
               AND column_name IN (
-                  'cluster_context', 'namespace', 'server_name',
+                  'cluster_context', 'cluster_context_sha256', 'namespace', 'server_name',
                   'canonical_workload_spec', 'canonical_workload_spec_sha256',
                   'launch_intent_id'
               );

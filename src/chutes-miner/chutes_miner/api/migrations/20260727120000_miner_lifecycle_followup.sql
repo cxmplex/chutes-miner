@@ -14,7 +14,10 @@ CREATE TABLE IF NOT EXISTS miner_launch_intents (
     response_payload JSONB,
     response_sha256 TEXT,
     token_sha256 TEXT,
+    authorized_token_sha256s JSONB NOT NULL DEFAULT '[]'::jsonb,
     registry_ack JSONB,
+    job_release_ack JSONB,
+    job_released_at TIMESTAMPTZ,
     deployment_id TEXT,
     last_failure TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -44,8 +47,28 @@ CREATE TABLE IF NOT EXISTS miner_launch_intents (
             AND response_sha256 ~ '^[0-9a-f]{64}$'
             AND token_sha256 ~ '^[0-9a-f]{64}$'
         )
+    ),
+    CONSTRAINT ck_miner_launch_intent_authorized_tokens CHECK (
+        jsonb_typeof(authorized_token_sha256s) = 'array'
+    ),
+    CONSTRAINT ck_miner_launch_intent_job_ack CHECK (
+        (job_release_ack IS NULL) = (job_released_at IS NULL)
     )
 );
+ALTER TABLE miner_launch_intents
+    ADD COLUMN IF NOT EXISTS authorized_token_sha256s JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS job_release_ack JSONB,
+    ADD COLUMN IF NOT EXISTS job_released_at TIMESTAMPTZ;
+ALTER TABLE miner_launch_intents
+    DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_authorized_tokens,
+    DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_job_ack;
+ALTER TABLE miner_launch_intents
+    ADD CONSTRAINT ck_miner_launch_intent_authorized_tokens CHECK (
+        jsonb_typeof(authorized_token_sha256s) = 'array'
+    ),
+    ADD CONSTRAINT ck_miner_launch_intent_job_ack CHECK (
+        (job_release_ack IS NULL) = (job_released_at IS NULL)
+    );
 CREATE INDEX IF NOT EXISTS miner_launch_intent_recovery_idx
     ON miner_launch_intents (phase, created_at)
     WHERE phase NOT IN ('completed', 'failed');
@@ -55,6 +78,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS miner_launch_intent_active_lineage_key
 
 ALTER TABLE deployment_launch_operations
     ADD COLUMN IF NOT EXISTS cluster_context TEXT,
+    ADD COLUMN IF NOT EXISTS cluster_context_sha256 TEXT,
     ADD COLUMN IF NOT EXISTS namespace TEXT,
     ADD COLUMN IF NOT EXISTS server_name TEXT,
     ADD COLUMN IF NOT EXISTS canonical_workload_spec JSONB,
@@ -86,6 +110,13 @@ ALTER TABLE deployment_launch_operations
         canonical_workload_spec_sha256 IS NULL
         OR canonical_workload_spec_sha256 ~ '^[0-9a-f]{64}$'
     );
+ALTER TABLE deployment_launch_operations
+    DROP CONSTRAINT IF EXISTS ck_deployment_launch_cluster_context_sha256;
+ALTER TABLE deployment_launch_operations
+    ADD CONSTRAINT ck_deployment_launch_cluster_context_sha256 CHECK (
+        cluster_context_sha256 IS NULL
+        OR cluster_context_sha256 ~ '^[0-9a-f]{64}$'
+    );
 
 ALTER TABLE deployment_teardown_k8s_resources
     ADD COLUMN IF NOT EXISTS owner_api_version TEXT;
@@ -112,6 +143,17 @@ ALTER TABLE deployment_teardown_k8s_resources
             AND owner_name IS NOT NULL
             AND owner_uid IS NOT NULL
         )
+    );
+
+ALTER TABLE deployment_teardown_operations
+    ADD COLUMN IF NOT EXISTS validator_job_release_ack JSONB,
+    ADD COLUMN IF NOT EXISTS validator_job_released_at TIMESTAMPTZ;
+ALTER TABLE deployment_teardown_operations
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_job_ack;
+ALTER TABLE deployment_teardown_operations
+    ADD CONSTRAINT ck_deployment_teardown_job_ack CHECK (
+        (validator_job_release_ack IS NULL) =
+        (validator_job_released_at IS NULL)
     );
 
 ALTER TABLE kubernetes_orphan_tombstone_resources
@@ -145,6 +187,7 @@ ALTER TABLE kubernetes_orphan_tombstone_resources
 
 LOCK TABLE
     deployment_launch_operations,
+    deployment_teardown_operations,
     deployment_teardown_k8s_resources,
     kubernetes_orphan_tombstone_resources,
     miner_launch_intents
@@ -158,11 +201,21 @@ BEGIN
         WHERE canonical_workload_spec IS NOT NULL
            OR canonical_workload_spec_sha256 IS NOT NULL
            OR cluster_context IS NOT NULL
+           OR cluster_context_sha256 IS NOT NULL
            OR namespace IS NOT NULL
            OR server_name IS NOT NULL
     ) THEN
         RAISE EXCEPTION
             'cannot remove miner lifecycle follow-up schema while canonical launch intents exist';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM deployment_teardown_operations
+        WHERE validator_job_release_ack IS NOT NULL
+           OR validator_job_released_at IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'cannot remove miner lifecycle follow-up schema while validator job release history exists';
     END IF;
     IF EXISTS (SELECT 1 FROM miner_launch_intents) THEN
         RAISE EXCEPTION
@@ -170,6 +223,11 @@ BEGIN
     END IF;
 END
 $$;
+
+ALTER TABLE deployment_teardown_operations
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_job_ack,
+    DROP COLUMN IF EXISTS validator_job_released_at,
+    DROP COLUMN IF EXISTS validator_job_release_ack;
 
 ALTER TABLE kubernetes_orphan_tombstone_resources
     DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_owner;
@@ -197,10 +255,12 @@ DROP INDEX IF EXISTS deployment_launch_intent_key;
 ALTER TABLE deployment_launch_operations
     DROP CONSTRAINT IF EXISTS ck_deployment_launch_canonical_workload,
     DROP CONSTRAINT IF EXISTS ck_deployment_launch_canonical_workload_sha256,
+    DROP CONSTRAINT IF EXISTS ck_deployment_launch_cluster_context_sha256,
     DROP COLUMN IF EXISTS canonical_workload_spec_sha256,
     DROP COLUMN IF EXISTS canonical_workload_spec,
     DROP COLUMN IF EXISTS server_name,
     DROP COLUMN IF EXISTS namespace,
+    DROP COLUMN IF EXISTS cluster_context_sha256,
     DROP COLUMN IF EXISTS cluster_context,
     DROP COLUMN IF EXISTS launch_intent_id;
 

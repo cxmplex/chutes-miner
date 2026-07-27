@@ -17,7 +17,10 @@ from chutes_common.schemas import Base
 from chutes_miner.api.config import settings
 from chutes_miner.api.socket_client import SocketClient
 from chutes_miner.api.server.seedless_adoption import adopt_seedless_gpu_server
-from chutes_miner.api.schema_barrier import wait_for_required_schema
+from chutes_miner.api.schema_barrier import (
+    wait_for_required_schema,
+    wait_for_seedless_adoption,
+)
 
 
 @asynccontextmanager
@@ -37,6 +40,8 @@ async def lifespan(application: FastAPI):
     if not is_migration_process:
         await leader_connection.close()
         await wait_for_required_schema(engine)
+        if settings.gpu_tee_only:
+            await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)
         application.state.schema_ready = True
         try:
             yield
@@ -85,6 +90,7 @@ async def lifespan(application: FastAPI):
         if settings.gpu_tee_only:
             server_id = await adopt_seedless_gpu_server()
             logger.success(f"adopted registrar-created logical GPU server {server_id}")
+            await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)
 
         for validator in settings.validators:
             socket_client = SocketClient(

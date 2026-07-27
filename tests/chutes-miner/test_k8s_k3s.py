@@ -4,7 +4,9 @@ Unit tests for kubernetes helper module.
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
+import hashlib
 import json
+from types import SimpleNamespace
 from typing import Any, Dict
 import uuid
 from chutes_common.monitoring.messages import ResourceChangeMessage
@@ -19,6 +21,7 @@ from chutes_common.k8s import WatchEvent, WatchEventType, serializer
 from chutes_common.schemas.deployment import Deployment
 import chutes_miner.api.k8s as k8s
 from chutes_miner.api.exceptions import DeploymentFailure
+from chutes_miner.api.config import settings
 from chutes_miner.api.k8s.constants import (
     CHUTE_DEPLOY_PREFIX,
     SEARCH_DEPLOYMENTS_PATH,
@@ -28,8 +31,33 @@ from chutes_miner.api.k8s.operator import K8sOperator, MultiClusterK8sOperator
 
 
 @contextmanager
-def _mock_durable_launch(mock_db_session, deployment):
+def _mock_durable_launch(mock_db_session, deployment, chute, server):
     mock_db_session.scalar = AsyncMock(return_value=None)
+    mock_db_session.get = AsyncMock(
+        return_value=SimpleNamespace(
+            phase="registry_acked",
+            request_payload={
+                "lineage": {
+                    "schema": "chutes.miner-launch-lineage",
+                    "version": 1,
+                    "miner_hotkey": settings.miner_ss58,
+                    "validator": chute.validator,
+                    "chute_id": chute.chute_id,
+                    "chute_version": chute.version,
+                    "server_id": server.server_id,
+                    "kubernetes_node_uid": server.kubernetes_node_uid,
+                    "kubernetes_node_generation": server.kubernetes_node_generation,
+                    "gpu_allocation_group_id": server.gpu_allocation_group_id,
+                    "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
+                    "job_id": None,
+                }
+            },
+            response_payload={"config_id": "config-1", "registry": None},
+            authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
+            deployment_id=None,
+            last_failure=None,
+        )
+    )
 
     async def finish(_deployment_id, server, service, _token):
         if deployment is None:
@@ -43,6 +71,7 @@ def _mock_durable_launch(mock_db_session, deployment):
     with (
         patch.object(K8sOperator, "_claim_launch", AsyncMock(return_value="claim-token")),
         patch.object(K8sOperator, "_assert_launch_creation_allowed", AsyncMock()),
+        patch.object(K8sOperator, "_persist_launch_resource_intent", AsyncMock()),
         patch.object(K8sOperator, "_record_launch_resource", AsyncMock()),
         patch.object(K8sOperator, "_fail_launch", AsyncMock()),
         patch.object(K8sOperator, "_update_deployment", side_effect=finish),
@@ -662,12 +691,13 @@ async def test_deploy_chute_success(
             "chutes_miner.api.k8s.operator.uuid.uuid4",
             return_value=mock_deployment_db.deployment_id,
         ),
-        _mock_durable_launch(mock_db_session, mock_deployment_db),
+        _mock_durable_launch(mock_db_session, mock_deployment_db, sample_chute, sample_server),
     ):
         deployment, created_deployment = await k8s.deploy_chute(
             sample_chute,
             sample_server,
             token="launch-token",
+            launch_intent_id="launch-intent-1",
             config_id="config-1",
         )
 
@@ -768,7 +798,7 @@ async def test_deploy_chute_deployment_disappeared(
     # Call the function and expect exception
     with (
         patch("chutes_miner.api.k8s.operator.uuid.uuid4", return_value=deployment_id),
-        _mock_durable_launch(mock_db_session, None),
+        _mock_durable_launch(mock_db_session, None, sample_chute, sample_server),
         patch.object(
             K8sOperator,
             "_clear_deployment",
@@ -781,6 +811,7 @@ async def test_deploy_chute_deployment_disappeared(
                 sample_chute,
                 sample_server,
                 token="launch-token",
+                launch_intent_id="launch-intent-1",
                 config_id="config-1",
             )
     rollback.assert_awaited_once_with(deployment_id)
@@ -830,7 +861,7 @@ async def test_deploy_chute_api_exception(
 
     # Call the function and expect exception
     with (
-        _mock_durable_launch(mock_db_session, mock_deployment_db),
+        _mock_durable_launch(mock_db_session, mock_deployment_db, sample_chute, sample_server),
         patch.object(
             K8sOperator,
             "_clear_deployment",
@@ -843,6 +874,7 @@ async def test_deploy_chute_api_exception(
                 sample_chute,
                 sample_server,
                 token="launch-token",
+                launch_intent_id="launch-intent-1",
                 config_id="config-1",
             )
     rollback.assert_awaited_once()
