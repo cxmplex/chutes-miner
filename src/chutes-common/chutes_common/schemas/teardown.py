@@ -6,6 +6,7 @@ import uuid
 
 from chutes_common.schemas import Base
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
@@ -379,6 +380,12 @@ class MinerLaunchIntent(Base):
     chute_version = Column(String, nullable=False)
     server_id = Column(String, nullable=False)
     job_id = Column(String, nullable=True)
+    job_cleanup_only = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("FALSE"),
+    )
     request_payload = Column(JSONB, nullable=False)
     request_sha256 = Column(String, nullable=False)
     lineage_sha256 = Column(String, nullable=False)
@@ -434,6 +441,13 @@ class MinerLaunchIntent(Base):
         CheckConstraint(
             "(job_release_ack IS NULL) = (job_released_at IS NULL)",
             name="ck_miner_launch_intent_job_ack",
+        ),
+        CheckConstraint(
+            "NOT job_cleanup_only OR (job_id IS NOT NULL "
+            "AND response_payload IS NULL AND response_sha256 IS NULL "
+            "AND token_sha256 IS NULL AND registry_ack IS NULL "
+            "AND deployment_id IS NULL)",
+            name="ck_miner_launch_intent_job_cleanup_only",
         ),
         Index(
             "miner_launch_intent_recovery_idx",

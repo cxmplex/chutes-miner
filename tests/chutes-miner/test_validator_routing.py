@@ -27,6 +27,8 @@ def _gepetto() -> Gepetto:
     gepetto._record_launch_response = AsyncMock()
     gepetto._record_registry_ack = AsyncMock()
     gepetto._record_launch_intent_failure = AsyncMock()
+    gepetto._begin_job_cleanup_intent = AsyncMock(return_value="job-cleanup-1")
+    gepetto.abort_launch_intent = AsyncMock(return_value=True)
     return gepetto
 
 
@@ -203,6 +205,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
     }
     with pytest.raises(DeploymentFailure, match="expected exactly"):
         await gepetto.get_launch_token(_chute(), _server())
+    gepetto.abort_launch_intent.assert_awaited_once_with("request-1")
 
     mock_aiohttp_response.json.return_value = {
         "token": "launch-token",
@@ -439,7 +442,6 @@ async def test_run_job_propagates_version_and_launch_context():
         }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[{"port": 9000}])
-    gepetto.release_job = AsyncMock()
     deployment = SimpleNamespace(deployment_id="deployment-1")
 
     with patch.object(
@@ -467,12 +469,12 @@ async def test_job_path_rejects_nonpositive_hourly_cost_before_token_fetch():
     chute = _chute()
     server = _server(hourly_cost=0.0)
     gepetto.get_launch_token = AsyncMock()
-    gepetto.release_job = AsyncMock()
     with patch.object(gepetto_module.k8s, "deploy_chute", new=AsyncMock()) as deploy:
         await gepetto.run_job(chute, "job-1", server, settings.validators[0])
     gepetto.get_launch_token.assert_not_awaited()
     deploy.assert_not_awaited()
-    gepetto.release_job.assert_awaited_once_with(chute, "job-1")
+    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(chute, server, "job-1")
+    gepetto.abort_launch_intent.assert_awaited_once_with("job-cleanup-1")
 
 
 @pytest.mark.asyncio
@@ -482,14 +484,14 @@ async def test_run_job_rejects_cross_validator_server_before_token_fetch():
     server = _server(validator="different-validator")
     gepetto.get_launch_token = AsyncMock()
     gepetto._get_job_extra_services = AsyncMock()
-    gepetto.release_job = AsyncMock()
 
     with patch.object(gepetto_module.k8s, "deploy_chute", new=AsyncMock()) as deploy:
         await gepetto.run_job(chute, "job-1", server, settings.validators[0])
 
     gepetto.get_launch_token.assert_not_awaited()
     deploy.assert_not_awaited()
-    gepetto.release_job.assert_awaited_once_with(chute, "job-1")
+    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(chute, server, "job-1")
+    gepetto.abort_launch_intent.assert_awaited_once_with("job-cleanup-1")
 
 
 @pytest.mark.asyncio
@@ -537,7 +539,6 @@ async def test_preemption_job_propagates_version_and_job_identity():
         }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[])
-    gepetto.release_job = AsyncMock()
     deployment = SimpleNamespace(deployment_id="deployment-1")
 
     with (

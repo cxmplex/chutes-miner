@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from kubernetes.client import (
@@ -18,21 +18,30 @@ from kubernetes.client import (
     V1JobSpec,
     V1LocalObjectReference,
     V1ObjectMeta,
+    V1OwnerReference,
     V1PodSecurityContext,
     V1PodSpec,
     V1PodTemplateSpec,
     V1ResourceRequirements,
     V1SecurityContext,
+    V1Secret,
     V1Service,
     V1ServicePort,
     V1ServiceSpec,
     V1Volume,
     V1VolumeMount,
 )
+from kubernetes.client.rest import ApiException
 
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s import operator as operator_module
-from chutes_miner.api.k8s.operator import K8sOperator, canonical_workload_resource
+from chutes_miner.api.k8s.operator import (
+    AmbiguousKubernetesCreate,
+    K8sOperator,
+    _canonical_document_sha256,
+    _adopt_named_resource_after_create_error,
+    canonical_workload_resource,
+)
 import chutes_miner.gepetto as gepetto_module
 from chutes_miner.gepetto import Gepetto
 
@@ -189,6 +198,32 @@ def test_canonical_job_accepts_only_known_api_defaults_and_fresh_launch_token():
         lambda job: job.spec.template.spec.containers[0].resources.limits.update(
             {"memory": "16Gi"}
         ),
+        lambda job: setattr(job.spec, "suspend", True),
+        lambda job: setattr(
+            job.spec.template.spec.containers[0],
+            "working_dir",
+            "/other",
+        ),
+        lambda job: setattr(
+            job.spec.template.spec.containers[0],
+            "lifecycle",
+            {"preStop": {"exec": {"command": ["sh", "-c", "sleep 30"]}}},
+        ),
+        lambda job: setattr(
+            job.spec.template.spec.containers[0],
+            "env_from",
+            [{"secretRef": {"name": "foreign-secret"}}],
+        ),
+        lambda job: setattr(
+            job.spec.template.spec,
+            "host_aliases",
+            [{"ip": "127.0.0.1", "hostnames": ["authority.local"]}],
+        ),
+        lambda job: setattr(
+            job.spec.template.spec,
+            "dns_config",
+            {"nameservers": ["203.0.113.53"]},
+        ),
     ],
 )
 def test_canonical_job_rejects_runtime_authority_or_placement_drift(mutate):
@@ -209,6 +244,8 @@ def test_canonical_service_ignores_allocated_node_port_but_not_selector_or_targe
     readback.spec.ip_families = ["IPv4"]
     readback.spec.ip_family_policy = "SingleStack"
     readback.spec.session_affinity = "None"
+    readback.spec.internal_traffic_policy = "Cluster"
+    readback.spec.publish_not_ready_addresses = False
     readback.spec.ports[0].node_port = 32001
     assert canonical_workload_resource(
         "Service", readback
@@ -224,6 +261,124 @@ def test_canonical_service_ignores_allocated_node_port_but_not_selector_or_targe
         "Service", readback
     ) != canonical_workload_resource("Service", intended)
 
+    readback = deepcopy(intended)
+    readback.spec.publish_not_ready_addresses = True
+    assert canonical_workload_resource(
+        "Service", readback
+    ) != canonical_workload_resource("Service", intended)
+    readback = deepcopy(intended)
+    readback.spec.internal_traffic_policy = "Local"
+    assert canonical_workload_resource(
+        "Service", readback
+    ) != canonical_workload_resource("Service", intended)
+
+
+@pytest.mark.parametrize("state", ["owned", "terminating"])
+def test_canonical_adoption_rejects_foreign_ownership_and_deletion(state):
+    intended = _job()
+    conflicting = deepcopy(intended)
+    if state == "owned":
+        conflicting.metadata.owner_references = [
+            V1OwnerReference(
+                api_version="apps/v1",
+                kind="Deployment",
+                name="foreign",
+                uid="foreign-uid",
+            )
+        ]
+    else:
+        conflicting.metadata.deletion_timestamp = "2026-07-27T12:00:00Z"
+    assert canonical_workload_resource(
+        "Job", conflicting
+    ) != canonical_workload_resource("Job", intended)
+
+
+def test_service_timeout_after_create_adopts_exact_persisted_object(monkeypatch):
+    intended = _service()
+    persisted = deepcopy(intended)
+    persisted.metadata.uid = "service-uid"
+    core = SimpleNamespace(read_namespaced_service=Mock(return_value=persisted))
+    monkeypatch.setattr(operator_module, "k8s_core_client", lambda: core)
+    operator = object.__new__(operator_module.SingleClusterK8sOperator)
+    operator._manager = None
+    operator._deploy_service = Mock(side_effect=TimeoutError("response lost"))
+
+    result = operator._create_service_for_deployment(
+        SimpleNamespace(chute_id="chute-1"),
+        SimpleNamespace(name="node-1"),
+        "deployment-1",
+        config_id="config-1",
+        job_id=None,
+        service_intent=intended,
+    )
+    assert result.metadata.uid == "service-uid"
+
+
+def test_job_gateway_timeout_after_create_adopts_exact_persisted_object(monkeypatch):
+    intended = _job()
+    persisted = deepcopy(intended)
+    persisted.metadata.uid = "job-uid"
+    batch = SimpleNamespace(read_namespaced_job=Mock(return_value=persisted))
+    monkeypatch.setattr(operator_module, "k8s_batch_client", lambda: batch)
+    operator = object.__new__(operator_module.SingleClusterK8sOperator)
+    operator._manager = None
+    operator._get_probe_port = Mock(return_value=8001)
+    operator._deploy_job_for_deployment = Mock(
+        side_effect=ApiException(status=504, reason="response lost")
+    )
+
+    result = operator._create_job_for_deployment(
+        "deployment-1",
+        SimpleNamespace(chute_id="chute-1"),
+        SimpleNamespace(name="node-1"),
+        _service(),
+        ["GPU-a", "GPU-b"],
+        job_intent=intended,
+    )
+    assert result.metadata.uid == "job-uid"
+
+
+def test_secret_timeout_after_create_adopts_exact_persisted_object(monkeypatch):
+    intended = V1Secret(
+        api_version="v1",
+        kind="Secret",
+        metadata=V1ObjectMeta(
+            name="registry-config-1",
+            labels={"chutes/launch-config-id": "config-1"},
+        ),
+        type="kubernetes.io/dockerconfigjson",
+        data={".dockerconfigjson": "e30="},
+    )
+    persisted = deepcopy(intended)
+    persisted.metadata.uid = "secret-uid"
+    core = SimpleNamespace(
+        create_namespaced_secret=Mock(side_effect=TimeoutError("response lost")),
+        read_namespaced_secret=Mock(return_value=persisted),
+    )
+    monkeypatch.setattr(operator_module, "k8s_core_client", lambda: core)
+    operator = object.__new__(operator_module.SingleClusterK8sOperator)
+    result = operator._create_registry_pull_secret(
+        "config-1",
+        "validator-1",
+        intended,
+    )
+    assert result.metadata.uid == "secret-uid"
+
+
+def test_unresolved_ambiguous_create_is_not_treated_as_absent():
+    intended = _service()
+
+    def missing():
+        raise ApiException(status=404, reason="not yet visible")
+
+    with pytest.raises(AmbiguousKubernetesCreate, match="result is unknown"):
+        _adopt_named_resource_after_create_error(
+            kind="Service",
+            intended=intended,
+            create_error=TimeoutError("response lost"),
+            read=missing,
+        )
+
 
 @pytest.mark.asyncio
 async def test_first_captured_kubernetes_uid_is_immutable(monkeypatch):
@@ -237,6 +392,9 @@ async def test_first_captured_kubernetes_uid_is_immutable(monkeypatch):
         lease_owner="lease-1",
         phase="creating",
         canonical_workload_spec={"service": expected},
+        canonical_workload_spec_sha256=_canonical_document_sha256(
+            {"service": expected}
+        ),
         immutable_labels=LABELS,
         server_name="node-1",
         cluster_context="node-1",
@@ -268,6 +426,89 @@ async def test_first_captured_kubernetes_uid_is_immutable(monkeypatch):
         )
     assert launch.service_uid == "first-uid"
     session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_canonical_digest_mismatch_fails_before_uid_capture(monkeypatch):
+    deployment = SimpleNamespace(
+        launch_operation_id="launch-1",
+        teardown_operation_id=None,
+    )
+    intended = _service()
+    intended.metadata.uid = "service-uid"
+    launch = SimpleNamespace(
+        lease_owner="lease-1",
+        phase="creating",
+        canonical_workload_spec={
+            "service": canonical_workload_resource("Service", intended)
+        },
+        canonical_workload_spec_sha256="0" * 64,
+        immutable_labels=LABELS,
+        server_name="node-1",
+        cluster_context="node-1",
+        service_name=None,
+        service_uid=None,
+        create_results={},
+    )
+    session = SimpleNamespace(commit=AsyncMock())
+
+    async def get(model, *_args, **_kwargs):
+        return deployment if model.__name__ == "Deployment" else launch
+
+    session.get = AsyncMock(side_effect=get)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(operator_module, "get_session", fake_session)
+    with pytest.raises(DeploymentFailure, match="closure digest is invalid"):
+        await K8sOperator._record_launch_resource(
+            SimpleNamespace(),
+            "deployment-1",
+            "lease-1",
+            "Service",
+            intended,
+        )
+    assert launch.service_uid is None
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_create_retains_lease_until_teardown_can_prove_absence(
+    monkeypatch,
+):
+    deployment = SimpleNamespace(launch_operation_id="launch-1")
+    lease_expiry = object()
+    launch = SimpleNamespace(
+        lease_owner="lease-1",
+        lease_expires_at=lease_expiry,
+        phase="creating",
+        last_failure=None,
+    )
+    session = SimpleNamespace(commit=AsyncMock())
+
+    async def get(model, *_args, **_kwargs):
+        return deployment if model.__name__ == "Deployment" else launch
+
+    session.get = AsyncMock(side_effect=get)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(operator_module, "get_session", fake_session)
+    await K8sOperator._fail_launch(
+        SimpleNamespace(),
+        "deployment-1",
+        "lease-1",
+        AmbiguousKubernetesCreate("create response lost"),
+    )
+    assert launch.phase == "creating"
+    assert launch.lease_owner == "lease-1"
+    assert launch.lease_expires_at is lease_expiry
+    assert "AmbiguousKubernetesCreate" in launch.last_failure
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -315,6 +556,56 @@ async def test_launch_response_replay_accumulates_only_validator_returned_tokens
 class _IntentResult:
     def scalars(self):
         return ["intent-1"]
+
+
+class _NoIntentResult:
+    @staticmethod
+    def scalar_one_or_none():
+        return None
+
+
+@pytest.mark.asyncio
+async def test_pre_request_job_cleanup_is_committed_before_external_release(
+    monkeypatch,
+):
+    added = []
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, _NoIntentResult()]),
+        add=lambda value: added.append(value),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+    chute = SimpleNamespace(
+        validator="validator-1",
+        chute_id="chute-1",
+        version="1.0.0",
+    )
+    server = SimpleNamespace(
+        server_id="server-invalid",
+        kubernetes_node_uid="node-uid",
+        kubernetes_node_generation=1,
+        gpu_allocation_group_id="group-1",
+        gpu_allocation_group_generation=1,
+    )
+
+    intent_id = await gepetto._begin_job_cleanup_intent(
+        chute,
+        server,
+        "job-1",
+    )
+    assert intent_id == added[0].intent_id
+    assert added[0].phase == "cleanup_required"
+    assert added[0].job_cleanup_only is True
+    assert added[0].job_id == "job-1"
+    assert added[0].request_payload["schema"] == "chutes.miner-job-release.v1"
+    assert len(added[0].request_sha256) == 64
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -422,3 +713,103 @@ async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
     assert intent.job_release_ack is None
     assert intent.completed_at is None
     assert intent.last_failure == "validator unavailable"
+
+
+@pytest.mark.asyncio
+async def test_predeployment_abort_persists_before_cleanup_and_retries_in_reconcile(
+    monkeypatch,
+):
+    intent = SimpleNamespace(
+        intent_id="intent-1",
+        phase="registry_acked",
+        chute_id="chute-1",
+        server_id="server-1",
+        job_id="job-1",
+        validator="validator-1",
+        response_payload={"config_id": "config-1", "registry": None},
+        job_release_ack=None,
+        job_released_at=None,
+        completed_at=None,
+        last_failure=None,
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_IntentResult()),
+        get=AsyncMock(return_value=intent),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+    gepetto._revoke_registry_scope = AsyncMock()
+    gepetto._release_job_exact = AsyncMock(
+        side_effect=[
+            ConnectionError("release response lost"),
+            {"status": "already_absent", "job_id": "job-1"},
+        ]
+    )
+
+    async def record_failure(_intent_id, exc):
+        intent.last_failure = str(exc)
+
+    gepetto._record_launch_intent_failure = AsyncMock(side_effect=record_failure)
+    assert await gepetto.abort_launch_intent("intent-1") is False
+    assert intent.phase == "cleanup_required"
+    assert intent.job_release_ack is None
+    assert intent.last_failure == "release response lost"
+
+    await gepetto.resume_aborted_launch_intents()
+    assert intent.phase == "completed"
+    assert intent.job_release_ack == {
+        "status": "already_absent",
+        "job_id": "job-1",
+    }
+    assert intent.completed_at is not None
+    assert gepetto._release_job_exact.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_job_cleanup_only_intent_releases_without_requesting_launch_config(
+    monkeypatch,
+):
+    intent = SimpleNamespace(
+        intent_id="intent-1",
+        phase="cleanup_required",
+        chute_id="chute-1",
+        server_id="invalid-server",
+        job_id="job-1",
+        validator="validator-1",
+        job_cleanup_only=True,
+        response_payload=None,
+        job_release_ack=None,
+        job_released_at=None,
+        completed_at=None,
+        last_failure=None,
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_IntentResult()),
+        get=AsyncMock(return_value=intent),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+    gepetto._fetch_launch_config = AsyncMock()
+    gepetto._revoke_registry_scope = AsyncMock()
+    gepetto._release_job_exact = AsyncMock(
+        return_value={"status": "released", "job_id": "job-1"}
+    )
+    gepetto._record_launch_intent_failure = AsyncMock()
+
+    await gepetto.resume_aborted_launch_intents()
+    assert intent.phase == "completed"
+    assert intent.job_release_ack == {"status": "released", "job_id": "job-1"}
+    gepetto._fetch_launch_config.assert_not_awaited()
+    gepetto._revoke_registry_scope.assert_not_awaited()

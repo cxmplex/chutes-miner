@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -100,10 +103,58 @@ def test_all_api_workers_and_gepetto_wait_before_work():
     run_source = inspect.getsource(gepetto.Gepetto.run)
     assert "Base.metadata.create_all" not in run_source
     gepetto_wait = run_source.index("await wait_for_required_schema(engine)")
+    gepetto_adoption = run_source.index(
+        "await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)"
+    )
     validator_migrations = run_source.index("await run_validator_migrations()")
     launch_resume = run_source.index("await self.resume_launch_intents()")
     resume = run_source.index("await self.teardown.resume_pending()")
-    assert gepetto_wait < validator_migrations < launch_resume < resume
+    assert gepetto_wait < gepetto_adoption < validator_migrations < launch_resume < resume
+
+
+@pytest.mark.asyncio
+async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch):
+    from chutes_miner import gepetto
+
+    adoption_started = asyncio.Event()
+    release_adoption = asyncio.Event()
+
+    async def wait_for_adoption(_engine, identity):
+        assert identity == {"server_id": "server-1"}
+        adoption_started.set()
+        await release_adoption.wait()
+
+    monkeypatch.setattr(gepetto, "wait_for_required_schema", AsyncMock())
+    monkeypatch.setattr(gepetto, "wait_for_seedless_adoption", wait_for_adoption)
+    monkeypatch.setattr(
+        gepetto,
+        "settings",
+        SimpleNamespace(
+            gpu_tee_only=True,
+            seedless_gpu_identity={"server_id": "server-1"},
+            validator_migrations_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(gepetto.k8s, "purge_legacy_source_config_maps", AsyncMock())
+    coordinator = object.__new__(gepetto.Gepetto)
+    coordinator.resume_launch_intents = AsyncMock()
+    coordinator.teardown = SimpleNamespace(resume_pending=AsyncMock())
+    coordinator.reconcile = AsyncMock()
+    coordinator.autoscaler = AsyncMock()
+    coordinator.reconciler = AsyncMock()
+    coordinator.pubsub = SimpleNamespace(start=AsyncMock())
+
+    task = asyncio.create_task(coordinator.run())
+    await adoption_started.wait()
+    coordinator.resume_launch_intents.assert_not_awaited()
+    coordinator.teardown.resume_pending.assert_not_awaited()
+    coordinator.reconcile.assert_not_awaited()
+
+    release_adoption.set()
+    await task
+    coordinator.resume_launch_intents.assert_awaited_once()
+    coordinator.teardown.resume_pending.assert_awaited_once()
+    coordinator.reconcile.assert_awaited_once()
 
 
 def test_api_chart_keeps_liveness_open_and_readiness_schema_gated():

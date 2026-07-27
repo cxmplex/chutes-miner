@@ -21,6 +21,7 @@ from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s import operator as k8s_operator
 from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.gepetto import Gepetto
+from kubernetes.client import V1ObjectMeta, V1Service, V1ServiceSpec
 from kubernetes.client.rest import ApiException
 
 
@@ -710,6 +711,7 @@ def test_direct_delete_uses_kubernetes_uid_precondition(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["body"].preconditions.uid == "uid-a"
     assert calls[0]["body"].propagation_policy == "Foreground"
+    assert calls[0]["body"].grace_period_seconds > 0
 
 
 def test_uid_precondition_conflict_advances_to_direct_replacement_verification(monkeypatch):
@@ -965,6 +967,7 @@ async def test_inflight_launch_finishes_into_exact_teardown_uid_closure(monkeypa
         lease_expires_at=object(),
         immutable_labels=EXPECTED_LABELS,
         canonical_workload_spec={},
+        canonical_workload_spec_sha256=None,
         server_name="node-a",
         cluster_context="node-a",
         service_name=None,
@@ -988,27 +991,28 @@ async def test_inflight_launch_finishes_into_exact_teardown_uid_closure(monkeypa
         yield session
 
     monkeypatch.setattr(k8s_operator, "get_session", fake_session)
-    service = SimpleNamespace(
+    service = V1Service(
         api_version="v1",
-        metadata=SimpleNamespace(
+        kind="Service",
+        metadata=V1ObjectMeta(
             name="chute-svc-dep-1",
             namespace="chutes",
             uid="service-uid",
             labels=EXPECTED_LABELS,
         ),
-        spec=SimpleNamespace(
+        spec=V1ServiceSpec(
             type="NodePort",
             external_traffic_policy="Local",
             selector={"chutes/deployment-id": "dep-1"},
             ports=[],
-            external_i_ps=None,
-            load_balancer_ip=None,
-            load_balancer_source_ranges=None,
         ),
     )
     launch.canonical_workload_spec = {
         "service": k8s_operator.canonical_workload_resource("Service", service)
     }
+    launch.canonical_workload_spec_sha256 = k8s_operator._canonical_document_sha256(
+        launch.canonical_workload_spec
+    )
 
     with pytest.raises(DeploymentFailure, match="fenced while Kubernetes create"):
         await K8sOperator._record_launch_resource(

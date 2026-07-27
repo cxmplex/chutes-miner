@@ -34,7 +34,10 @@ from chutes_miner.api.k8s.util import (
     resolve_deployment_validator,
 )
 from chutes_miner.api.redis_pubsub import RedisListener
-from chutes_miner.api.schema_barrier import wait_for_required_schema
+from chutes_miner.api.schema_barrier import (
+    wait_for_required_schema,
+    wait_for_seedless_adoption,
+)
 from chutes_miner.validator_migrations import run_validator_migrations
 from loguru import logger
 from sqlalchemy import case, func, select, text, update
@@ -109,6 +112,8 @@ class Gepetto:
         Main loop.
         """
         await wait_for_required_schema(engine)
+        if settings.gpu_tee_only:
+            await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)
         if settings.validator_migrations_enabled:
             await run_validator_migrations()
         await self.resume_launch_intents()
@@ -537,6 +542,59 @@ class Gepetto:
             await session.commit()
             return intent_id
 
+    async def _begin_job_cleanup_intent(
+        self,
+        chute: Chute,
+        server: Server,
+        job_id: str,
+    ) -> str:
+        """Persist validator job cleanup when launch validation fails pre-request."""
+        lineage = self._launch_lineage(chute, server, job_id)
+        lineage_sha256 = _canonical_sha256(lineage)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(:lineage_sha256, 0))"
+                ),
+                {"lineage_sha256": lineage_sha256},
+            )
+            existing = (
+                await session.execute(
+                    select(MinerLaunchIntent)
+                    .where(
+                        MinerLaunchIntent.lineage_sha256 == lineage_sha256,
+                        MinerLaunchIntent.phase.not_in({"completed", "failed"}),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing.intent_id
+            intent_id = str(uuid.uuid4())
+            request_payload = {
+                "schema": "chutes.miner-job-release.v1",
+                "miner_launch_request_id": intent_id,
+                "lineage": lineage,
+            }
+            session.add(
+                MinerLaunchIntent(
+                    intent_id=intent_id,
+                    phase="cleanup_required",
+                    validator=chute.validator,
+                    chute_id=chute.chute_id,
+                    chute_version=chute.version,
+                    server_id=server.server_id,
+                    job_id=job_id,
+                    job_cleanup_only=True,
+                    request_payload=request_payload,
+                    request_sha256=_canonical_sha256(request_payload),
+                    lineage_sha256=lineage_sha256,
+                )
+            )
+            await session.commit()
+            return intent_id
+
     async def _record_launch_response(
         self,
         intent_id: str,
@@ -552,6 +610,7 @@ class Gepetto:
                 "pending",
                 "response_persisted",
                 "registry_acked",
+                "cleanup_required",
             }:
                 raise DeploymentFailure("durable launch response arrived in an invalid phase")
             if intent.response_payload is not None and intent.response_payload != stable:
@@ -563,7 +622,7 @@ class Gepetto:
             authorized.add(token_sha256)
             intent.token_sha256 = token_sha256
             intent.authorized_token_sha256s = sorted(authorized)
-            if intent.phase != "registry_acked":
+            if intent.phase not in {"registry_acked", "cleanup_required"}:
                 intent.phase = "response_persisted"
             intent.last_failure = None
             await session.commit()
@@ -591,97 +650,122 @@ class Gepetto:
                 intent.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
                 await session.commit()
 
-    async def resume_launch_intents(self) -> None:
-        """Close pre-deployment launch authority left by a crashed worker."""
+    async def _resume_launch_intent(self, intent_id: str) -> bool:
+        """Replay and close one exact pre-deployment launch authority."""
+        try:
+            async with get_session() as session:
+                intent = await session.get(MinerLaunchIntent, intent_id)
+                if intent is None or intent.phase not in {
+                    "pending",
+                    "response_persisted",
+                    "registry_acked",
+                    "cleanup_required",
+                }:
+                    return False
+                phase = intent.phase
+                chute_id = intent.chute_id
+                server_id = intent.server_id
+                job_id = intent.job_id
+                validator_hotkey = intent.validator
+                job_cleanup_only = bool(getattr(intent, "job_cleanup_only", False))
+                job_release_ack = intent.job_release_ack
+                stable_response = dict(intent.response_payload or {})
+
+            # An exact request replay closes the response-loss window. The
+            # replayed JWT stays in memory and is intentionally discarded.
+            if not job_cleanup_only and (phase == "pending" or not stable_response):
+                validator = validator_by_hotkey(validator_hotkey)
+                if validator is None:
+                    raise DeploymentFailure("launch intent validator is unavailable")
+                payload = await self._fetch_launch_config(
+                    validator=validator,
+                    chute_id=chute_id,
+                    server_id=server_id,
+                    job_id=job_id,
+                    intent_id=intent_id,
+                )
+                await self._record_launch_response(intent_id, payload)
+                stable_response = {
+                    "config_id": payload["config_id"],
+                    "registry": payload.get("registry"),
+                }
+            config_id = stable_response.get("config_id")
+            if config_id:
+                await self._revoke_registry_scope(validator_hotkey, config_id)
+            if job_id and job_release_ack is None:
+                job_release_ack = await self._release_job_exact(
+                    validator_hotkey,
+                    job_id,
+                )
+            async with get_session() as session:
+                current = await session.get(
+                    MinerLaunchIntent,
+                    intent_id,
+                    with_for_update=True,
+                )
+                if current and current.phase in {
+                    "response_persisted",
+                    "registry_acked",
+                    "cleanup_required",
+                }:
+                    if job_id:
+                        if job_release_ack is None:
+                            raise DeploymentFailure(
+                                "launch intent cleanup lacks validator job release ACK"
+                            )
+                        current.job_release_ack = job_release_ack
+                        current.job_released_at = datetime.now(timezone.utc)
+                    current.phase = "completed"
+                    current.completed_at = datetime.now(timezone.utc)
+                    current.last_failure = None
+                    await session.commit()
+                    return True
+            return False
+        except Exception as exc:
+            await self._record_launch_intent_failure(intent_id, exc)
+            logger.warning(
+                f"Durable launch intent {intent_id} cleanup paused for retry: {exc}"
+            )
+            return False
+
+    async def _launch_intent_ids(self, phases: set[str]) -> list[str]:
         async with get_session() as session:
-            intent_ids = list(
+            return list(
                 (
                     await session.execute(
                         select(MinerLaunchIntent.intent_id).where(
-                            MinerLaunchIntent.phase.in_(
-                                {
-                                    "pending",
-                                    "response_persisted",
-                                    "registry_acked",
-                                    "cleanup_required",
-                                }
-                            )
+                            MinerLaunchIntent.phase.in_(phases)
                         )
                     )
                 ).scalars()
             )
-        for intent_id in intent_ids:
-            try:
-                async with get_session() as session:
-                    intent = await session.get(MinerLaunchIntent, intent_id)
-                    if intent is None or intent.phase not in {
-                        "pending",
-                        "response_persisted",
-                        "registry_acked",
-                        "cleanup_required",
-                    }:
-                        continue
-                    phase = intent.phase
-                    chute_id = intent.chute_id
-                    server_id = intent.server_id
-                    job_id = intent.job_id
-                    validator_hotkey = intent.validator
-                    job_release_ack = intent.job_release_ack
-                    stable_response = dict(intent.response_payload or {})
 
-                # An exact request replay closes the response-loss window. The
-                # replayed JWT stays in memory and is intentionally discarded.
-                if phase == "pending":
-                    validator = validator_by_hotkey(validator_hotkey)
-                    if validator is None:
-                        raise DeploymentFailure("launch intent validator is unavailable")
-                    payload = await self._fetch_launch_config(
-                        validator=validator,
-                        chute_id=chute_id,
-                        server_id=server_id,
-                        job_id=job_id,
-                        intent_id=intent_id,
-                    )
-                    await self._record_launch_response(intent_id, payload)
-                    stable_response = {
-                        "config_id": payload["config_id"],
-                        "registry": payload.get("registry"),
-                    }
-                config_id = stable_response.get("config_id")
-                if config_id:
-                    await self._revoke_registry_scope(validator_hotkey, config_id)
-                if job_id and job_release_ack is None:
-                    job_release_ack = await self._release_job_exact(
-                        validator_hotkey,
-                        job_id,
-                    )
-                async with get_session() as session:
-                    current = await session.get(
-                        MinerLaunchIntent,
-                        intent_id,
-                        with_for_update=True,
-                    )
-                    if current and current.phase in {
-                        "response_persisted",
-                        "registry_acked",
-                        "cleanup_required",
-                    }:
-                        if job_id:
-                            if job_release_ack is None:
-                                raise DeploymentFailure(
-                                    "launch intent cleanup lacks validator job release ACK"
-                                )
-                            current.job_release_ack = job_release_ack
-                            current.job_released_at = datetime.now(timezone.utc)
-                        current.phase = "completed"
-                        current.completed_at = datetime.now(timezone.utc)
-                        current.last_failure = None
-                        await session.commit()
-            except Exception as exc:
-                await self._record_launch_intent_failure(intent_id, exc)
-                logger.warning(
-                    f"Durable launch intent {intent_id} cleanup paused for retry: {exc}"
-                )
+    async def resume_launch_intents(self) -> None:
+        """Close pre-deployment launch authority left by a crashed worker."""
+        for intent_id in await self._launch_intent_ids(
+            {"pending", "response_persisted", "registry_acked", "cleanup_required"}
+        ):
+            await self._resume_launch_intent(intent_id)
+
+    async def resume_aborted_launch_intents(self) -> None:
+        """Retry only explicitly aborted intents during live reconciliation."""
+        for intent_id in await self._launch_intent_ids({"cleanup_required"}):
+            await self._resume_launch_intent(intent_id)
+
+    async def abort_launch_intent(self, intent_id: str) -> bool:
+        """Persist an exact abort before revoking registry and job authority."""
+        async with get_session() as session:
+            intent = await session.get(
+                MinerLaunchIntent,
+                intent_id,
+                with_for_update=True,
+            )
+            if intent is None or intent.phase in {"consumed", "completed", "failed"}:
+                return False
+            intent.phase = "cleanup_required"
+            intent.last_failure = None
+            await session.commit()
+        return await self._resume_launch_intent(intent_id)
 
     async def _revoke_registry_scope(
         self,
@@ -813,9 +897,11 @@ class Gepetto:
             return payload
         except DeploymentFailure as exc:
             await self._record_launch_intent_failure(intent_id, exc)
+            await self.abort_launch_intent(intent_id)
             raise
         except Exception as exc:
             await self._record_launch_intent_failure(intent_id, exc)
+            await self.abort_launch_intent(intent_id)
             logger.warning(f"Unable to fetch launch config token: {exc}")
             raise DeploymentFailure(f"Failed to fetch JWT for launch: {exc}") from exc
 
@@ -1073,12 +1159,6 @@ class Gepetto:
             "response_sha256": hashlib.sha256(body).hexdigest(),
         }
 
-    async def release_job(self, chute: Chute, job_id: str) -> dict[str, Any]:
-        """Release one exact job lock; callers retain failure for durable retry."""
-        ack = await self._release_job_exact(chute.validator, job_id)
-        logger.success(f"Successfully released {job_id=}: {ack['status']}")
-        return ack
-
     async def _get_job_extra_services(self, chute: Chute):
         """
         Get the list of extra services (i.e. extra ports that the chute requires) for a chute.
@@ -1132,12 +1212,15 @@ class Gepetto:
             f"Attempting to deploy {job_id=} for {chute.chute_id=} on {server.server_id=} with {disk_gb=}"
         )
         deployment = None
+        launch_token = None
+        token_requested = False
         try:
             self._require_validator_match(chute, server)
             if validator.hotkey != chute.validator:
                 raise DeploymentFailure(
                     f"Job validator {validator.hotkey!r} does not match chute validator {chute.validator!r}."
                 )
+            token_requested = True
             launch_token = await self.get_launch_token(
                 chute,
                 server,
@@ -1169,7 +1252,17 @@ class Gepetto:
             )
             if deployment:
                 await self.undeploy(deployment.deployment_id, reason="job_launch_failure")
-            await self.release_job(chute, job_id)
+            elif launch_token:
+                await self.abort_launch_intent(
+                    launch_token["_miner_launch_request_id"]
+                )
+            elif not token_requested:
+                cleanup_intent_id = await self._begin_job_cleanup_intent(
+                    chute,
+                    server,
+                    job_id,
+                )
+                await self.abort_launch_intent(cleanup_intent_id)
 
     async def chute_updated(self, event_data: Dict[str, Any]):
         """
@@ -1726,6 +1819,7 @@ class Gepetto:
             ):
                 logger.info(f"Attempting to deploy {chute.chute_id=} on {server_id=}")
                 deployment = None
+                launch_token = None
                 try:
                     launch_token = await self.get_launch_token(chute, server)
                     deployment, _ = await k8s.deploy_chute(
@@ -1751,6 +1845,10 @@ class Gepetto:
                         await self.undeploy(
                             deployment.deployment_id,
                             reason="rolling_update_launch_failure",
+                        )
+                    elif launch_token:
+                        await self.abort_launch_intent(
+                            launch_token["_miner_launch_request_id"]
                         )
                     return
 
@@ -2150,8 +2248,9 @@ class Gepetto:
                         )
         except Exception as exc:
             logger.error(f"Unexpected error preempting deployments: {exc}")
-            if job_id:
-                await self.release_job(chute, job_id)
+            await self.abort_launch_intent(
+                launch_token["_miner_launch_request_id"]
+            )
             return False
 
         # Deploy on our target server.
@@ -2186,8 +2285,10 @@ class Gepetto:
                     deployment.deployment_id,
                     reason="preemption_launch_failure",
                 )
-            if job_id:
-                await self.release_job(chute, job_id)
+            else:
+                await self.abort_launch_intent(
+                    launch_token["_miner_launch_request_id"]
+                )
         return False
 
     async def scale_chute(self, chute: Chute, desired_count: int, preempt: bool = False) -> bool:
@@ -2247,6 +2348,7 @@ class Gepetto:
                             f"Attempting to deploy {chute.chute_id=} on {server.server_id=}"
                         )
                         deployment = None
+                        launch_token = None
                         try:
                             self._require_validator_match(chute, server)
                             launch_token = await self.get_launch_token(
@@ -2284,6 +2386,10 @@ class Gepetto:
                                     deployment.deployment_id,
                                     reason="scale_up_launch_failure",
                                 )
+                            elif launch_token:
+                                await self.abort_launch_intent(
+                                    launch_token["_miner_launch_request_id"]
+                                )
                             scaled = False
                             break
 
@@ -2309,6 +2415,7 @@ class Gepetto:
         """
         Put our local system back in harmony with the validators.
         """
+        await self.resume_aborted_launch_intents()
         await self.teardown.resume_pending()
         try:
             await self.remote_refresh_all()

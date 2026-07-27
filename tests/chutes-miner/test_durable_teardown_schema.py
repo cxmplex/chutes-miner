@@ -130,6 +130,7 @@ def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
         "chute_version",
         "server_id",
         "job_id",
+        "job_cleanup_only",
         "request_payload",
         "request_sha256",
         "lineage_sha256",

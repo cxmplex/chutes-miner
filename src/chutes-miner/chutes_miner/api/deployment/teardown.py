@@ -574,7 +574,9 @@ class DirectKubernetesClosure:
             preconditions=V1Preconditions(uid=uid),
             propagation_policy="Foreground",
             grace_period_seconds=(
-                settings.chute_shutdown_time_seconds if kind in CONTROLLER_KINDS else 0
+                settings.chute_shutdown_time_seconds
+                if kind in CONTROLLER_KINDS or kind == "Pod"
+                else 0
             ),
         )
         try:

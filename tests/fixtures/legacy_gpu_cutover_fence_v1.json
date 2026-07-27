@@ -1,0 +1,31 @@
+{
+  "fields": [
+    "current_state_sha256",
+    "pending_state_path",
+    "pending_state_sha256",
+    "schema",
+    "state_identity",
+    "state_path",
+    "version"
+  ],
+  "file_requirements": {
+    "mode": "0600",
+    "owner_uid": 0,
+    "regular_file": true,
+    "symlinks": false
+  },
+  "path": "/etc/chutes/legacy-gpu-cutover/fence.json",
+  "pending_state_path": "/var/lib/chutes/legacy-gpu-cutover/state.pending.json",
+  "schema": "chutes.legacy-gpu-cutover-fence",
+  "state_identity_fields": [
+    "boot_id",
+    "legacy_server_id",
+    "schema",
+    "target_host_id",
+    "version"
+  ],
+  "state_identity_schema": "chutes.legacy-gpu-cutover-state",
+  "state_identity_version": 1,
+  "state_path": "/var/lib/chutes/legacy-gpu-cutover/state.json",
+  "version": 1
+}

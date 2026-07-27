@@ -34,6 +34,33 @@ def test_cutover_state_contract_fixture_matches_implementation():
     }
 
 
+def test_cutover_fence_contract_fixture_matches_producer():
+    contract = json.loads(
+        (ROOT / "tests/fixtures/legacy_gpu_cutover_fence_v1.json").read_text(
+            encoding="ascii"
+        )
+    )
+    state = _source_state()
+    marker = legacy_cutover._fence_marker_document(state)
+    assert contract == {
+        "fields": sorted(marker),
+        "file_requirements": {
+            "mode": "0600",
+            "owner_uid": 0,
+            "regular_file": True,
+            "symlinks": False,
+        },
+        "path": legacy_cutover.CUTOVER_FENCE_MARKER_PATH,
+        "pending_state_path": legacy_cutover.CUTOVER_FENCE_PENDING_STATE_PATH,
+        "schema": legacy_cutover.CUTOVER_FENCE_MARKER_SCHEMA,
+        "state_identity_fields": sorted(marker["state_identity"]),
+        "state_identity_schema": legacy_cutover.CUTOVER_STATE_SCHEMA,
+        "state_identity_version": legacy_cutover.CUTOVER_STATE_VERSION,
+        "state_path": legacy_cutover.CUTOVER_FENCE_STATE_PATH,
+        "version": legacy_cutover.CUTOVER_FENCE_MARKER_VERSION,
+    }
+
+
 def _bundle() -> dict:
     return {
         "validator_api": "https://validator.example",

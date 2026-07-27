@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS miner_launch_intents (
     chute_version TEXT NOT NULL,
     server_id TEXT NOT NULL,
     job_id TEXT,
+    job_cleanup_only BOOLEAN NOT NULL DEFAULT FALSE,
     request_payload JSONB NOT NULL,
     request_sha256 TEXT NOT NULL,
     lineage_sha256 TEXT NOT NULL,
@@ -53,21 +54,43 @@ CREATE TABLE IF NOT EXISTS miner_launch_intents (
     ),
     CONSTRAINT ck_miner_launch_intent_job_ack CHECK (
         (job_release_ack IS NULL) = (job_released_at IS NULL)
+    ),
+    CONSTRAINT ck_miner_launch_intent_job_cleanup_only CHECK (
+        NOT job_cleanup_only OR (
+            job_id IS NOT NULL
+            AND response_payload IS NULL
+            AND response_sha256 IS NULL
+            AND token_sha256 IS NULL
+            AND registry_ack IS NULL
+            AND deployment_id IS NULL
+        )
     )
 );
 ALTER TABLE miner_launch_intents
     ADD COLUMN IF NOT EXISTS authorized_token_sha256s JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS job_cleanup_only BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS job_release_ack JSONB,
     ADD COLUMN IF NOT EXISTS job_released_at TIMESTAMPTZ;
 ALTER TABLE miner_launch_intents
     DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_authorized_tokens,
-    DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_job_ack;
+    DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_job_ack,
+    DROP CONSTRAINT IF EXISTS ck_miner_launch_intent_job_cleanup_only;
 ALTER TABLE miner_launch_intents
     ADD CONSTRAINT ck_miner_launch_intent_authorized_tokens CHECK (
         jsonb_typeof(authorized_token_sha256s) = 'array'
     ),
     ADD CONSTRAINT ck_miner_launch_intent_job_ack CHECK (
         (job_release_ack IS NULL) = (job_released_at IS NULL)
+    ),
+    ADD CONSTRAINT ck_miner_launch_intent_job_cleanup_only CHECK (
+        NOT job_cleanup_only OR (
+            job_id IS NOT NULL
+            AND response_payload IS NULL
+            AND response_sha256 IS NULL
+            AND token_sha256 IS NULL
+            AND registry_ack IS NULL
+            AND deployment_id IS NULL
+        )
     );
 CREATE INDEX IF NOT EXISTS miner_launch_intent_recovery_idx
     ON miner_launch_intents (phase, created_at)

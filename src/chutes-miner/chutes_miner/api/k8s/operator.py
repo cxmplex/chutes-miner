@@ -82,7 +82,7 @@ from loguru import logger
 from redis.client import PubSub
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from urllib3.exceptions import MaxRetryError
+from urllib3.exceptions import HTTPError, MaxRetryError
 
 # Cache disk stats.
 _disk_info_cache: dict[str, tuple[dict[str, float], datetime]] = {}
@@ -93,6 +93,10 @@ _disk_info_locks: dict[str, asyncio.Lock] = {}
 # registration and never changes, so a long TTL is safe.
 _tee_cluster_cache: dict[str, tuple[bool, datetime]] = {}
 _TEE_CACHE_TTL = timedelta(minutes=10)
+
+
+class AmbiguousKubernetesCreate(DeploymentFailure):
+    """The API may have committed a named object without returning its identity."""
 
 
 def _without_none(value: Any) -> Any:
@@ -113,192 +117,131 @@ def _model_value(value: Any) -> Any:
     return _without_none(ApiClient().sanitize_for_serialization(value))
 
 
-def _wire_field(value: Any, name: str, default: Any = None) -> Any:
-    wire = _model_value(value)
-    if not isinstance(wire, dict):
-        return default
-    return wire.get(name, default)
-
-
-def _canonical_container_ports(values: list[Any]) -> list[dict[str, Any]]:
-    return [
-        _without_none(
-            {
-                "containerPort": _wire_field(value, "containerPort"),
-                "hostIP": _wire_field(value, "hostIP"),
-                "hostPort": _wire_field(value, "hostPort"),
-                "name": _wire_field(value, "name"),
-                "protocol": _wire_field(value, "protocol", "TCP") or "TCP",
-            }
-        )
-        for value in values
-    ]
-
-
-def _canonical_volume_mounts(values: list[Any]) -> list[dict[str, Any]]:
-    return [
-        _without_none(
-            {
-                "name": _wire_field(value, "name"),
-                "mountPath": _wire_field(value, "mountPath"),
-                "mountPropagation": _wire_field(value, "mountPropagation"),
-                "readOnly": bool(_wire_field(value, "readOnly", False)),
-                "recursiveReadOnly": _wire_field(value, "recursiveReadOnly"),
-                "subPath": _wire_field(value, "subPath"),
-                "subPathExpr": _wire_field(value, "subPathExpr"),
-            }
-        )
-        for value in values
-    ]
-
-
 def canonical_workload_resource(kind: str, resource: Any) -> dict[str, Any]:
-    """Canonical immutable closure used for create-response-loss adoption."""
-    metadata = resource.metadata
+    """Canonical full authority closure used for create-response-loss adoption."""
+    wire = _model_value(resource)
+    if not isinstance(wire, dict):
+        raise DeploymentFailure(f"invalid canonical launch resource {kind}")
+    metadata = dict(wire.get("metadata") or {})
     base: dict[str, Any] = {
-        "api_version": str(
-            getattr(resource, "api_version", None)
-            or ("batch/v1" if kind == "Job" else "v1")
-        ),
+        "api_version": str(wire.get("apiVersion") or ("batch/v1" if kind == "Job" else "v1")),
         "kind": kind,
-        "metadata": {
-            "name": str(metadata.name),
-            "labels": dict(metadata.labels or {}),
-            "annotations": dict(getattr(metadata, "annotations", None) or {}),
-        },
+        "metadata": _without_none(
+            {
+                "name": str(metadata.get("name") or ""),
+                "labels": dict(metadata.get("labels") or {}),
+                "annotations": dict(metadata.get("annotations") or {}),
+                "owner_references": list(metadata.get("ownerReferences") or []),
+                "finalizers": list(metadata.get("finalizers") or []),
+                "deletion_timestamp": metadata.get("deletionTimestamp"),
+                "deletion_grace_period_seconds": metadata.get(
+                    "deletionGracePeriodSeconds"
+                ),
+            }
+        ),
     }
     if kind == "Service":
-        spec = resource.spec
-        base["spec"] = _without_none(
-            {
-                "type": spec.type,
-                "external_traffic_policy": spec.external_traffic_policy,
-                "selector": dict(spec.selector or {}),
-                "ports": [
-                    {
-                        "name": port.name,
-                        "port": port.port,
-                        "protocol": port.protocol,
-                        "target_port": port.target_port,
-                        "app_protocol": getattr(port, "app_protocol", None),
-                    }
-                    for port in spec.ports or []
-                ],
-                "external_ips": spec.external_i_ps,
-                "load_balancer_ip": spec.load_balancer_ip,
-                "load_balancer_source_ranges": spec.load_balancer_source_ranges,
-            }
-        )
+        spec = dict(wire.get("spec") or {})
+        for allocated in (
+            "clusterIP",
+            "clusterIPs",
+            "healthCheckNodePort",
+            "ipFamilies",
+            "ipFamilyPolicy",
+        ):
+            spec.pop(allocated, None)
+        if spec.get("sessionAffinity") in {None, "None"}:
+            spec.pop("sessionAffinity", None)
+        if spec.get("internalTrafficPolicy") in {None, "Cluster"}:
+            spec.pop("internalTrafficPolicy", None)
+        if spec.get("publishNotReadyAddresses") is False:
+            spec.pop("publishNotReadyAddresses", None)
+        for port in spec.get("ports") or []:
+            port.pop("nodePort", None)
+            port["protocol"] = port.get("protocol") or "TCP"
+        base["spec"] = _without_none(spec)
         return base
     if kind == "Secret":
-        base["type"] = resource.type
+        base["type"] = wire.get("type") or "Opaque"
+        base["immutable"] = bool(wire.get("immutable", False))
         base["data_sha256"] = {
             key: hashlib.sha256(value.encode()).hexdigest()
-            for key, value in sorted((resource.data or {}).items())
+            for key, value in sorted((wire.get("data") or {}).items())
         }
         return base
     if kind != "Job":
         raise DeploymentFailure(f"unsupported canonical launch resource {kind}")
 
-    job_spec = resource.spec
-    pod_spec = job_spec.template.spec
-    containers = []
-    for container in pod_spec.containers or []:
-        env = []
-        for item in container.env or []:
-            value = item.value
-            if item.name == "CHUTES_LAUNCH_JWT" and value is not None:
-                value = {
-                    "launch_config_id": (metadata.labels or {}).get(
-                        "chutes/config-id"
-                    )
-                }
-            env.append(
-                _without_none(
-                    {
-                        "name": item.name,
-                        "value": value,
-                        "value_from": _model_value(item.value_from),
-                    }
-                )
-            )
-        containers.append(
-            _without_none(
-                {
-                    "name": container.name,
-                    "image": container.image,
-                    "image_pull_policy": container.image_pull_policy,
-                    "command": list(container.command or []),
-                    "args": list(container.args or []),
-                    "env": env,
-                    "resources": _model_value(container.resources),
-                    "volume_mounts": _canonical_volume_mounts(
-                        container.volume_mounts or []
-                    ),
-                    "security_context": _model_value(container.security_context),
-                    "ports": _canonical_container_ports(container.ports or []),
-                    "readiness_probe": _model_value(container.readiness_probe),
-                    "liveness_probe": _model_value(container.liveness_probe),
-                    "startup_probe": _model_value(container.startup_probe),
-                }
-            )
-        )
-    base["spec"] = _without_none(
-        {
-            "parallelism": job_spec.parallelism,
-            "completions": job_spec.completions,
-            "backoff_limit": job_spec.backoff_limit,
-            "ttl_seconds_after_finished": job_spec.ttl_seconds_after_finished,
-            "active_deadline_seconds": job_spec.active_deadline_seconds,
-            "template": {
-                "metadata": {
-                    "labels": {
-                        key: value
-                        for key, value in (job_spec.template.metadata.labels or {}).items()
-                        if key
-                        not in {
-                            "controller-uid",
-                            "job-name",
-                            "batch.kubernetes.io/controller-uid",
-                            "batch.kubernetes.io/job-name",
-                        }
-                    },
-                    "annotations": dict(job_spec.template.metadata.annotations or {}),
-                },
-                "spec": _without_none(
-                    {
-                        "node_name": pod_spec.node_name,
-                        "runtime_class_name": pod_spec.runtime_class_name,
-                        "restart_policy": pod_spec.restart_policy,
-                        "automount_service_account_token": (
-                            pod_spec.automount_service_account_token
-                        ),
-                        "termination_grace_period_seconds": (
-                            pod_spec.termination_grace_period_seconds
-                        ),
-                        "image_pull_secrets": [
-                            {"name": str(secret.name)}
-                            for secret in pod_spec.image_pull_secrets or []
-                        ],
-                        "security_context": _model_value(pod_spec.security_context),
-                        "volumes": _model_value(pod_spec.volumes or []),
-                        "containers": containers,
-                        "init_containers": _model_value(pod_spec.init_containers or []),
-                        "ephemeral_containers": _model_value(
-                            pod_spec.ephemeral_containers or []
-                        ),
-                        "host_network": bool(pod_spec.host_network),
-                        "host_pid": bool(pod_spec.host_pid),
-                        "host_ipc": bool(pod_spec.host_ipc),
-                        "service_account_name": pod_spec.service_account_name,
-                        "node_selector": _model_value(pod_spec.node_selector or {}),
-                        "affinity": _model_value(pod_spec.affinity),
-                        "tolerations": _model_value(pod_spec.tolerations or []),
-                    }
-                ),
-            },
+    spec = dict(wire.get("spec") or {})
+    # A Job controller allocates this selector and mirrors its labels into the
+    # pod template; only those four controller fields are intentionally dynamic.
+    spec.pop("selector", None)
+    template = dict(spec.get("template") or {})
+    template_metadata = dict(template.get("metadata") or {})
+    template_metadata["labels"] = {
+        key: value
+        for key, value in (template_metadata.get("labels") or {}).items()
+        if key
+        not in {
+            "controller-uid",
+            "job-name",
+            "batch.kubernetes.io/controller-uid",
+            "batch.kubernetes.io/job-name",
         }
-    )
+    }
+    for dynamic in (
+        "creationTimestamp",
+        "generation",
+        "managedFields",
+        "resourceVersion",
+        "selfLink",
+        "uid",
+    ):
+        template_metadata.pop(dynamic, None)
+    template["metadata"] = template_metadata
+    pod_spec = dict(template.get("spec") or {})
+    for defaulted, default in (
+        ("dnsPolicy", "ClusterFirst"),
+        ("schedulerName", "default-scheduler"),
+        ("enableServiceLinks", True),
+        ("serviceAccountName", "default"),
+        ("serviceAccount", "default"),
+        ("hostNetwork", False),
+        ("hostPID", False),
+        ("hostIPC", False),
+    ):
+        if pod_spec.get(defaulted) == default:
+            pod_spec.pop(defaulted, None)
+    for container_key in ("containers", "initContainers", "ephemeralContainers"):
+        for container in pod_spec.get(container_key) or []:
+            for item in container.get("env") or []:
+                if item.get("name") == "CHUTES_LAUNCH_JWT" and item.get("value") is not None:
+                    item["value"] = {
+                        "launch_config_id": (metadata.get("labels") or {}).get(
+                            "chutes/config-id"
+                        )
+                    }
+            for port in container.get("ports") or []:
+                port["protocol"] = port.get("protocol") or "TCP"
+            for mount in container.get("volumeMounts") or []:
+                mount["readOnly"] = bool(mount.get("readOnly", False))
+            if container.get("terminationMessagePath") == "/dev/termination-log":
+                container.pop("terminationMessagePath", None)
+            if container.get("terminationMessagePolicy") == "File":
+                container.pop("terminationMessagePolicy", None)
+            for default_false in ("stdin", "stdinOnce", "tty"):
+                if container.get(default_false) is False:
+                    container.pop(default_false, None)
+    template["spec"] = pod_spec
+    spec["template"] = template
+    for defaulted, default in (
+        ("completionMode", "NonIndexed"),
+        ("manualSelector", False),
+        ("suspend", False),
+    ):
+        if spec.get(defaulted) == default:
+            spec.pop(defaulted, None)
+    base["spec"] = _without_none(spec)
     return base
 
 
@@ -323,6 +266,52 @@ def _canonical_document_sha256(document: Any) -> str:
             sort_keys=True,
         ).encode("ascii")
     ).hexdigest()
+
+
+def _verified_launch_closure(launch: DeploymentLaunchOperation) -> dict[str, Any]:
+    closure = launch.canonical_workload_spec
+    digest = launch.canonical_workload_spec_sha256
+    if closure is None and digest is None:
+        return {}
+    if not isinstance(closure, dict) or not isinstance(digest, str):
+        raise DeploymentFailure("canonical launch closure is incomplete")
+    if _canonical_document_sha256(closure) != digest:
+        raise DeploymentFailure("canonical launch closure digest is invalid")
+    return dict(closure)
+
+
+def _create_error_is_ambiguous(exc: Exception) -> bool:
+    if isinstance(exc, ApiException):
+        return exc.status is None or exc.status in {408, 409, 429} or exc.status >= 500
+    return isinstance(
+        exc,
+        (ConnectionError, HTTPError, OSError, TimeoutError),
+    )
+
+
+def _adopt_named_resource_after_create_error(
+    *,
+    kind: str,
+    intended: Any,
+    create_error: Exception,
+    read: Callable[[], Any],
+) -> Any:
+    """Resolve an ambiguous create by exact name without treating 404 as absence."""
+    if not _create_error_is_ambiguous(create_error):
+        raise create_error
+    try:
+        current = read()
+    except Exception as read_error:
+        raise AmbiguousKubernetesCreate(
+            f"{kind} create result is unknown and exact-name read did not resolve it"
+        ) from read_error
+    if canonical_workload_resource(kind, current) != canonical_workload_resource(
+        kind, intended
+    ):
+        raise DeploymentFailure(
+            f"existing {kind} conflicts with canonical launch spec"
+        ) from create_error
+    return current
 
 
 def _launch_cluster_context_sha256(server: Server) -> str:
@@ -1731,7 +1720,7 @@ class K8sOperator(abc.ABC):
                 or deployment.teardown_operation_id is not None
             ):
                 raise DeploymentFailure("launch intent persistence was fenced")
-            closure = dict(launch.canonical_workload_spec or {})
+            closure = _verified_launch_closure(launch)
             existing = closure.get(kind.lower())
             if existing is not None and existing != canonical:
                 raise DeploymentFailure(f"canonical {kind} launch intent changed")
@@ -1799,15 +1788,14 @@ class K8sOperator(abc.ABC):
                 "teardown_fenced",
             }:
                 raise DeploymentFailure("launch lease changed before UID persistence")
-            expected_canonical = (launch.canonical_workload_spec or {}).get(kind.lower())
+            closure = _verified_launch_closure(launch)
+            expected_canonical = closure.get(kind.lower())
             if expected_canonical is None or canonical != expected_canonical:
                 raise DeploymentFailure(f"created {kind} conflicts with canonical launch spec")
             if kind == "Job":
                 token_sha256 = _launch_jwt_sha256(resource)
                 authorized = set(
-                    (launch.canonical_workload_spec or {}).get(
-                        "authorized_launch_token_sha256s"
-                    )
+                    closure.get("authorized_launch_token_sha256s")
                     or []
                 )
                 if token_sha256 is None or token_sha256 not in authorized:
@@ -1912,6 +1900,10 @@ class K8sOperator(abc.ABC):
             )
             if launch.lease_owner != token:
                 return
+            if isinstance(exc, AmbiguousKubernetesCreate):
+                launch.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
+                await session.commit()
+                return
             if launch.phase == "creating":
                 launch.phase = "failed"
             launch.lease_owner = None
@@ -1967,6 +1959,7 @@ class K8sOperator(abc.ABC):
                 or (settings.gpu_tee_only and not launch.secret_uid)
             ):
                 raise DeploymentFailure("launch completion was fenced or lacks exact UIDs")
+            _verified_launch_closure(launch)
             intent = await session.get(
                 MinerLaunchIntent,
                 launch.launch_intent_id,
@@ -2224,31 +2217,29 @@ class K8sOperator(abc.ABC):
 
         try:
             created_service = self._deploy_service(service, server_name=server.name)
-        except ApiException as exc:
-            if exc.status != 409:
-                raise DeploymentFailure(
-                    f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
-                ) from exc
+        except Exception as exc:
             client = (
                 self._manager.get_core_client(server.name)
                 if getattr(self, "_manager", None) is not None
                 else k8s_core_client()
             )
-            created_service = client.read_namespaced_service(
-                name=service.metadata.name,
-                namespace=settings.namespace,
-                _request_timeout=30,
-            )
-            if canonical_workload_resource(
-                "Service", created_service
-            ) != canonical_workload_resource("Service", service):
+            try:
+                created_service = _adopt_named_resource_after_create_error(
+                    kind="Service",
+                    intended=service,
+                    create_error=exc,
+                    read=lambda: client.read_namespaced_service(
+                        name=service.metadata.name,
+                        namespace=settings.namespace,
+                        _request_timeout=30,
+                    ),
+                )
+            except AmbiguousKubernetesCreate:
+                raise
+            except Exception as resolution_error:
                 raise DeploymentFailure(
-                    "existing Service conflicts with canonical launch spec"
-                ) from exc
-        except Exception as exc:
-            raise DeploymentFailure(
-                f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
-            ) from exc
+                    f"Failed to create service for {chute.chute_id=} and {deployment_id=}"
+                ) from resolution_error
 
         return created_service
 
@@ -2287,31 +2278,29 @@ class K8sOperator(abc.ABC):
 
         try:
             created_job = self._deploy_job_for_deployment(job, server_name=server.name)
-        except ApiException as exc:
-            if exc.status != 409:
-                raise DeploymentFailure(
-                    f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
-                ) from exc
+        except Exception as exc:
             client = (
                 self._manager.get_batch_client(server.name)
                 if getattr(self, "_manager", None) is not None
                 else k8s_batch_client()
             )
-            created_job = client.read_namespaced_job(
-                name=job.metadata.name,
-                namespace=settings.namespace,
-                _request_timeout=30,
-            )
-            if canonical_workload_resource(
-                "Job", created_job
-            ) != canonical_workload_resource("Job", job):
+            try:
+                created_job = _adopt_named_resource_after_create_error(
+                    kind="Job",
+                    intended=job,
+                    create_error=exc,
+                    read=lambda: client.read_namespaced_job(
+                        name=job.metadata.name,
+                        namespace=settings.namespace,
+                        _request_timeout=30,
+                    ),
+                )
+            except AmbiguousKubernetesCreate:
+                raise
+            except Exception as resolution_error:
                 raise DeploymentFailure(
-                    "existing Job conflicts with canonical launch spec"
-                ) from exc
-        except Exception as exc:
-            raise DeploymentFailure(
-                f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
-            ) from exc
+                    f"Failed to create job for {chute.chute_id=} and {deployment_id=}"
+                ) from resolution_error
 
         return created_job
 
@@ -2363,27 +2352,24 @@ class K8sOperator(abc.ABC):
         secret_intent: V1Secret | None = None,
     ) -> V1Secret:
         body = secret_intent or self._build_registry_pull_secret(config_id, validator)
+        client = k8s_core_client()
         try:
-            return k8s_core_client().create_namespaced_secret(
+            return client.create_namespaced_secret(
                 namespace=settings.namespace,
                 body=body,
                 _request_timeout=60,
             )
-        except ApiException as exc:
-            if exc.status != 409:
-                raise
-            current = k8s_core_client().read_namespaced_secret(
-                name=body.metadata.name,
-                namespace=settings.namespace,
-                _request_timeout=30,
+        except Exception as exc:
+            return _adopt_named_resource_after_create_error(
+                kind="Secret",
+                intended=body,
+                create_error=exc,
+                read=lambda: client.read_namespaced_secret(
+                    name=body.metadata.name,
+                    namespace=settings.namespace,
+                    _request_timeout=30,
+                ),
             )
-            if canonical_workload_resource(
-                "Secret", current
-            ) != canonical_workload_resource("Secret", body):
-                raise DeploymentFailure(
-                    "existing registry scope secret conflicts with canonical launch spec"
-                ) from exc
-            return current
 
     def _delete_registry_pull_secret(self, config_id: str) -> None:
         name = self._registry_pull_secret_name(config_id)
