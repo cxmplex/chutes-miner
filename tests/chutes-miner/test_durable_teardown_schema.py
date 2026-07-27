@@ -13,6 +13,11 @@ MIGRATION = (
     / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260726120000_durable_deployment_teardown.sql"
 )
+FOLLOWUP_MIGRATION = (
+    ROOT
+    / "src/chutes-miner/chutes_miner/api/migrations/"
+    "20260727120000_miner_lifecycle_followup.sql"
+)
 
 
 def _ondelete(table: str, column: str) -> str:
@@ -50,7 +55,13 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
     }.issubset(operation.c.keys())
     assert "parent_deletion_children" in Base.metadata.tables
     resource = Base.metadata.tables["deployment_teardown_k8s_resources"]
-    assert {"owner_kind", "owner_name", "owner_uid", "node_name"}.issubset(
+    assert {
+        "owner_api_version",
+        "owner_kind",
+        "owner_name",
+        "owner_uid",
+        "node_name",
+    }.issubset(
         resource.c.keys()
     )
     unique_columns = {
@@ -90,6 +101,12 @@ def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
         "secret_uid",
         "job_uid",
         "create_results",
+        "cluster_context",
+        "namespace",
+        "server_name",
+        "canonical_workload_spec",
+        "canonical_workload_spec_sha256",
+        "launch_intent_id",
     }.issubset(launch.c.keys())
     cleanup = Base.metadata.tables["delayed_validator_instance_cleanups"]
     assert _ondelete(
@@ -98,6 +115,39 @@ def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
     assert {"validator", "chute_id", "config_id", "instance_id", "deletion_ack"}.issubset(
         cleanup.c.keys()
     )
+
+
+def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
+    intent = Base.metadata.tables["miner_launch_intents"]
+    assert {
+        "intent_id",
+        "phase",
+        "validator",
+        "chute_id",
+        "chute_version",
+        "server_id",
+        "job_id",
+        "request_payload",
+        "request_sha256",
+        "lineage_sha256",
+        "response_payload",
+        "response_sha256",
+        "token_sha256",
+        "registry_ack",
+        "deployment_id",
+        "last_failure",
+        "completed_at",
+    }.issubset(intent.c.keys())
+    active_index = next(
+        index
+        for index in intent.indexes
+        if index.name == "miner_launch_intent_active_lineage_key"
+    )
+    assert active_index.unique
+    assert "phase NOT IN ('completed', 'failed')" in str(
+        active_index.dialect_options["postgresql"]["where"]
+    )
+    assert _ondelete("deployment_launch_operations", "launch_intent_id") == "RESTRICT"
 
 
 def test_migration_guards_release_and_has_migration_specific_down_guard():
@@ -127,3 +177,16 @@ def test_orphan_tombstone_binds_cluster_and_node_lineage():
     assert "lineage_conflict_at" not in Base.metadata.tables[
         "parent_deletion_operations"
     ].c
+    assert "owner_api_version" in Base.metadata.tables[
+        "kubernetes_orphan_tombstone_resources"
+    ].c
+
+
+def test_followup_migration_has_specific_locked_down_guard():
+    sql = FOLLOWUP_MIGRATION.read_text(encoding="utf-8")
+    assert "IN ACCESS EXCLUSIVE MODE" in sql
+    assert "canonical launch intents exist" in sql
+    assert "owner_api_version" in sql
+    assert "canonical_workload_spec_sha256" in sql
+    assert "miner_launch_intent_active_lineage_key" in sql
+    assert "launch intent history exists" in sql

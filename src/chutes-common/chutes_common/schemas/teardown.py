@@ -218,6 +218,7 @@ class DeploymentTeardownK8sResource(Base):
     kind = Column(String, nullable=False)
     name = Column(String, nullable=False)
     uid = Column(String, nullable=False)
+    owner_api_version = Column(String, nullable=True)
     owner_kind = Column(String, nullable=True)
     owner_name = Column(String, nullable=True)
     owner_uid = Column(String, nullable=True)
@@ -246,8 +247,10 @@ class DeploymentTeardownK8sResource(Base):
             name="ck_deployment_teardown_resource_state",
         ),
         CheckConstraint(
-            "(owner_kind IS NULL AND owner_name IS NULL AND owner_uid IS NULL) OR "
-            "(owner_kind IS NOT NULL AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)",
+            "(owner_api_version IS NULL AND owner_kind IS NULL "
+            "AND owner_name IS NULL AND owner_uid IS NULL) OR "
+            "(owner_api_version IS NOT NULL AND owner_kind IS NOT NULL "
+            "AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)",
             name="ck_deployment_teardown_resource_owner",
         ),
         UniqueConstraint(
@@ -278,6 +281,16 @@ class DeploymentLaunchOperation(Base):
     lease_owner = Column(String, nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     immutable_labels = Column(JSONB, nullable=False)
+    launch_intent_id = Column(
+        String,
+        ForeignKey("miner_launch_intents.intent_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    cluster_context = Column(String, nullable=True)
+    namespace = Column(String, nullable=True)
+    server_name = Column(String, nullable=True)
+    canonical_workload_spec = Column(JSONB, nullable=True)
+    canonical_workload_spec_sha256 = Column(String, nullable=True)
     service_name = Column(String, nullable=True)
     service_uid = Column(String, nullable=True)
     secret_name = Column(String, nullable=True)
@@ -305,6 +318,16 @@ class DeploymentLaunchOperation(Base):
             name="ck_deployment_launch_lease",
         ),
         CheckConstraint(
+            "(canonical_workload_spec IS NULL) = "
+            "(canonical_workload_spec_sha256 IS NULL)",
+            name="ck_deployment_launch_canonical_workload",
+        ),
+        CheckConstraint(
+            "canonical_workload_spec_sha256 IS NULL OR "
+            "canonical_workload_spec_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_deployment_launch_canonical_workload_sha256",
+        ),
+        CheckConstraint(
             "(service_name IS NULL) = (service_uid IS NULL)",
             name="ck_deployment_launch_service",
         ),
@@ -320,9 +343,80 @@ class DeploymentLaunchOperation(Base):
             "deployment_launch_recovery_idx",
             "phase",
             "lease_expires_at",
-            postgresql_where=text(
-                "phase IN ('reserved', 'creating', 'failed')"
-            ),
+            postgresql_where=text("phase IN ('reserved', 'creating', 'failed')"),
+        ),
+        Index(
+            "deployment_launch_intent_key",
+            "launch_intent_id",
+            unique=True,
+            postgresql_where=text("launch_intent_id IS NOT NULL"),
+        ),
+    )
+
+
+class MinerLaunchIntent(Base):
+    """Local authority persisted before requesting a validator launch config."""
+
+    __tablename__ = "miner_launch_intents"
+
+    intent_id = Column(String, primary_key=True, default=_uuid)
+    phase = Column(String, nullable=False, default="pending", server_default="pending")
+    validator = Column(String, nullable=False)
+    chute_id = Column(String, nullable=False)
+    chute_version = Column(String, nullable=False)
+    server_id = Column(String, nullable=False)
+    job_id = Column(String, nullable=True)
+    request_payload = Column(JSONB, nullable=False)
+    request_sha256 = Column(String, nullable=False)
+    lineage_sha256 = Column(String, nullable=False)
+    response_payload = Column(JSONB, nullable=True)
+    response_sha256 = Column(String, nullable=True)
+    token_sha256 = Column(String, nullable=True)
+    registry_ack = Column(JSONB, nullable=True)
+    deployment_id = Column(String, nullable=True)
+    last_failure = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending', 'response_persisted', 'registry_acked', "
+            "'consumed', 'cleanup_required', 'completed', 'failed')",
+            name="ck_miner_launch_intent_phase",
+        ),
+        CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_miner_launch_intent_request_sha256",
+        ),
+        CheckConstraint(
+            "lineage_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_miner_launch_intent_lineage_sha256",
+        ),
+        CheckConstraint(
+            "(response_payload IS NULL AND response_sha256 IS NULL "
+            "AND token_sha256 IS NULL) OR "
+            "(response_payload IS NOT NULL "
+            "AND response_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND token_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_miner_launch_intent_response",
+        ),
+        Index(
+            "miner_launch_intent_recovery_idx",
+            "phase",
+            "created_at",
+            postgresql_where=text("phase NOT IN ('completed', 'failed')"),
+        ),
+        Index(
+            "miner_launch_intent_active_lineage_key",
+            "lineage_sha256",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('completed', 'failed')"),
         ),
     )
 
@@ -518,6 +612,7 @@ class KubernetesOrphanTombstoneResource(Base):
     kind = Column(String, nullable=False)
     name = Column(String, nullable=False)
     uid = Column(String, nullable=False)
+    owner_api_version = Column(String, nullable=True)
     owner_kind = Column(String, nullable=True)
     owner_name = Column(String, nullable=True)
     owner_uid = Column(String, nullable=True)
@@ -540,8 +635,10 @@ class KubernetesOrphanTombstoneResource(Base):
             name="ck_kubernetes_orphan_resource_state",
         ),
         CheckConstraint(
-            "(owner_kind IS NULL AND owner_name IS NULL AND owner_uid IS NULL) OR "
-            "(owner_kind IS NOT NULL AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)",
+            "(owner_api_version IS NULL AND owner_kind IS NULL "
+            "AND owner_name IS NULL AND owner_uid IS NULL) OR "
+            "(owner_api_version IS NOT NULL AND owner_kind IS NOT NULL "
+            "AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)",
             name="ck_kubernetes_orphan_resource_owner",
         ),
         UniqueConstraint(

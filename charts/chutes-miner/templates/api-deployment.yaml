@@ -135,6 +135,20 @@ spec:
             - name: http
               containerPort: {{ .Values.minerApi.service.targetPort }}
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
           resources:
             {{- toYaml .Values.minerApi.resources | nindent 12 }}
       volumes:

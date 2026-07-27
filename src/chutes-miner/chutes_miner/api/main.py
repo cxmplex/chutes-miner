@@ -17,17 +17,15 @@ from chutes_common.schemas import Base
 from chutes_miner.api.config import settings
 from chutes_miner.api.socket_client import SocketClient
 from chutes_miner.api.server.seedless_adoption import adopt_seedless_gpu_server
+from chutes_miner.api.schema_barrier import wait_for_required_schema
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
     """
     Execute all initialization/startup code, e.g. ensuring tables exist and such.
     """
-    # SQLAlchemy init.
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
+    application.state.schema_ready = False
     leader_connection = await engine.connect()
     is_migration_process = bool(
         await leader_connection.scalar(
@@ -38,9 +36,18 @@ async def lifespan(_: FastAPI):
     )
     if not is_migration_process:
         await leader_connection.close()
-        yield
+        await wait_for_required_schema(engine)
+        application.state.schema_ready = True
+        try:
+            yield
+        finally:
+            application.state.schema_ready = False
         return
     try:
+        # The elected API worker is the only metadata/migration owner.
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
         # Manual DB migrations.
         process = await asyncio.create_subprocess_exec(
             "dbmate",
@@ -72,9 +79,9 @@ async def lifespan(_: FastAPI):
             logger.success("successfully applied all DB migrations")
         else:
             logger.error(f"failed to run db migrations returncode={process.returncode}")
-            if settings.gpu_tee_only:
-                raise RuntimeError("seedless GPU database migration failed")
+            raise RuntimeError("miner database migration failed")
 
+        await wait_for_required_schema(engine)
         if settings.gpu_tee_only:
             server_id = await adopt_seedless_gpu_server()
             logger.success(f"adopted registrar-created logical GPU server {server_id}")
@@ -86,8 +93,10 @@ async def lifespan(_: FastAPI):
             )
             asyncio.create_task(socket_client.connect_and_run())
 
+        application.state.schema_ready = True
         yield
     finally:
+        application.state.schema_ready = False
         await leader_connection.scalar(
             text("SELECT pg_advisory_unlock(hashtextextended('chutes:seedless-api-leader:v1', 0))")
         )
@@ -98,6 +107,16 @@ app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
 app.include_router(servers_router, prefix="/servers", tags=["Servers"])
 app.include_router(deployments_router, prefix="/deployments", tags=["Deployments"])
 app.get("/ping")(lambda: {"message": "pong"})
+
+
+@app.get("/ready")
+async def ready(request: Request):
+    if not getattr(request.app.state, "schema_ready", False):
+        return ORJSONResponse(
+            status_code=503,
+            content={"ready": False, "reason": "required_schema_unavailable"},
+        )
+    return {"ready": True}
 
 
 @app.middleware("http")
