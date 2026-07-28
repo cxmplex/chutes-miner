@@ -63,9 +63,12 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "owner_name",
         "owner_uid",
         "node_name",
-    }.issubset(
-        resource.c.keys()
-    )
+        "pod_termination_evidence",
+        "pod_termination_evidence_sha256",
+        "pod_teardown_finalizer_attached_at",
+        "pod_teardown_finalizer_removal_requested_at",
+        "pod_teardown_finalizer_removed_at",
+    }.issubset(resource.c.keys())
     unique_columns = {
         tuple(column.name for column in constraint.columns)
         for constraint in resource.constraints
@@ -181,12 +184,22 @@ def test_orphan_tombstone_binds_cluster_and_node_lineage():
         "kubernetes_node_generation",
         "lineage_conflict_at",
     }.issubset(table.c.keys())
-    assert "lineage_conflict_at" not in Base.metadata.tables[
-        "parent_deletion_operations"
-    ].c
-    assert "owner_api_version" in Base.metadata.tables[
-        "kubernetes_orphan_tombstone_resources"
-    ].c
+    resource = Base.metadata.tables["kubernetes_orphan_tombstone_resources"]
+    assert {
+        "pod_termination_evidence",
+        "pod_termination_evidence_sha256",
+        "pod_teardown_finalizer_attached_at",
+        "pod_teardown_finalizer_removal_requested_at",
+        "pod_teardown_finalizer_removed_at",
+    }.issubset(resource.c.keys())
+    assert (
+        "lineage_conflict_at"
+        not in Base.metadata.tables["parent_deletion_operations"].c
+    )
+    assert (
+        "owner_api_version"
+        in Base.metadata.tables["kubernetes_orphan_tombstone_resources"].c
+    )
 
 
 def test_followup_migration_has_specific_locked_down_guard():

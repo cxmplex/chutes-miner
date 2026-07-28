@@ -33,6 +33,7 @@ from kubernetes.client import (
 
 _VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
 MIN_SUPPORTED_CHUTES_VERSION = "0.3.61"
+POD_TEARDOWN_FINALIZER = "chutes.ai/gpu-teardown-v1"
 MINER_LAUNCH_REQUEST_FIELDS = frozenset(
     {"schema", "miner_launch_request_id", "lineage"}
 )
@@ -283,6 +284,9 @@ def build_chute_job(
             template=V1PodTemplateSpec(
                 metadata=V1ObjectMeta(
                     labels=deployment_labels,
+                    finalizers=(
+                        [POD_TEARDOWN_FINALIZER] if settings.gpu_tee_only else None
+                    ),
                     annotations={
                         "prometheus.io/scrape": "true",
                         "prometheus.io/path": "/_metrics",

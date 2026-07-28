@@ -495,6 +495,7 @@ async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
     )
     pod = SimpleNamespace(
         resource_id="pod-row",
+        api_version="v1",
         kind="Pod",
         name="pod-1",
         uid="pod-uid",
@@ -521,6 +522,7 @@ async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
     monkeypatch.setattr(teardown, "get_session", fake_session)
     coordinator._renew_operation_lease = AsyncMock()
     coordinator._advance = AsyncMock()
+    coordinator._ensure_operation_pod_finalizers = AsyncMock()
 
     await coordinator._delete_resources(operation)
     assert coordinator.kubernetes.delete_resource.call_args.kwargs["kind"] == "Job"
@@ -811,6 +813,217 @@ def test_uid_precondition_conflict_advances_to_direct_replacement_verification(m
         )
         == "uid_changed"
     )
+
+
+def _terminal_pod(*, finalizers=None, deletion_timestamp="2026-07-27T20:00:00Z"):
+    terminated = SimpleNamespace(
+        exit_code=0,
+        signal=0,
+        reason="Completed",
+        started_at="2026-07-27T19:59:00Z",
+        finished_at="2026-07-27T20:00:00Z",
+    )
+    return SimpleNamespace(
+        api_version="v1",
+        metadata=SimpleNamespace(
+            name="pod-a",
+            namespace="chutes",
+            uid="pod-uid",
+            resource_version="17",
+            labels=dict(EXPECTED_LABELS),
+            owner_references=[],
+            finalizers=list(finalizers or []),
+            deletion_timestamp=deletion_timestamp,
+        ),
+        spec=SimpleNamespace(
+            node_name="node-a",
+            init_containers=[],
+            containers=[SimpleNamespace(name="worker")],
+            ephemeral_containers=[],
+        ),
+        status=SimpleNamespace(
+            init_container_statuses=[],
+            container_statuses=[
+                SimpleNamespace(
+                    name="worker",
+                    container_id="containerd://exact-container-id",
+                    state=SimpleNamespace(terminated=terminated, running=None),
+                )
+            ],
+            ephemeral_container_statuses=[],
+        ),
+    )
+
+
+def test_pod_terminal_evidence_requires_our_finalizer_and_every_container_status():
+    pod = _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER])
+    evidence = teardown._pod_termination_evidence(pod)
+    assert evidence["pod_uid"] == "pod-uid"
+    assert evidence["node_name"] == "node-a"
+    assert evidence["teardown_finalizer"] == teardown.POD_TEARDOWN_FINALIZER
+    assert evidence["containers"] == [
+        {
+            "group": "container",
+            "name": "worker",
+            "outcome": "terminated",
+            "container_id": "containerd://exact-container-id",
+            "exit_code": 0,
+            "signal": 0,
+            "reason": "Completed",
+            "started_at": "2026-07-27T19:59:00Z",
+            "finished_at": "2026-07-27T20:00:00Z",
+        }
+    ]
+
+    pod.metadata.finalizers = []
+    assert teardown._pod_termination_evidence(pod) is None
+    pod.metadata.finalizers = [teardown.POD_TEARDOWN_FINALIZER]
+    pod.status.container_statuses = []
+    assert teardown._pod_termination_evidence(pod) is None
+
+
+@pytest.mark.parametrize(
+    ("method", "finalizers"),
+    [
+        ("ensure_pod_teardown_finalizer", []),
+        ("remove_pod_teardown_finalizer", [teardown.POD_TEARDOWN_FINALIZER]),
+    ],
+)
+def test_pod_finalizer_resource_version_race_is_retryable(
+    monkeypatch,
+    method,
+    finalizers,
+):
+    pod = _terminal_pod(finalizers=finalizers, deletion_timestamp=None)
+
+    class Core:
+        @staticmethod
+        def read_namespaced_pod(**_kwargs):
+            return pod
+
+        @staticmethod
+        def patch_namespaced_pod(**_kwargs):
+            raise ApiException(status=409, reason="resourceVersion changed")
+
+    monkeypatch.setattr(teardown, "k8s_app_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(teardown, "k8s_batch_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(teardown, "k8s_core_client", Core)
+    closure = DirectKubernetesClosure(operator=SimpleNamespace())
+    assert (
+        getattr(closure, method)(
+            cluster_context="node-a",
+            namespace="chutes",
+            name="pod-a",
+            uid="pod-uid",
+            node_name="node-a",
+        )
+        == "retryable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pod_404_without_terminal_finalizer_closure_retains_ownership():
+    pod = SimpleNamespace(
+        resource_id="pod-row",
+        api_version="v1",
+        kind="Pod",
+        name="pod-a",
+        uid="pod-uid",
+        namespace="chutes",
+        node_name="node-a",
+        state="delete_requested",
+        owner_uid=None,
+        pod_termination_evidence=None,
+        pod_termination_evidence_sha256=None,
+        pod_teardown_finalizer_attached_at=object(),
+        pod_teardown_finalizer_removal_requested_at=None,
+        pod_teardown_finalizer_removed_at=None,
+    )
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        deployment_id="deployment-1",
+        cluster_context="node-a",
+        namespace="chutes",
+        config_id=None,
+        immutable_labels=EXPECTED_LABELS,
+        resources=[pod],
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(read_resource=Mock(return_value=None))
+    )
+    coordinator._renew_operation_lease = AsyncMock()
+    coordinator._pause_for_retry = AsyncMock()
+    coordinator._advance = AsyncMock()
+
+    assert await coordinator._verify(operation) is False
+    assert pod.state == "delete_requested"
+    coordinator._pause_for_retry.assert_awaited_once()
+    coordinator._advance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orphan_pod_finalizer_response_loss_replays_from_durable_evidence(
+    monkeypatch,
+):
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(
+            remove_pod_teardown_finalizer=Mock(
+                side_effect=ConnectionError("finalizer response lost")
+            )
+        )
+    )
+    tombstone = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        cluster_context="node-a",
+        namespace="chutes",
+        phase="verifying",
+        retry_lease_owner=coordinator.worker_id,
+        retry_lease_expires_at=None,
+    )
+    resource = SimpleNamespace(
+        resource_id="pod-row",
+        tombstone_id="tombstone-1",
+        api_version="v1",
+        kind="Pod",
+        name="pod-a",
+        uid="pod-uid",
+        node_name="node-a",
+        state="delete_requested",
+        absent_at=None,
+        pod_termination_evidence=None,
+        pod_termination_evidence_sha256=None,
+        pod_teardown_finalizer_attached_at=object(),
+        pod_teardown_finalizer_removal_requested_at=None,
+        pod_teardown_finalizer_removed_at=None,
+    )
+    live = teardown._identity(
+        "Pod",
+        _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER]),
+    )
+
+    async def get(model, _identity, **_kwargs):
+        if model.__name__ == "KubernetesOrphanTombstone":
+            return tombstone
+        return resource
+
+    session = SimpleNamespace(get=AsyncMock(side_effect=get), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    with pytest.raises(ConnectionError, match="response lost"):
+        await coordinator._close_orphan_pod(tombstone, resource, live)
+    assert resource.pod_termination_evidence == live.pod_termination_evidence
+    assert resource.pod_teardown_finalizer_removal_requested_at is not None
+    assert resource.pod_teardown_finalizer_removed_at is None
+    assert resource.state == "delete_requested"
+
+    coordinator.kubernetes.remove_pod_teardown_finalizer = Mock(return_value="absent")
+    assert await coordinator._close_orphan_pod(tombstone, resource, None) == "absent"
+    assert resource.pod_teardown_finalizer_removed_at is not None
+    assert resource.state == "absent"
 
 
 @pytest.mark.asyncio

@@ -142,7 +142,12 @@ ALTER TABLE deployment_launch_operations
     );
 
 ALTER TABLE deployment_teardown_k8s_resources
-    ADD COLUMN IF NOT EXISTS owner_api_version TEXT;
+    ADD COLUMN IF NOT EXISTS owner_api_version TEXT,
+    ADD COLUMN IF NOT EXISTS pod_termination_evidence JSONB,
+    ADD COLUMN IF NOT EXISTS pod_termination_evidence_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_attached_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_removal_requested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_removed_at TIMESTAMPTZ;
 UPDATE deployment_teardown_k8s_resources
 SET owner_api_version = CASE
     WHEN owner_kind = 'Job' THEN 'batch/v1'
@@ -152,7 +157,9 @@ END
 WHERE owner_kind IS NOT NULL
   AND owner_api_version IS NULL;
 ALTER TABLE deployment_teardown_k8s_resources
-    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_owner;
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_owner,
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_pod_termination,
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_pod_termination_sha256;
 ALTER TABLE deployment_teardown_k8s_resources
     ADD CONSTRAINT ck_deployment_teardown_resource_owner CHECK (
         (
@@ -166,6 +173,41 @@ ALTER TABLE deployment_teardown_k8s_resources
             AND owner_name IS NOT NULL
             AND owner_uid IS NOT NULL
         )
+    ),
+    ADD CONSTRAINT ck_deployment_teardown_resource_pod_termination CHECK (
+        ((pod_termination_evidence IS NULL) =
+            (pod_termination_evidence_sha256 IS NULL))
+        AND ((pod_termination_evidence IS NULL) =
+            (pod_teardown_finalizer_removal_requested_at IS NULL))
+        AND (kind = 'Pod' OR pod_termination_evidence IS NULL)
+        AND (
+            kind = 'Pod'
+            OR (
+                pod_teardown_finalizer_attached_at IS NULL
+                AND pod_teardown_finalizer_removal_requested_at IS NULL
+                AND pod_teardown_finalizer_removed_at IS NULL
+            )
+        )
+        AND (
+            pod_teardown_finalizer_removal_requested_at IS NULL
+            OR pod_teardown_finalizer_attached_at IS NOT NULL
+        )
+        AND (
+            pod_teardown_finalizer_removed_at IS NULL
+            OR pod_teardown_finalizer_removal_requested_at IS NOT NULL
+        )
+        AND (
+            kind <> 'Pod'
+            OR state NOT IN ('absent', 'replaced')
+            OR (
+                pod_termination_evidence IS NOT NULL
+                AND pod_teardown_finalizer_removed_at IS NOT NULL
+            )
+        )
+    ),
+    ADD CONSTRAINT ck_deployment_teardown_resource_pod_termination_sha256 CHECK (
+        pod_termination_evidence_sha256 IS NULL
+        OR pod_termination_evidence_sha256 ~ '^[0-9a-f]{64}$'
     );
 
 ALTER TABLE deployment_teardown_operations
@@ -243,7 +285,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 ALTER TABLE kubernetes_orphan_tombstone_resources
-    ADD COLUMN IF NOT EXISTS owner_api_version TEXT;
+    ADD COLUMN IF NOT EXISTS owner_api_version TEXT,
+    ADD COLUMN IF NOT EXISTS pod_termination_evidence JSONB,
+    ADD COLUMN IF NOT EXISTS pod_termination_evidence_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_attached_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_removal_requested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS pod_teardown_finalizer_removed_at TIMESTAMPTZ;
 UPDATE kubernetes_orphan_tombstone_resources
 SET owner_api_version = CASE
     WHEN owner_kind = 'Job' THEN 'batch/v1'
@@ -253,7 +300,9 @@ END
 WHERE owner_kind IS NOT NULL
   AND owner_api_version IS NULL;
 ALTER TABLE kubernetes_orphan_tombstone_resources
-    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_owner;
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_owner,
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_pod_termination,
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_pod_termination_sha256;
 ALTER TABLE kubernetes_orphan_tombstone_resources
     ADD CONSTRAINT ck_kubernetes_orphan_resource_owner CHECK (
         (
@@ -267,6 +316,41 @@ ALTER TABLE kubernetes_orphan_tombstone_resources
             AND owner_name IS NOT NULL
             AND owner_uid IS NOT NULL
         )
+    ),
+    ADD CONSTRAINT ck_kubernetes_orphan_resource_pod_termination CHECK (
+        ((pod_termination_evidence IS NULL) =
+            (pod_termination_evidence_sha256 IS NULL))
+        AND ((pod_termination_evidence IS NULL) =
+            (pod_teardown_finalizer_removal_requested_at IS NULL))
+        AND (kind = 'Pod' OR pod_termination_evidence IS NULL)
+        AND (
+            kind = 'Pod'
+            OR (
+                pod_teardown_finalizer_attached_at IS NULL
+                AND pod_teardown_finalizer_removal_requested_at IS NULL
+                AND pod_teardown_finalizer_removed_at IS NULL
+            )
+        )
+        AND (
+            pod_teardown_finalizer_removal_requested_at IS NULL
+            OR pod_teardown_finalizer_attached_at IS NOT NULL
+        )
+        AND (
+            pod_teardown_finalizer_removed_at IS NULL
+            OR pod_teardown_finalizer_removal_requested_at IS NOT NULL
+        )
+        AND (
+            kind <> 'Pod'
+            OR state <> 'absent'
+            OR (
+                pod_termination_evidence IS NOT NULL
+                AND pod_teardown_finalizer_removed_at IS NOT NULL
+            )
+        )
+    ),
+    ADD CONSTRAINT ck_kubernetes_orphan_resource_pod_termination_sha256 CHECK (
+        pod_termination_evidence_sha256 IS NULL
+        OR pod_termination_evidence_sha256 ~ '^[0-9a-f]{64}$'
     );
 
 -- migrate:down
@@ -302,6 +386,26 @@ BEGIN
     ) THEN
         RAISE EXCEPTION
             'cannot remove miner lifecycle follow-up schema while validator job release history exists';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM deployment_teardown_k8s_resources
+        WHERE pod_termination_evidence IS NOT NULL
+           OR pod_termination_evidence_sha256 IS NOT NULL
+           OR pod_teardown_finalizer_attached_at IS NOT NULL
+           OR pod_teardown_finalizer_removal_requested_at IS NOT NULL
+           OR pod_teardown_finalizer_removed_at IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1
+        FROM kubernetes_orphan_tombstone_resources
+        WHERE pod_termination_evidence IS NOT NULL
+           OR pod_termination_evidence_sha256 IS NOT NULL
+           OR pod_teardown_finalizer_attached_at IS NOT NULL
+           OR pod_teardown_finalizer_removal_requested_at IS NOT NULL
+           OR pod_teardown_finalizer_removed_at IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'cannot remove miner lifecycle follow-up schema while pod termination evidence exists';
     END IF;
     IF EXISTS (SELECT 1 FROM miner_launch_intents) THEN
         RAISE EXCEPTION
@@ -377,23 +481,37 @@ ALTER TABLE deployment_teardown_operations
     DROP COLUMN IF EXISTS validator_job_release_ack;
 
 ALTER TABLE kubernetes_orphan_tombstone_resources
-    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_owner;
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_owner,
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_pod_termination,
+    DROP CONSTRAINT IF EXISTS ck_kubernetes_orphan_resource_pod_termination_sha256;
 ALTER TABLE kubernetes_orphan_tombstone_resources
     ADD CONSTRAINT ck_kubernetes_orphan_resource_owner CHECK (
         (owner_kind IS NULL AND owner_name IS NULL AND owner_uid IS NULL) OR
         (owner_kind IS NOT NULL AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)
     );
 ALTER TABLE kubernetes_orphan_tombstone_resources
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_removed_at,
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_removal_requested_at,
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_attached_at,
+    DROP COLUMN IF EXISTS pod_termination_evidence_sha256,
+    DROP COLUMN IF EXISTS pod_termination_evidence,
     DROP COLUMN IF EXISTS owner_api_version;
 
 ALTER TABLE deployment_teardown_k8s_resources
-    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_owner;
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_owner,
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_pod_termination,
+    DROP CONSTRAINT IF EXISTS ck_deployment_teardown_resource_pod_termination_sha256;
 ALTER TABLE deployment_teardown_k8s_resources
     ADD CONSTRAINT ck_deployment_teardown_resource_owner CHECK (
         (owner_kind IS NULL AND owner_name IS NULL AND owner_uid IS NULL) OR
         (owner_kind IS NOT NULL AND owner_name IS NOT NULL AND owner_uid IS NOT NULL)
     );
 ALTER TABLE deployment_teardown_k8s_resources
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_removed_at,
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_removal_requested_at,
+    DROP COLUMN IF EXISTS pod_teardown_finalizer_attached_at,
+    DROP COLUMN IF EXISTS pod_termination_evidence_sha256,
+    DROP COLUMN IF EXISTS pod_termination_evidence,
     DROP COLUMN IF EXISTS owner_api_version;
 
 ALTER TABLE deployment_launch_operations

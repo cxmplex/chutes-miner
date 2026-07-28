@@ -151,14 +151,30 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
                   'kubernetes_orphan_tombstone_resources'
               )
               AND column_name = 'owner_api_version';
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name IN (
+                  'deployment_teardown_k8s_resources',
+                  'kubernetes_orphan_tombstone_resources'
+              )
+              AND column_name IN (
+                  'pod_termination_evidence',
+                  'pod_termination_evidence_sha256',
+                  'pod_teardown_finalizer_attached_at',
+                  'pod_teardown_finalizer_removal_requested_at',
+                  'pod_teardown_finalizer_removed_at'
+              );
             """,
             schema=schema,
             tuples_only=True,
         )
         _assert_ok(inspected)
         assert [
-            line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["t", "7", "2"]
+            line.strip()
+            for line in inspected.stdout.decode().splitlines()
+            if line.strip()
+        ] == ["t", "7", "2", "10"]
 
         _assert_ok(_psql(f"BEGIN;\n{FOLLOWUP_DOWN}\nCOMMIT;", schema=schema))
         restored = _psql(

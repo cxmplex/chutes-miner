@@ -42,6 +42,7 @@ from chutes_miner.api.config import (
 from chutes_miner.api.database import get_session
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.util import (
+    POD_TEARDOWN_FINALIZER,
     registry_pull_secret_name,
     validated_miner_launch_lineage,
 )
@@ -54,6 +55,7 @@ from sqlalchemy.orm import selectinload
 
 LEASE_SECONDS = 300
 EXTERNAL_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+POD_TERMINATION_EVIDENCE_SCHEMA = "chutes.miner-pod-termination.v1"
 DELETE_ORDER = {
     "Job": 0,
     "Deployment": 0,
@@ -101,6 +103,102 @@ def canonical_sha256(document: Any) -> str:
     ).hexdigest()
 
 
+def _timestamp_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
+    """Return exact terminal-container evidence, never mere API absence."""
+    metadata = getattr(resource, "metadata", None)
+    spec = getattr(resource, "spec", None)
+    status = getattr(resource, "status", None)
+    pod_uid = str(getattr(metadata, "uid", "") or "")
+    node_name = str(getattr(spec, "node_name", "") or "")
+    if not pod_uid or not node_name or status is None:
+        return None
+
+    deletion_timestamp = _timestamp_text(getattr(metadata, "deletion_timestamp", None))
+    finalizers = {str(value) for value in (getattr(metadata, "finalizers", None) or [])}
+    if deletion_timestamp is None or POD_TEARDOWN_FINALIZER not in finalizers:
+        return None
+    groups = (
+        (
+            "init",
+            list(getattr(spec, "init_containers", None) or []),
+            list(getattr(status, "init_container_statuses", None) or []),
+        ),
+        (
+            "container",
+            list(getattr(spec, "containers", None) or []),
+            list(getattr(status, "container_statuses", None) or []),
+        ),
+        (
+            "ephemeral",
+            list(getattr(spec, "ephemeral_containers", None) or []),
+            list(getattr(status, "ephemeral_container_statuses", None) or []),
+        ),
+    )
+    records: list[dict[str, Any]] = []
+    expected_count = 0
+    for group, containers, statuses in groups:
+        expected_names = [
+            str(getattr(container, "name", "") or "") for container in containers
+        ]
+        if any(not name for name in expected_names) or len(set(expected_names)) != len(
+            expected_names
+        ):
+            return None
+        expected_count += len(expected_names)
+        by_name = {
+            str(getattr(container_status, "name", "") or ""): container_status
+            for container_status in statuses
+        }
+        if set(by_name).difference(expected_names):
+            return None
+        for name in expected_names:
+            container_status = by_name.get(name)
+            if container_status is None:
+                return None
+            state = getattr(container_status, "state", None)
+            terminated = getattr(state, "terminated", None) if state else None
+            container_id = str(getattr(container_status, "container_id", "") or "")
+            if terminated is not None:
+                finished_at = _timestamp_text(getattr(terminated, "finished_at", None))
+                if not container_id or not finished_at:
+                    return None
+                records.append(
+                    {
+                        "group": group,
+                        "name": name,
+                        "outcome": "terminated",
+                        "container_id": container_id,
+                        "exit_code": int(getattr(terminated, "exit_code", 0)),
+                        "signal": int(getattr(terminated, "signal", 0) or 0),
+                        "reason": str(getattr(terminated, "reason", "") or ""),
+                        "started_at": _timestamp_text(
+                            getattr(terminated, "started_at", None)
+                        ),
+                        "finished_at": finished_at,
+                    }
+                )
+                continue
+            return None
+    if expected_count == 0:
+        return None
+    return {
+        "schema": POD_TERMINATION_EVIDENCE_SCHEMA,
+        "pod_uid": pod_uid,
+        "node_name": node_name,
+        "teardown_finalizer": POD_TEARDOWN_FINALIZER,
+        "deletion_timestamp": deletion_timestamp,
+        "containers": sorted(records, key=lambda item: (item["group"], item["name"])),
+    }
+
+
 def cluster_context_sha256(server: Server) -> str:
     return canonical_sha256(
         {
@@ -130,10 +228,85 @@ class ResourceIdentity:
     owner_name: str | None
     owner_uid: str | None
     node_name: str | None
+    pod_termination_evidence: dict[str, Any] | None = None
 
     @property
     def labels_sha256(self) -> str:
         return canonical_sha256(self.labels)
+
+    @property
+    def pod_termination_evidence_sha256(self) -> str | None:
+        if self.pod_termination_evidence is None:
+            return None
+        return canonical_sha256(self.pod_termination_evidence)
+
+
+def _verified_pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
+    evidence = getattr(resource, "pod_termination_evidence", None)
+    digest = getattr(resource, "pod_termination_evidence_sha256", None)
+    if getattr(resource, "kind", None) != "Pod":
+        if evidence is not None or digest is not None:
+            raise LineageConflict("non-Pod resource has Pod termination evidence")
+        return None
+    if evidence is None and digest is None:
+        return None
+    if (
+        not isinstance(evidence, dict)
+        or not isinstance(digest, str)
+        or set(evidence)
+        != {
+            "schema",
+            "pod_uid",
+            "node_name",
+            "teardown_finalizer",
+            "deletion_timestamp",
+            "containers",
+        }
+        or evidence.get("schema") != POD_TERMINATION_EVIDENCE_SCHEMA
+        or evidence.get("pod_uid") != getattr(resource, "uid", None)
+        or evidence.get("node_name") != getattr(resource, "node_name", None)
+        or evidence.get("teardown_finalizer") != POD_TEARDOWN_FINALIZER
+        or not evidence.get("deletion_timestamp")
+        or not isinstance(evidence.get("containers"), list)
+        or not evidence["containers"]
+        or canonical_sha256(evidence) != digest
+    ):
+        raise LineageConflict("Pod termination evidence is invalid")
+    for container in evidence["containers"]:
+        if (
+            not isinstance(container, dict)
+            or set(container)
+            != {
+                "group",
+                "name",
+                "outcome",
+                "container_id",
+                "exit_code",
+                "signal",
+                "reason",
+                "started_at",
+                "finished_at",
+            }
+            or container.get("group") not in {"init", "container", "ephemeral"}
+            or not container.get("name")
+            or container.get("outcome") != "terminated"
+            or not container.get("container_id")
+            or not container.get("finished_at")
+        ):
+            raise LineageConflict("Pod container termination evidence is invalid")
+    return evidence
+
+
+def _pod_absence_proven(resource: Any) -> bool:
+    """Require the complete durable finalizer/evidence closure for a Pod UID."""
+    if getattr(resource, "kind", None) != "Pod":
+        return True
+    return bool(
+        _verified_pod_termination_evidence(resource)
+        and getattr(resource, "pod_teardown_finalizer_attached_at", None)
+        and getattr(resource, "pod_teardown_finalizer_removal_requested_at", None)
+        and getattr(resource, "pod_teardown_finalizer_removed_at", None)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +513,9 @@ def _identity(kind: str, resource: Any) -> ResourceIdentity:
         owner_name=owner_name,
         owner_uid=owner_uid,
         node_name=str(node_name) if node_name else None,
+        pod_termination_evidence=(
+            _pod_termination_evidence(resource) if kind == "Pod" else None
+        ),
     )
 
 
@@ -411,11 +587,15 @@ def _accept_owner(
 
 
 def _resource_delete_ready(resource: Any, resources: Iterable[Any]) -> bool:
-    """Delete children only after their captured controller is directly absent."""
+    """Delete children only after their captured controller deletion is durable."""
     by_uid = {item.uid: item for item in resources}
     if resource.owner_uid:
         owner = by_uid.get(resource.owner_uid)
-        if owner is not None and owner.state not in {"absent", "replaced"}:
+        if owner is not None and owner.state not in {
+            "delete_requested",
+            "absent",
+            "replaced",
+        }:
             return False
     if resource.kind == "Secret":
         return all(
@@ -553,6 +733,136 @@ class DirectKubernetesClosure:
                 return None
             raise
         return _identity(kind, resource)
+
+    def ensure_pod_teardown_finalizer(
+        self,
+        *,
+        cluster_context: str,
+        namespace: str,
+        name: str,
+        uid: str,
+        node_name: str,
+    ) -> str:
+        """Attach our exact-UID deletion fence before any controller is deleted."""
+        _, _, core = self._clients(cluster_context)
+        try:
+            pod = core.read_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                _request_timeout=30,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return "absent"
+            raise
+        metadata = pod.metadata
+        if str(metadata.uid) != uid:
+            return "uid_changed"
+        if str(getattr(pod.spec, "node_name", "") or "") != node_name:
+            raise LineageConflict("Pod node changed before teardown fencing")
+        finalizers = [str(value) for value in (metadata.finalizers or [])]
+        if POD_TEARDOWN_FINALIZER in finalizers:
+            return "present"
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        if not resource_version:
+            raise DeploymentFailure(
+                "Pod resourceVersion is missing before finalizer attach"
+            )
+        try:
+            patched = core.patch_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                body={
+                    "metadata": {
+                        "uid": uid,
+                        "resourceVersion": resource_version,
+                        "finalizers": [*finalizers, POD_TEARDOWN_FINALIZER],
+                    }
+                },
+                _content_type="application/merge-patch+json",
+                _request_timeout=30,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return "absent"
+            if exc.status in {409, 422}:
+                return "retryable"
+            raise
+        if str(patched.metadata.uid) != uid or POD_TEARDOWN_FINALIZER not in {
+            str(value) for value in (patched.metadata.finalizers or [])
+        }:
+            raise DeploymentFailure(
+                "Pod teardown finalizer attach was not acknowledged"
+            )
+        return "attached"
+
+    def remove_pod_teardown_finalizer(
+        self,
+        *,
+        cluster_context: str,
+        namespace: str,
+        name: str,
+        uid: str,
+        node_name: str,
+    ) -> str:
+        """Remove only our finalizer after exact terminal evidence is durable."""
+        _, _, core = self._clients(cluster_context)
+        try:
+            pod = core.read_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                _request_timeout=30,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return "absent"
+            raise
+        metadata = pod.metadata
+        if str(metadata.uid) != uid:
+            return "uid_changed"
+        if str(getattr(pod.spec, "node_name", "") or "") != node_name:
+            raise LineageConflict("Pod node changed before teardown finalizer removal")
+        finalizers = [str(value) for value in (metadata.finalizers or [])]
+        if POD_TEARDOWN_FINALIZER not in finalizers:
+            return "removed"
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        if not resource_version:
+            raise DeploymentFailure(
+                "Pod resourceVersion is missing before finalizer removal"
+            )
+        try:
+            patched = core.patch_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                body={
+                    "metadata": {
+                        "uid": uid,
+                        "resourceVersion": resource_version,
+                        "finalizers": [
+                            value
+                            for value in finalizers
+                            if value != POD_TEARDOWN_FINALIZER
+                        ],
+                    }
+                },
+                _content_type="application/merge-patch+json",
+                _request_timeout=30,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return "absent"
+            if exc.status in {409, 422}:
+                return "retryable"
+            raise
+        if str(patched.metadata.uid) != uid:
+            return "uid_changed"
+        if POD_TEARDOWN_FINALIZER in {
+            str(value) for value in (patched.metadata.finalizers or [])
+        }:
+            raise DeploymentFailure(
+                "Pod teardown finalizer removal was not acknowledged"
+            )
+        return "removed"
 
     def delete_resource(
         self,
@@ -1128,6 +1438,192 @@ class DeploymentTeardownCoordinator:
             operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
 
+    async def _ensure_operation_pod_finalizers(
+        self,
+        operation_id: str,
+        phase: str,
+    ) -> None:
+        """Attach every Pod fence before controller deletion can begin."""
+        async with get_session() as session:
+            resources = list(
+                (
+                    await session.execute(
+                        select(DeploymentTeardownK8sResource).where(
+                            DeploymentTeardownK8sResource.operation_id == operation_id,
+                            DeploymentTeardownK8sResource.kind == "Pod",
+                            DeploymentTeardownK8sResource.state.notin_(
+                                ("absent", "replaced")
+                            ),
+                            DeploymentTeardownK8sResource.pod_teardown_finalizer_attached_at.is_(
+                                None
+                            ),
+                        )
+                    )
+                ).scalars()
+            )
+        for resource in resources:
+            outcome = await asyncio.to_thread(
+                self.kubernetes.ensure_pod_teardown_finalizer,
+                cluster_context=resource.cluster_context,
+                namespace=resource.namespace,
+                name=resource.name,
+                uid=resource.uid,
+                node_name=resource.node_name,
+            )
+            async with get_session() as session:
+                operation = await session.get(
+                    DeploymentTeardownOperation,
+                    operation_id,
+                    with_for_update=True,
+                )
+                current = await session.get(
+                    DeploymentTeardownK8sResource,
+                    resource.resource_id,
+                    with_for_update=True,
+                )
+                if (
+                    operation is None
+                    or operation.retry_lease_owner != self.worker_id
+                    or operation.phase != phase
+                    or current is None
+                    or current.operation_id != operation_id
+                    or current.uid != resource.uid
+                ):
+                    raise DeploymentFailure(
+                        "teardown changed during Pod finalizer attachment"
+                    )
+                if outcome == "retryable":
+                    raise DeploymentFailure(
+                        f"Pod finalizer attach raced a Kubernetes update: {resource.uid}"
+                    )
+                if outcome not in {"attached", "present"}:
+                    raise LineageConflict(
+                        f"Pod disappeared or changed UID before teardown fence: {resource.uid}"
+                    )
+                current.pod_teardown_finalizer_attached_at = (
+                    current.pod_teardown_finalizer_attached_at or utc_now()
+                )
+                operation.retry_lease_expires_at = utc_now() + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                await session.commit()
+
+    async def _close_operation_pod(
+        self,
+        operation: DeploymentTeardownOperation,
+        resource: DeploymentTeardownK8sResource,
+        live: ResourceIdentity | None,
+    ) -> str | None:
+        """Persist exact termination, then remove the deletion fence, crash-safely."""
+        evidence = getattr(resource, "pod_termination_evidence", None)
+        digest = getattr(resource, "pod_termination_evidence_sha256", None)
+        if evidence is not None or digest is not None:
+            _verified_pod_termination_evidence(resource)
+        elif live is not None and live.pod_termination_evidence is not None:
+            evidence = live.pod_termination_evidence
+            digest = live.pod_termination_evidence_sha256
+        else:
+            return None
+        if not getattr(resource, "pod_teardown_finalizer_attached_at", None):
+            raise LineageConflict("Pod terminal evidence predates teardown finalizer")
+
+        async with get_session() as session:
+            current_operation = await session.get(
+                DeploymentTeardownOperation,
+                operation.operation_id,
+                with_for_update=True,
+            )
+            current = await session.get(
+                DeploymentTeardownK8sResource,
+                resource.resource_id,
+                with_for_update=True,
+            )
+            if (
+                current_operation is None
+                or current_operation.retry_lease_owner != self.worker_id
+                or current_operation.phase != "verifying"
+                or current is None
+                or current.operation_id != operation.operation_id
+                or current.uid != resource.uid
+                or current.state in {"absent", "replaced"}
+            ):
+                raise DeploymentFailure("teardown changed before Pod terminal evidence")
+            if not current.pod_teardown_finalizer_attached_at:
+                raise LineageConflict("Pod terminal evidence has no durable finalizer")
+            if current.pod_termination_evidence is not None and (
+                current.pod_termination_evidence != evidence
+                or current.pod_termination_evidence_sha256 != digest
+            ):
+                raise LineageConflict("Pod terminal evidence changed during replay")
+            current.pod_termination_evidence = evidence
+            current.pod_termination_evidence_sha256 = digest
+            current.pod_teardown_finalizer_removal_requested_at = (
+                current.pod_teardown_finalizer_removal_requested_at or utc_now()
+            )
+            current_operation.retry_lease_expires_at = utc_now() + timedelta(
+                seconds=LEASE_SECONDS
+            )
+            await session.commit()
+
+        outcome = await asyncio.to_thread(
+            self.kubernetes.remove_pod_teardown_finalizer,
+            cluster_context=resource.cluster_context,
+            namespace=resource.namespace,
+            name=resource.name,
+            uid=resource.uid,
+            node_name=resource.node_name,
+        )
+        async with get_session() as session:
+            current_operation = await session.get(
+                DeploymentTeardownOperation,
+                operation.operation_id,
+                with_for_update=True,
+            )
+            current = await session.get(
+                DeploymentTeardownK8sResource,
+                resource.resource_id,
+                with_for_update=True,
+            )
+            if (
+                current_operation is None
+                or current_operation.retry_lease_owner != self.worker_id
+                or current_operation.phase != "verifying"
+                or current is None
+                or current.operation_id != operation.operation_id
+                or current.uid != resource.uid
+                or current.pod_termination_evidence != evidence
+                or current.pod_termination_evidence_sha256 != digest
+            ):
+                raise DeploymentFailure("teardown changed during Pod finalizer removal")
+            if outcome == "uid_changed":
+                raise LineageConflict(
+                    "same-name Pod replaced during teardown finalizer removal"
+                )
+            if outcome == "retryable":
+                raise DeploymentFailure(
+                    "Pod finalizer removal raced a Kubernetes update"
+                )
+            current.pod_teardown_finalizer_removed_at = (
+                current.pod_teardown_finalizer_removed_at or utc_now()
+            )
+            resource.pod_termination_evidence = evidence
+            resource.pod_termination_evidence_sha256 = digest
+            resource.pod_teardown_finalizer_removal_requested_at = (
+                current.pod_teardown_finalizer_removal_requested_at
+            )
+            resource.pod_teardown_finalizer_removed_at = (
+                current.pod_teardown_finalizer_removed_at
+            )
+            if outcome == "absent":
+                current.state = "absent"
+                current.absent_at = current.absent_at or utc_now()
+                resource.state = "absent"
+            current_operation.retry_lease_expires_at = utc_now() + timedelta(
+                seconds=LEASE_SECONDS
+            )
+            await session.commit()
+        return outcome
+
     async def _adopt_replacement(
         self,
         operation_id: str,
@@ -1187,6 +1683,12 @@ class DeploymentTeardownCoordinator:
                 )
                 if predecessor is None or predecessor.operation_id != operation_id:
                     raise DeploymentFailure("replacement predecessor binding changed")
+                if getattr(
+                    predecessor, "kind", None
+                ) == "Pod" and not _pod_absence_proven(predecessor):
+                    raise LineageConflict(
+                        "same-name Pod replaced before exact termination closure"
+                    )
                 predecessor.state = "replaced"
                 predecessor.replaced_by_resource_id = successor.resource_id
             operation.phase = "deleting"
@@ -1255,6 +1757,10 @@ class DeploymentTeardownCoordinator:
                 f"Kubernetes owner lineage was not observed: {identities}"
             )
         await self._record_resources(operation.operation_id, resources)
+        await self._ensure_operation_pod_finalizers(
+            operation.operation_id,
+            "discovering",
+        )
         await self._advance(operation.operation_id, "discovering", "revoking")
 
     async def _revoke_registry(self, operation: DeploymentTeardownOperation) -> dict[str, Any]:
@@ -1551,6 +2057,7 @@ class DeploymentTeardownCoordinator:
         await self._advance(operation.operation_id, "revoking", "deleting")
 
     async def _delete_resources(self, operation: DeploymentTeardownOperation) -> None:
+        await self._ensure_operation_pod_finalizers(operation.operation_id, "deleting")
         resources = sorted(
             (
                 resource
@@ -1576,7 +2083,11 @@ class DeploymentTeardownCoordinator:
                     resource.resource_id,
                     with_for_update=True,
                 )
-                if current and outcome == "absent":
+                if (
+                    current
+                    and outcome == "absent"
+                    and (current.kind != "Pod" or _pod_absence_proven(current))
+                ):
                     current.state = "absent"
                     current.absent_at = utc_now()
                     resource.state = "absent"
@@ -1612,6 +2123,12 @@ class DeploymentTeardownCoordinator:
             key=lambda item: (VERIFY_ORDER[item.kind], item.name, item.uid),
         ):
             if resource.state in {"absent", "replaced"}:
+                if resource.kind == "Pod" and not _pod_absence_proven(resource):
+                    await self._record_conflict(
+                        operation.operation_id,
+                        "terminal Pod row lacks exact termination closure",
+                    )
+                    return False
                 continue
             live = await asyncio.to_thread(
                 self.kubernetes.read_resource,
@@ -1622,6 +2139,18 @@ class DeploymentTeardownCoordinator:
             )
             await self._renew_operation_lease(operation.operation_id, "verifying")
             if live is None:
+                if resource.kind == "Pod":
+                    if (
+                        resource.pod_termination_evidence is not None
+                        and resource.pod_teardown_finalizer_removal_requested_at
+                    ):
+                        await self._close_operation_pod(operation, resource, None)
+                        continue
+                    await self._pause_for_retry(
+                        operation.operation_id,
+                        f"Pod {resource.uid} is absent without terminal evidence",
+                    )
+                    return False
                 async with get_session() as session:
                     current = await session.get(
                         DeploymentTeardownK8sResource,
@@ -1634,6 +2163,16 @@ class DeploymentTeardownCoordinator:
                 resource.state = "absent"
                 continue
             if live.uid == resource.uid:
+                if resource.kind == "Pod":
+                    outcome = await self._close_operation_pod(
+                        operation,
+                        resource,
+                        live,
+                    )
+                    if outcome is not None:
+                        if resource.state != "absent":
+                            absence_pending = True
+                        continue
                 if resource.state == "observed" and _resource_delete_ready(
                     resource, operation.resources
                 ):
@@ -1641,6 +2180,12 @@ class DeploymentTeardownCoordinator:
                 else:
                     absence_pending = True
                 continue
+            if resource.kind == "Pod" and not _pod_absence_proven(resource):
+                await self._record_conflict(
+                    operation.operation_id,
+                    "same-name Pod appeared before exact predecessor termination closure",
+                )
+                return False
             try:
                 replacement_matches(
                     expected_labels=operation.immutable_labels,
@@ -1710,6 +2255,14 @@ class DeploymentTeardownCoordinator:
             )
             return False
 
+        for resource in operation.resources:
+            if resource.kind == "Pod" and not _pod_absence_proven(resource):
+                await self._record_conflict(
+                    operation.operation_id,
+                    "Pod closure became incomplete before teardown finalization",
+                )
+                return False
+
         now = utc_now()
         values: dict[str, Any] = {
             "controllers_absent_at": now,
@@ -1763,7 +2316,29 @@ class DeploymentTeardownCoordinator:
                 and (not current.job_id or current.validator_job_release_ack)
                 and (not current.instance_id or current.validator_instance_deletion_ack)
             ):
-                raise DeploymentFailure("teardown finalization lacks persisted acknowledgements")
+                raise DeploymentFailure(
+                    "teardown finalization lacks persisted acknowledgements"
+                )
+            resources = list(
+                (
+                    await session.execute(
+                        select(DeploymentTeardownK8sResource)
+                        .where(
+                            DeploymentTeardownK8sResource.operation_id
+                            == current.operation_id
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if any(
+                resource.state not in {"absent", "replaced"}
+                or (resource.kind == "Pod" and not _pod_absence_proven(resource))
+                for resource in resources
+            ):
+                raise DeploymentFailure(
+                    "teardown finalization lacks exact Kubernetes UID closure"
+                )
             latest_handoff = (
                 await session.execute(
                     select(DeploymentTeardownNodeIncarnationHandoff)
@@ -2527,6 +3102,192 @@ class DeploymentTeardownCoordinator:
             await session.commit()
             return tombstone.tombstone_id
 
+    async def _ensure_orphan_pod_finalizers(
+        self,
+        tombstone_id: str,
+        phase: str,
+    ) -> None:
+        async with get_session() as session:
+            tombstone = await session.get(KubernetesOrphanTombstone, tombstone_id)
+            resources = list(
+                (
+                    await session.execute(
+                        select(KubernetesOrphanTombstoneResource).where(
+                            KubernetesOrphanTombstoneResource.tombstone_id
+                            == tombstone_id,
+                            KubernetesOrphanTombstoneResource.kind == "Pod",
+                            KubernetesOrphanTombstoneResource.state != "absent",
+                            KubernetesOrphanTombstoneResource.pod_teardown_finalizer_attached_at.is_(
+                                None
+                            ),
+                        )
+                    )
+                ).scalars()
+            )
+        if tombstone is None:
+            raise DeploymentFailure("orphan tombstone disappeared before Pod fencing")
+        for resource in resources:
+            outcome = await asyncio.to_thread(
+                self.kubernetes.ensure_pod_teardown_finalizer,
+                cluster_context=tombstone.cluster_context,
+                namespace=tombstone.namespace,
+                name=resource.name,
+                uid=resource.uid,
+                node_name=resource.node_name,
+            )
+            async with get_session() as session:
+                current_tombstone = await session.get(
+                    KubernetesOrphanTombstone,
+                    tombstone_id,
+                    with_for_update=True,
+                )
+                current = await session.get(
+                    KubernetesOrphanTombstoneResource,
+                    resource.resource_id,
+                    with_for_update=True,
+                )
+                if (
+                    current_tombstone is None
+                    or current_tombstone.retry_lease_owner != self.worker_id
+                    or current_tombstone.phase != phase
+                    or current is None
+                    or current.tombstone_id != tombstone_id
+                    or current.uid != resource.uid
+                ):
+                    raise DeploymentFailure(
+                        "orphan changed during Pod finalizer attachment"
+                    )
+                if outcome == "retryable":
+                    raise DeploymentFailure(
+                        f"orphan Pod finalizer attach raced a Kubernetes update: {resource.uid}"
+                    )
+                if outcome not in {"attached", "present"}:
+                    raise LineageConflict(
+                        f"orphan Pod disappeared before teardown fence: {resource.uid}"
+                    )
+                current.pod_teardown_finalizer_attached_at = (
+                    current.pod_teardown_finalizer_attached_at or utc_now()
+                )
+                current_tombstone.retry_lease_expires_at = utc_now() + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                await session.commit()
+
+    async def _close_orphan_pod(
+        self,
+        tombstone: KubernetesOrphanTombstone,
+        resource: KubernetesOrphanTombstoneResource,
+        live: ResourceIdentity | None,
+    ) -> str | None:
+        evidence = getattr(resource, "pod_termination_evidence", None)
+        digest = getattr(resource, "pod_termination_evidence_sha256", None)
+        if evidence is not None or digest is not None:
+            _verified_pod_termination_evidence(resource)
+        elif live is not None and live.pod_termination_evidence is not None:
+            evidence = live.pod_termination_evidence
+            digest = live.pod_termination_evidence_sha256
+        else:
+            return None
+        if not getattr(resource, "pod_teardown_finalizer_attached_at", None):
+            raise LineageConflict("orphan Pod terminal evidence predates finalizer")
+
+        async with get_session() as session:
+            current_tombstone = await session.get(
+                KubernetesOrphanTombstone,
+                tombstone.tombstone_id,
+                with_for_update=True,
+            )
+            current = await session.get(
+                KubernetesOrphanTombstoneResource,
+                resource.resource_id,
+                with_for_update=True,
+            )
+            if (
+                current_tombstone is None
+                or current_tombstone.retry_lease_owner != self.worker_id
+                or current_tombstone.phase != "verifying"
+                or current is None
+                or current.tombstone_id != tombstone.tombstone_id
+                or current.uid != resource.uid
+                or current.state == "absent"
+            ):
+                raise DeploymentFailure("orphan changed before Pod terminal evidence")
+            if not current.pod_teardown_finalizer_attached_at:
+                raise LineageConflict("orphan Pod evidence has no durable finalizer")
+            if current.pod_termination_evidence is not None and (
+                current.pod_termination_evidence != evidence
+                or current.pod_termination_evidence_sha256 != digest
+            ):
+                raise LineageConflict("orphan Pod terminal evidence changed")
+            current.pod_termination_evidence = evidence
+            current.pod_termination_evidence_sha256 = digest
+            current.pod_teardown_finalizer_removal_requested_at = (
+                current.pod_teardown_finalizer_removal_requested_at or utc_now()
+            )
+            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(
+                seconds=LEASE_SECONDS
+            )
+            await session.commit()
+
+        outcome = await asyncio.to_thread(
+            self.kubernetes.remove_pod_teardown_finalizer,
+            cluster_context=tombstone.cluster_context,
+            namespace=tombstone.namespace,
+            name=resource.name,
+            uid=resource.uid,
+            node_name=resource.node_name,
+        )
+        async with get_session() as session:
+            current_tombstone = await session.get(
+                KubernetesOrphanTombstone,
+                tombstone.tombstone_id,
+                with_for_update=True,
+            )
+            current = await session.get(
+                KubernetesOrphanTombstoneResource,
+                resource.resource_id,
+                with_for_update=True,
+            )
+            if (
+                current_tombstone is None
+                or current_tombstone.retry_lease_owner != self.worker_id
+                or current_tombstone.phase != "verifying"
+                or current is None
+                or current.tombstone_id != tombstone.tombstone_id
+                or current.uid != resource.uid
+                or current.pod_termination_evidence != evidence
+                or current.pod_termination_evidence_sha256 != digest
+            ):
+                raise DeploymentFailure("orphan changed during Pod finalizer removal")
+            if outcome == "uid_changed":
+                raise LineageConflict(
+                    "same-name orphan Pod replaced during finalizer removal"
+                )
+            if outcome == "retryable":
+                raise DeploymentFailure(
+                    "orphan Pod finalizer removal raced a Kubernetes update"
+                )
+            current.pod_teardown_finalizer_removed_at = (
+                current.pod_teardown_finalizer_removed_at or utc_now()
+            )
+            resource.pod_termination_evidence = evidence
+            resource.pod_termination_evidence_sha256 = digest
+            resource.pod_teardown_finalizer_removal_requested_at = (
+                current.pod_teardown_finalizer_removal_requested_at
+            )
+            resource.pod_teardown_finalizer_removed_at = (
+                current.pod_teardown_finalizer_removed_at
+            )
+            if outcome == "absent":
+                current.state = "absent"
+                current.absent_at = current.absent_at or utc_now()
+                resource.state = "absent"
+            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(
+                seconds=LEASE_SECONDS
+            )
+            await session.commit()
+        return outcome
+
     async def _adopt_orphan_replacement(
         self,
         tombstone_id: str,
@@ -2583,6 +3344,12 @@ class DeploymentTeardownCoordinator:
                 )
                 if predecessor is None or predecessor.tombstone_id != tombstone_id:
                     raise DeploymentFailure("orphan replacement predecessor changed")
+                if getattr(
+                    predecessor, "kind", None
+                ) == "Pod" and not _pod_absence_proven(predecessor):
+                    raise LineageConflict(
+                        "same-name orphan Pod replaced before exact termination closure"
+                    )
                 predecessor.state = "absent"
                 predecessor.absent_at = utc_now()
             tombstone.phase = "deleting"
@@ -2679,7 +3446,20 @@ class DeploymentTeardownCoordinator:
                         tombstone_id,
                         with_for_update=True,
                     )
+                    known = {
+                        (item.kind, item.uid)
+                        for item in (
+                            await session.execute(
+                                select(KubernetesOrphanTombstoneResource).where(
+                                    KubernetesOrphanTombstoneResource.tombstone_id
+                                    == tombstone_id
+                                )
+                            )
+                        ).scalars()
+                    }
                     for resource in resources:
+                        if (resource.kind, resource.uid) in known:
+                            continue
                         session.add(
                             KubernetesOrphanTombstoneResource(
                                 resource_id=str(uuid.uuid4()),
@@ -2697,6 +3477,21 @@ class DeploymentTeardownCoordinator:
                                 labels_sha256=resource.labels_sha256,
                             )
                         )
+                    await session.commit()
+                await self._ensure_orphan_pod_finalizers(tombstone_id, "recorded")
+                async with get_session() as session:
+                    current = await session.get(
+                        KubernetesOrphanTombstone,
+                        tombstone_id,
+                        with_for_update=True,
+                    )
+                    if (
+                        current.retry_lease_owner != self.worker_id
+                        or current.phase != "recorded"
+                    ):
+                        raise DeploymentFailure(
+                            "orphan changed after Pod finalizer attachment"
+                        )
                     current.phase = "deleting"
                     await session.commit()
                 return await self._run_orphan_claimed(tombstone_id)
@@ -2705,15 +3500,15 @@ class DeploymentTeardownCoordinator:
                 resources = list(
                     (
                         await session.execute(
-                            select(KubernetesOrphanTombstoneResource)
-                            .where(
-                                KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id,
-                                KubernetesOrphanTombstoneResource.state != "absent",
+                            select(KubernetesOrphanTombstoneResource).where(
+                                KubernetesOrphanTombstoneResource.tombstone_id
+                                == tombstone_id,
                             )
                         )
                     ).scalars()
                 )
             if tombstone.phase == "deleting":
+                await self._ensure_orphan_pod_finalizers(tombstone_id, "deleting")
                 for resource in sorted(
                     (
                         resource
@@ -2738,7 +3533,9 @@ class DeploymentTeardownCoordinator:
                             resource.resource_id,
                             with_for_update=True,
                         )
-                        if outcome == "absent":
+                        if outcome == "absent" and (
+                            current.kind != "Pod" or _pod_absence_proven(current)
+                        ):
                             current.state = "absent"
                             current.absent_at = utc_now()
                             resource.state = "absent"
@@ -2766,6 +3563,12 @@ class DeploymentTeardownCoordinator:
                 resources,
                 key=lambda item: (VERIFY_ORDER[item.kind], item.name, item.uid),
             ):
+                if resource.state == "absent":
+                    if resource.kind == "Pod" and not _pod_absence_proven(resource):
+                        raise LineageConflict(
+                            "terminal orphan Pod row lacks exact termination closure"
+                        )
+                    continue
                 live = await asyncio.to_thread(
                     self.kubernetes.read_resource,
                     cluster_context=tombstone.cluster_context,
@@ -2775,6 +3578,16 @@ class DeploymentTeardownCoordinator:
                 )
                 await self._renew_orphan_lease(tombstone_id, "verifying")
                 if live is None:
+                    if resource.kind == "Pod":
+                        if (
+                            resource.pod_termination_evidence is not None
+                            and resource.pod_teardown_finalizer_removal_requested_at
+                        ):
+                            await self._close_orphan_pod(tombstone, resource, None)
+                            continue
+                        raise LineageConflict(
+                            f"orphan Pod {resource.uid} is absent without terminal evidence"
+                        )
                     async with get_session() as session:
                         current = await session.get(
                             KubernetesOrphanTombstoneResource,
@@ -2787,6 +3600,16 @@ class DeploymentTeardownCoordinator:
                     resource.state = "absent"
                     continue
                 if live.uid == resource.uid:
+                    if resource.kind == "Pod":
+                        outcome = await self._close_orphan_pod(
+                            tombstone,
+                            resource,
+                            live,
+                        )
+                        if outcome is not None:
+                            if resource.state != "absent":
+                                absence_pending = True
+                            continue
                     if resource.state == "observed" and _resource_delete_ready(
                         resource, resources
                     ):
@@ -2794,6 +3617,10 @@ class DeploymentTeardownCoordinator:
                     else:
                         absence_pending = True
                     continue
+                if resource.kind == "Pod" and not _pod_absence_proven(resource):
+                    raise LineageConflict(
+                        "same-name orphan Pod appeared before predecessor termination closure"
+                    )
                 replacement_matches(
                     expected_labels=tombstone.immutable_labels,
                     expected_node_name=tombstone.cluster_context,
@@ -2861,6 +3688,26 @@ class DeploymentTeardownCoordinator:
                 )
                 if current.retry_lease_owner != self.worker_id:
                     raise DeploymentFailure("orphan lease changed before completion")
+                all_resources = list(
+                    (
+                        await session.execute(
+                            select(KubernetesOrphanTombstoneResource)
+                            .where(
+                                KubernetesOrphanTombstoneResource.tombstone_id
+                                == tombstone_id
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                if any(
+                    resource.state != "absent"
+                    or (resource.kind == "Pod" and not _pod_absence_proven(resource))
+                    for resource in all_resources
+                ):
+                    raise DeploymentFailure(
+                        "orphan completion lacks exact Kubernetes UID closure"
+                    )
                 current.phase = "completed"
                 current.completed_at = utc_now()
                 current.retry_lease_owner = None

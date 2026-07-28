@@ -233,8 +233,19 @@ class DeploymentTeardownK8sResource(Base):
     node_name = Column(String, nullable=True)
     labels = Column(JSONB, nullable=False)
     labels_sha256 = Column(String, nullable=False)
-    state = Column(String, nullable=False, default="observed", server_default="observed")
-    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    pod_termination_evidence = Column(JSONB, nullable=True)
+    pod_termination_evidence_sha256 = Column(String, nullable=True)
+    pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
+    pod_teardown_finalizer_removal_requested_at = Column(
+        DateTime(timezone=True), nullable=True
+    )
+    pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
+    state = Column(
+        String, nullable=False, default="observed", server_default="observed"
+    )
+    observed_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     delete_requested_at = Column(DateTime(timezone=True), nullable=True)
     absent_at = Column(DateTime(timezone=True), nullable=True)
     replaced_by_resource_id = Column(
@@ -253,6 +264,29 @@ class DeploymentTeardownK8sResource(Base):
         CheckConstraint(
             "state IN ('observed', 'delete_requested', 'absent', 'replaced')",
             name="ck_deployment_teardown_resource_state",
+        ),
+        CheckConstraint(
+            "((pod_termination_evidence IS NULL) = "
+            "(pod_termination_evidence_sha256 IS NULL)) AND "
+            "((pod_termination_evidence IS NULL) = "
+            "(pod_teardown_finalizer_removal_requested_at IS NULL)) AND "
+            "(kind = 'Pod' OR pod_termination_evidence IS NULL) AND "
+            "(kind = 'Pod' OR (pod_teardown_finalizer_attached_at IS NULL AND "
+            "pod_teardown_finalizer_removal_requested_at IS NULL AND "
+            "pod_teardown_finalizer_removed_at IS NULL)) AND "
+            "(pod_teardown_finalizer_removal_requested_at IS NULL OR "
+            "pod_teardown_finalizer_attached_at IS NOT NULL) AND "
+            "(pod_teardown_finalizer_removed_at IS NULL OR "
+            "pod_teardown_finalizer_removal_requested_at IS NOT NULL) AND "
+            "(kind <> 'Pod' OR state NOT IN ('absent', 'replaced') OR "
+            "(pod_termination_evidence IS NOT NULL AND "
+            "pod_teardown_finalizer_removed_at IS NOT NULL))",
+            name="ck_deployment_teardown_resource_pod_termination",
+        ),
+        CheckConstraint(
+            "pod_termination_evidence_sha256 IS NULL OR "
+            "pod_termination_evidence_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_deployment_teardown_resource_pod_termination_sha256",
         ),
         CheckConstraint(
             "(owner_api_version IS NULL AND owner_kind IS NULL "
@@ -662,8 +696,19 @@ class KubernetesOrphanTombstoneResource(Base):
     node_name = Column(String, nullable=True)
     labels = Column(JSONB, nullable=False)
     labels_sha256 = Column(String, nullable=False)
-    state = Column(String, nullable=False, default="observed", server_default="observed")
-    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    pod_termination_evidence = Column(JSONB, nullable=True)
+    pod_termination_evidence_sha256 = Column(String, nullable=True)
+    pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
+    pod_teardown_finalizer_removal_requested_at = Column(
+        DateTime(timezone=True), nullable=True
+    )
+    pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
+    state = Column(
+        String, nullable=False, default="observed", server_default="observed"
+    )
+    observed_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     absent_at = Column(DateTime(timezone=True), nullable=True)
 
     tombstone = relationship("KubernetesOrphanTombstone", back_populates="resources")
@@ -676,6 +721,29 @@ class KubernetesOrphanTombstoneResource(Base):
         CheckConstraint(
             "state IN ('observed', 'delete_requested', 'absent')",
             name="ck_kubernetes_orphan_resource_state",
+        ),
+        CheckConstraint(
+            "((pod_termination_evidence IS NULL) = "
+            "(pod_termination_evidence_sha256 IS NULL)) AND "
+            "((pod_termination_evidence IS NULL) = "
+            "(pod_teardown_finalizer_removal_requested_at IS NULL)) AND "
+            "(kind = 'Pod' OR pod_termination_evidence IS NULL) AND "
+            "(kind = 'Pod' OR (pod_teardown_finalizer_attached_at IS NULL AND "
+            "pod_teardown_finalizer_removal_requested_at IS NULL AND "
+            "pod_teardown_finalizer_removed_at IS NULL)) AND "
+            "(pod_teardown_finalizer_removal_requested_at IS NULL OR "
+            "pod_teardown_finalizer_attached_at IS NOT NULL) AND "
+            "(pod_teardown_finalizer_removed_at IS NULL OR "
+            "pod_teardown_finalizer_removal_requested_at IS NOT NULL) AND "
+            "(kind <> 'Pod' OR state <> 'absent' OR "
+            "(pod_termination_evidence IS NOT NULL AND "
+            "pod_teardown_finalizer_removed_at IS NOT NULL))",
+            name="ck_kubernetes_orphan_resource_pod_termination",
+        ),
+        CheckConstraint(
+            "pod_termination_evidence_sha256 IS NULL OR "
+            "pod_termination_evidence_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_kubernetes_orphan_resource_pod_termination_sha256",
         ),
         CheckConstraint(
             "(owner_api_version IS NULL AND owner_kind IS NULL "

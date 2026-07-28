@@ -8,7 +8,7 @@ import pytest
 from kubernetes.client import ApiClient, V1Service, V1ServicePort, V1ServiceSpec
 
 from chutes_miner.api.exceptions import DeploymentFailure
-from chutes_miner.api.k8s.util import build_chute_job
+from chutes_miner.api.k8s.util import POD_TEARDOWN_FINALIZER, build_chute_job
 from cross_repo_tests import repository_root
 
 
@@ -235,6 +235,7 @@ def test_seedless_job_uses_exact_registry_root_digest(monkeypatch):
         registry_manifest_digest=root,
     )
     assert job.spec.template.spec.containers[0].image.endswith(f"/owner/image@{root}")
+    assert job.spec.template.metadata.finalizers == [POD_TEARDOWN_FINALIZER]
 
 
 def test_build_nontee_gpu_injects_launch_bound_model_access_without_host_claim():
