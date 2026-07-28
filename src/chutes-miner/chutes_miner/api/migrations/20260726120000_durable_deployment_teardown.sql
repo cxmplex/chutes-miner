@@ -560,6 +560,8 @@ DROP TABLE IF EXISTS kubernetes_orphan_tombstones;
 DROP TABLE IF EXISTS parent_deletion_children;
 DROP TABLE IF EXISTS parent_deletion_operations;
 DROP TABLE IF EXISTS delayed_validator_instance_cleanups;
+ALTER TABLE deployment_teardown_operations
+    DROP CONSTRAINT IF EXISTS deployment_teardown_operations_launch_operation_id_fkey;
 DROP TABLE IF EXISTS deployment_launch_operations;
 DROP TABLE IF EXISTS deployment_teardown_k8s_resources;
 DROP TABLE IF EXISTS deployment_teardown_node_incarnation_handoffs;

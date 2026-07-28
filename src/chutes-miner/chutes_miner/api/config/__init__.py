@@ -10,6 +10,7 @@ from typing import Any
 from kubernetes import client
 from kubernetes.config import load_kube_config, load_incluster_config
 from chutes_common.settings import MinerSettings as CommonSettings
+from pydantic import Field
 
 
 def create_kubernetes_client(cls: Any = client.CoreV1Api):
@@ -84,7 +85,10 @@ class Settings(CommonSettings):
     cache_max_size_gb: int = int(os.getenv("CACHE_MAX_SIZE_GB", "500"))
     cache_overrides: dict = json.loads(os.getenv("CACHE_OVERRIDES", "{}")) or {}
 
-    chute_shutdown_time_seconds: int = int(os.getenv("CHUTE_SHUTDOWN_TIME_SECONDS", "180"))
+    chute_shutdown_time_seconds: int = Field(
+        default=int(os.getenv("CHUTE_SHUTDOWN_TIME_SECONDS", "180")),
+        gt=0,
+    )
     deploy_cache_wait_timeout: int = int(os.getenv("DEPLOY_CACHE_WAIT_TIMEOUT", "60"))
 
     migrations_dir: str = os.getenv("MIGRATIONS_DIR", "chutes-miner/chutes_miner/api/migrations")

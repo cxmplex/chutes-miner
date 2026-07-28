@@ -56,6 +56,17 @@ class DeploymentTeardownOperation(Base):
     gpu_allocation_group_generation = Column(Integer, nullable=True)
     gpu_hardware_uuids = Column(JSONB, nullable=False)
     immutable_labels = Column(JSONB, nullable=False)
+    launch_operation_id = Column(
+        String,
+        ForeignKey("deployment_launch_operations.operation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    launch_phase_at_request = Column(String, nullable=True)
+    launch_kubernetes_mutation_possible = Column(Boolean, nullable=True)
+    launch_create_results_sha256 = Column(String(64), nullable=True)
+    resource_discovery = Column(JSONB, nullable=True)
+    resource_discovery_sha256 = Column(String(64), nullable=True)
+    resource_discovered_at = Column(DateTime(timezone=True), nullable=True)
 
     registry_revocation_ack = Column(JSONB, nullable=True)
     registry_revoked_at = Column(DateTime(timezone=True), nullable=True)
@@ -145,6 +156,27 @@ class DeploymentTeardownOperation(Base):
         CheckConstraint(
             "(pull_secret_deletion_ack IS NULL) = (pull_secret_deleted_at IS NULL)",
             name="ck_deployment_teardown_secret_ack",
+        ),
+        CheckConstraint(
+            "(resource_discovery IS NULL AND resource_discovery_sha256 IS NULL "
+            "AND resource_discovered_at IS NULL) OR "
+            "(resource_discovery IS NOT NULL "
+            "AND resource_discovery_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND resource_discovered_at IS NOT NULL)",
+            name="ck_deployment_teardown_resource_discovery",
+        ),
+        CheckConstraint(
+            "(launch_operation_id IS NULL "
+            "AND launch_phase_at_request IS NULL "
+            "AND launch_kubernetes_mutation_possible IS NULL "
+            "AND launch_create_results_sha256 IS NULL) OR "
+            "(launch_operation_id IS NOT NULL "
+            "AND launch_phase_at_request IN "
+            "('reserved', 'creating', 'created', 'failed') "
+            "AND launch_kubernetes_mutation_possible = "
+            "(launch_phase_at_request <> 'reserved') "
+            "AND launch_create_results_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_deployment_teardown_launch_snapshot",
         ),
     )
 

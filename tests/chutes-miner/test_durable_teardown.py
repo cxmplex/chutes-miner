@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from chutes_common.exceptions import AgentError
+from chutes_miner.api.config import Settings
 from chutes_miner.api.deployment import teardown
 from chutes_miner.api.deployment.teardown import (
     DirectKubernetesClosure,
@@ -23,6 +24,7 @@ from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.gepetto import Gepetto
 from kubernetes.client import V1ObjectMeta, V1Service, V1ServiceSpec
 from kubernetes.client.rest import ApiException
+from pydantic import ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -391,6 +393,7 @@ async def test_replacement_adoption_commits_successor_predecessor_and_phase_atom
         retry_lease_expires_at=None,
         phase="verifying",
         cluster_context="node-a",
+        namespace="chutes",
         last_failure="old",
     )
     predecessor = SimpleNamespace(
@@ -797,6 +800,59 @@ def test_direct_delete_uses_kubernetes_uid_precondition(monkeypatch):
     assert calls[0]["body"].preconditions.uid == "uid-a"
     assert calls[0]["body"].propagation_policy == "Foreground"
     assert calls[0]["body"].grace_period_seconds > 0
+
+
+def test_zero_shutdown_grace_is_rejected_at_config_and_delete_boundaries(monkeypatch):
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(chute_shutdown_time_seconds=0)
+
+    calls = []
+
+    class Core:
+        def delete_namespaced_pod(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(teardown, "k8s_app_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(teardown, "k8s_batch_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(teardown, "k8s_core_client", Core)
+    monkeypatch.setattr(teardown.settings, "chute_shutdown_time_seconds", 0)
+    closure = DirectKubernetesClosure(operator=SimpleNamespace())
+
+    with pytest.raises(DeploymentFailure, match="must be a positive integer"):
+        closure.delete_resource(
+            cluster_context="node-a",
+            namespace="chutes",
+            kind="Pod",
+            name="pod-a",
+            uid="uid-a",
+        )
+    assert calls == []
+
+
+def test_gpu_pod_evidence_requirement_uses_exact_launch_mutation_frontier():
+    operation = SimpleNamespace(
+        gpu_hardware_uuids=["GPU-a"],
+        launch_operation_id="launch-1",
+        launch_phase_at_request="reserved",
+        launch_kubernetes_mutation_possible=False,
+        launch_create_results_sha256=teardown.canonical_sha256({}),
+    )
+    assert not teardown._requires_pod_termination_evidence(operation)
+
+    operation.launch_phase_at_request = "creating"
+    operation.launch_kubernetes_mutation_possible = True
+    assert teardown._requires_pod_termination_evidence(operation)
+
+    operation.launch_phase_at_request = "reserved"
+    operation.launch_kubernetes_mutation_possible = False
+    operation.launch_create_results_sha256 = "0" * 64
+    assert teardown._requires_pod_termination_evidence(operation)
+
+    operation.launch_operation_id = None
+    assert teardown._requires_pod_termination_evidence(operation)
+
+    operation.gpu_hardware_uuids = []
+    assert not teardown._requires_pod_termination_evidence(operation)
 
 
 def test_uid_precondition_conflict_advances_to_direct_replacement_verification(monkeypatch):

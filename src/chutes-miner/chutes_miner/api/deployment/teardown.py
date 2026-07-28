@@ -56,6 +56,7 @@ from sqlalchemy.orm import selectinload
 LEASE_SECONDS = 300
 EXTERNAL_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 POD_TERMINATION_EVIDENCE_SCHEMA = "chutes.miner-pod-termination.v1"
+RESOURCE_DISCOVERY_SCHEMA = "chutes.miner-k8s-resource-discovery.v1"
 DELETE_ORDER = {
     "Job": 0,
     "Deployment": 0,
@@ -101,6 +102,16 @@ def canonical_sha256(document: Any) -> str:
             sort_keys=True,
         ).encode("ascii")
     ).hexdigest()
+
+
+def _teardown_grace_period_seconds() -> int:
+    """Fail closed rather than turning a bad setting into force deletion."""
+    value = settings.chute_shutdown_time_seconds
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise DeploymentFailure(
+            "CHUTE_SHUTDOWN_TIME_SECONDS must be a positive integer for teardown"
+        )
+    return value
 
 
 def _timestamp_text(value: Any) -> str | None:
@@ -307,6 +318,74 @@ def _pod_absence_proven(resource: Any) -> bool:
         and getattr(resource, "pod_teardown_finalizer_removal_requested_at", None)
         and getattr(resource, "pod_teardown_finalizer_removed_at", None)
     )
+
+
+def _launch_definitively_pre_kubernetes_mutation(operation: Any) -> bool:
+    """Return true only for the durable launch phase before any API mutation."""
+    return bool(getattr(operation, "launch_operation_id", None)) and (
+        getattr(operation, "launch_phase_at_request", None) == "reserved"
+        and getattr(operation, "launch_kubernetes_mutation_possible", None) is False
+        and getattr(operation, "launch_create_results_sha256", None)
+        == canonical_sha256({})
+    )
+
+
+def _requires_pod_termination_evidence(operation: Any) -> bool:
+    """GPU ownership requires an exact Pod closure unless launch never started."""
+    hardware_uuids = getattr(operation, "gpu_hardware_uuids", None)
+    return bool(hardware_uuids) and not _launch_definitively_pre_kubernetes_mutation(
+        operation
+    )
+
+
+def _resource_discovery_document(
+    operation: DeploymentTeardownOperation,
+    resources: Iterable[DeploymentTeardownK8sResource],
+) -> dict[str, Any]:
+    identities = [
+        {
+            "api_version": resource.api_version,
+            "kind": resource.kind,
+            "name": resource.name,
+            "namespace": resource.namespace,
+            "uid": resource.uid,
+            "owner_api_version": resource.owner_api_version,
+            "owner_kind": resource.owner_kind,
+            "owner_name": resource.owner_name,
+            "owner_uid": resource.owner_uid,
+            "node_name": resource.node_name,
+            "labels_sha256": resource.labels_sha256,
+        }
+        for resource in resources
+    ]
+    identities.sort(
+        key=lambda item: (
+            item["api_version"],
+            item["kind"],
+            item["namespace"],
+            item["name"],
+            item["uid"],
+        )
+    )
+    return {
+        "schema": RESOURCE_DISCOVERY_SCHEMA,
+        "operation_id": operation.operation_id,
+        "deployment_id": operation.deployment_id,
+        "cluster_context": operation.cluster_context,
+        "cluster_context_sha256": operation.cluster_context_sha256,
+        "namespace": operation.namespace,
+        "config_id": operation.config_id,
+        "immutable_labels_sha256": canonical_sha256(operation.immutable_labels),
+        "launch_operation_id": getattr(operation, "launch_operation_id", None),
+        "launch_phase_at_request": getattr(operation, "launch_phase_at_request", None),
+        "launch_kubernetes_mutation_possible": (
+            getattr(operation, "launch_kubernetes_mutation_possible", None)
+        ),
+        "launch_create_results_sha256": getattr(
+            operation, "launch_create_results_sha256", None
+        ),
+        "resources": identities,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -887,7 +966,7 @@ class DirectKubernetesClosure:
             preconditions=V1Preconditions(uid=uid),
             propagation_policy="Foreground",
             grace_period_seconds=(
-                settings.chute_shutdown_time_seconds
+                _teardown_grace_period_seconds()
                 if kind in CONTROLLER_KINDS or kind == "Pod"
                 else 0
             ),
@@ -954,6 +1033,9 @@ class DeploymentTeardownCoordinator:
     ) -> DeploymentTeardownOperation:
         launch = None
         launch_intent = None
+        launch_phase_at_request = None
+        launch_kubernetes_mutation_possible = None
+        launch_create_results_sha256 = None
         if deployment.launch_operation_id:
             launch = await session.get(
                 DeploymentLaunchOperation,
@@ -973,6 +1055,9 @@ class DeploymentTeardownCoordinator:
                 raise DeploymentFailure(
                     "durable miner launch lacks its original Kubernetes context closure"
                 )
+            launch_phase_at_request = launch.phase
+            launch_kubernetes_mutation_possible = launch.phase != "reserved"
+            launch_create_results_sha256 = canonical_sha256(launch.create_results or {})
             was_creating = launch.phase == "creating"
             launch.phase = "teardown_fenced"
             if not was_creating:
@@ -1119,6 +1204,10 @@ class DeploymentTeardownCoordinator:
                 str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
             ),
             immutable_labels=self._operation_labels(deployment),
+            launch_operation_id=launch.operation_id if launch else None,
+            launch_phase_at_request=launch_phase_at_request,
+            launch_kubernetes_mutation_possible=launch_kubernetes_mutation_possible,
+            launch_create_results_sha256=launch_create_results_sha256,
         )
         session.add(operation)
         await session.flush()
@@ -1413,7 +1502,10 @@ class DeploymentTeardownCoordinator:
                     .with_for_update()
                 )
             ).scalar_one()
-            if operation.retry_lease_owner != self.worker_id:
+            if (
+                operation.retry_lease_owner != self.worker_id
+                or operation.phase != "discovering"
+            ):
                 raise DeploymentFailure("teardown lease changed during discovery")
             known = {
                 (resource.kind, resource.uid)
@@ -1426,6 +1518,10 @@ class DeploymentTeardownCoordinator:
                 ).scalars()
             }
             for resource in resources:
+                if resource.namespace != operation.namespace:
+                    raise LineageConflict(
+                        "Kubernetes resource namespace changed during discovery"
+                    )
                 if (resource.kind, resource.uid) in known:
                     continue
                 session.add(
@@ -1447,6 +1543,29 @@ class DeploymentTeardownCoordinator:
                         labels_sha256=resource.labels_sha256,
                     )
                 )
+            await session.flush()
+            captured = list(
+                (
+                    await session.execute(
+                        select(DeploymentTeardownK8sResource).where(
+                            DeploymentTeardownK8sResource.operation_id == operation_id
+                        )
+                    )
+                ).scalars()
+            )
+            discovery = _resource_discovery_document(operation, captured)
+            discovery_sha256 = canonical_sha256(discovery)
+            if operation.resource_discovery is None:
+                operation.resource_discovery = discovery
+                operation.resource_discovery_sha256 = discovery_sha256
+                operation.resource_discovered_at = utc_now()
+            elif (
+                not isinstance(operation.resource_discovery, dict)
+                or operation.resource_discovery_sha256
+                != canonical_sha256(operation.resource_discovery)
+                or operation.resource_discovered_at is None
+            ):
+                raise LineageConflict("durable resource discovery witness changed")
             operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
 
@@ -1656,6 +1775,10 @@ class DeploymentTeardownCoordinator:
                 or operation.phase != "verifying"
             ):
                 raise DeploymentFailure("teardown changed during replacement adoption")
+            if live.namespace != operation.namespace:
+                raise LineageConflict(
+                    "replacement Kubernetes resource changed namespace"
+                )
             successor = (
                 await session.execute(
                     select(DeploymentTeardownK8sResource)
@@ -2267,6 +2390,16 @@ class DeploymentTeardownCoordinator:
             )
             return False
 
+        if _requires_pod_termination_evidence(operation) and not any(
+            resource.kind == "Pod" and _pod_absence_proven(resource)
+            for resource in operation.resources
+        ):
+            await self._pause_for_retry(
+                operation.operation_id,
+                "GPU-owned workload lacks exact Pod termination evidence",
+            )
+            return False
+
         for resource in operation.resources:
             if resource.kind == "Pod" and not _pod_absence_proven(resource):
                 await self._record_conflict(
@@ -2345,11 +2478,20 @@ class DeploymentTeardownCoordinator:
             )
             if any(
                 resource.state not in {"absent", "replaced"}
+                or resource.cluster_context != current.cluster_context
+                or resource.namespace != current.namespace
                 or (resource.kind == "Pod" and not _pod_absence_proven(resource))
                 for resource in resources
             ):
                 raise DeploymentFailure(
                     "teardown finalization lacks exact Kubernetes UID closure"
+                )
+            if _requires_pod_termination_evidence(current) and not any(
+                resource.kind == "Pod" and _pod_absence_proven(resource)
+                for resource in resources
+            ):
+                raise DeploymentFailure(
+                    "GPU-owned teardown lacks exact Pod termination evidence"
                 )
             latest_handoff = (
                 await session.execute(

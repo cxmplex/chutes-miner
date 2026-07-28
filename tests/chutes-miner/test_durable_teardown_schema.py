@@ -54,7 +54,15 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "registration_attestation_id",
         "gpu_allocation_group_id",
         "gpu_allocation_group_generation",
+        "launch_operation_id",
+        "launch_phase_at_request",
+        "launch_kubernetes_mutation_possible",
+        "launch_create_results_sha256",
+        "resource_discovery",
+        "resource_discovery_sha256",
+        "resource_discovered_at",
     }.issubset(operation.c.keys())
+    assert _ondelete("deployment_teardown_operations", "launch_operation_id") == "RESTRICT"
     assert "parent_deletion_children" in Base.metadata.tables
     resource = Base.metadata.tables["deployment_teardown_k8s_resources"]
     assert {
@@ -211,3 +219,8 @@ def test_followup_migration_has_specific_locked_down_guard():
     assert "miner_launch_intent_active_lineage_key" in sql
     assert "launch intent history exists" in sql
     assert "validator job release history exists" in sql
+    assert "deployment_teardown_closure_complete" in sql
+    assert "deployment_teardown_resource_chain_closed" in sql
+    assert "canonical_miner_teardown_jsonb" in sql
+    assert "resource_discovery_sha256" in sql
+    assert "launch_kubernetes_mutation_possible" in sql
