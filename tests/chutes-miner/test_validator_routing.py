@@ -770,6 +770,12 @@ class _ClaimSession:
         self.intent = SimpleNamespace(
             intent_id="launch-intent-1",
             phase="registry_acked",
+            validator=chute.validator,
+            chute_id=chute.chute_id,
+            chute_version=chute.version,
+            server_id=server.server_id,
+            job_id=job_id,
+            job_cleanup_only=False,
             request_payload=request,
             request_sha256=canonical_miner_launch_sha256(request),
             lineage_sha256=canonical_miner_launch_sha256(lineage),

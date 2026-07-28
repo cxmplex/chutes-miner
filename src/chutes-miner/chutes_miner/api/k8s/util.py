@@ -73,10 +73,16 @@ def validated_miner_launch_lineage(
     """Return one byte-canonical, exact-schema durable launch lineage."""
     request = getattr(intent, "request_payload", None)
     lineage = request.get("lineage") if isinstance(request, dict) else None
+    job_cleanup_only = bool(getattr(intent, "job_cleanup_only", False))
+    expected_request_schema = (
+        "chutes.miner-job-release.v1"
+        if job_cleanup_only
+        else "chutes.miner-launch-request.v1"
+    )
     if (
         not isinstance(request, dict)
         or set(request) != MINER_LAUNCH_REQUEST_FIELDS
-        or request.get("schema") != "chutes.miner-launch-request.v1"
+        or request.get("schema") != expected_request_schema
         or request.get("miner_launch_request_id") != getattr(intent, "intent_id", None)
         or not isinstance(lineage, dict)
         or set(lineage) != MINER_LAUNCH_LINEAGE_FIELDS
@@ -96,7 +102,15 @@ def validated_miner_launch_lineage(
         "server_id": server_id,
         "job_id": job_id,
     }
-    if any(lineage.get(key) != value for key, value in expected.items()):
+    if (
+        any(lineage.get(key) != value for key, value in expected.items())
+        or getattr(intent, "validator", None) != validator
+        or getattr(intent, "chute_id", None) != chute_id
+        or getattr(intent, "chute_version", None) != chute_version
+        or getattr(intent, "server_id", None) != server_id
+        or getattr(intent, "job_id", None) != job_id
+        or (job_cleanup_only and not job_id)
+    ):
         raise DeploymentFailure("durable miner launch lineage changed")
     if require_gpu_lineage:
         if any(

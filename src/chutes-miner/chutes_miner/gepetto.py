@@ -33,6 +33,7 @@ from chutes_miner.api.k8s.util import (
     canonical_miner_launch_sha256,
     require_supported_chutes_version,
     resolve_deployment_validator,
+    validated_miner_launch_lineage,
 )
 from chutes_miner.api.redis_pubsub import RedisListener
 from chutes_miner.api.schema_barrier import (
@@ -483,6 +484,21 @@ class Gepetto:
             "job_id": job_id,
         }
 
+    @staticmethod
+    def _validated_launch_intent(intent: MinerLaunchIntent | None) -> dict[str, Any]:
+        if intent is None:
+            raise DeploymentFailure("durable miner launch intent disappeared")
+        return validated_miner_launch_lineage(
+            intent,
+            miner_hotkey=settings.miner_ss58,
+            validator=intent.validator,
+            chute_id=intent.chute_id,
+            chute_version=intent.chute_version,
+            server_id=intent.server_id,
+            job_id=intent.job_id,
+            require_gpu_lineage=settings.gpu_tee_only,
+        )
+
     async def _begin_launch_intent(
         self,
         chute: Chute,
@@ -511,7 +527,7 @@ class Gepetto:
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                if existing.request_payload.get("lineage") != lineage:
+                if self._validated_launch_intent(existing) != lineage:
                     raise DeploymentFailure("durable launch request lineage conflicts")
                 if existing.phase in {"consumed", "cleanup_required"}:
                     raise DeploymentFailure(
@@ -569,6 +585,8 @@ class Gepetto:
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                if self._validated_launch_intent(existing) != lineage:
+                    raise DeploymentFailure("durable job cleanup lineage conflicts")
                 return existing.intent_id
             intent_id = str(uuid.uuid4())
             request_payload = {
@@ -604,7 +622,10 @@ class Gepetto:
             "registry": payload.get("registry"),
         }
         async with get_session() as session:
-            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
+            intent = await session.get(
+                MinerLaunchIntent, intent_id, with_for_update=True
+            )
+            self._validated_launch_intent(intent)
             if intent is None or intent.phase not in {
                 "pending",
                 "response_persisted",
@@ -632,9 +653,17 @@ class Gepetto:
         ack: dict[str, Any],
     ) -> None:
         async with get_session() as session:
-            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
-            if intent is None or intent.phase not in {"response_persisted", "registry_acked"}:
-                raise DeploymentFailure("registry ACK arrived in an invalid launch phase")
+            intent = await session.get(
+                MinerLaunchIntent, intent_id, with_for_update=True
+            )
+            self._validated_launch_intent(intent)
+            if intent is None or intent.phase not in {
+                "response_persisted",
+                "registry_acked",
+            }:
+                raise DeploymentFailure(
+                    "registry ACK arrived in an invalid launch phase"
+                )
             if intent.registry_ack is not None and intent.registry_ack != ack:
                 raise DeploymentFailure("registry replay changed the launch ACK")
             intent.registry_ack = ack
@@ -644,7 +673,17 @@ class Gepetto:
 
     async def _record_launch_intent_failure(self, intent_id: str, exc: Exception) -> None:
         async with get_session() as session:
-            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
+            intent = await session.get(
+                MinerLaunchIntent, intent_id, with_for_update=True
+            )
+            try:
+                self._validated_launch_intent(intent)
+            except DeploymentFailure as validation_error:
+                logger.error(
+                    f"Refusing to mutate invalid durable launch intent {intent_id}: "
+                    f"{validation_error}"
+                )
+                return
             if intent is not None and intent.phase not in {"completed", "failed"}:
                 intent.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
                 await session.commit()
@@ -653,7 +692,11 @@ class Gepetto:
         """Replay and close one exact pre-deployment launch authority."""
         try:
             async with get_session() as session:
-                intent = await session.get(MinerLaunchIntent, intent_id)
+                intent = await session.get(
+                    MinerLaunchIntent,
+                    intent_id,
+                    with_for_update=True,
+                )
                 if intent is None or intent.phase not in {
                     "pending",
                     "response_persisted",
@@ -661,6 +704,7 @@ class Gepetto:
                     "cleanup_required",
                 }:
                     return False
+                self._validated_launch_intent(intent)
                 phase = intent.phase
                 chute_id = intent.chute_id
                 server_id = intent.server_id
@@ -702,6 +746,7 @@ class Gepetto:
                     intent_id,
                     with_for_update=True,
                 )
+                self._validated_launch_intent(current)
                 if current and current.phase in {
                     "response_persisted",
                     "registry_acked",
@@ -761,6 +806,7 @@ class Gepetto:
             )
             if intent is None or intent.phase in {"consumed", "completed", "failed"}:
                 return False
+            self._validated_launch_intent(intent)
             intent.phase = "cleanup_required"
             intent.last_failure = None
             await session.commit()
@@ -1960,23 +2006,21 @@ class Gepetto:
         )
         async with get_session() as session:
             servers = (await session.execute(query)).unique().scalars().all()
-            # Servers come back tightest-fit first. Rather than always returning the
-            # single most-utilized server (which black-holes scheduling onto one box if
-            # it has an issue the disk check misses), gather the top few best-fit servers
-            # that pass the disk check and pick one at random to spread load.
-            candidates = []
-            for server in servers:
-                try:
-                    Gepetto._require_validator_match(chute, server)
-                except DeploymentFailure as exc:
-                    logger.error(f"Skipping invalid scale-up candidate: {exc}")
-                    continue
-                if await k8s.check_node_has_disk_available(server.name, disk_gb):
-                    candidates.append(server)
-                    if len(candidates) >= SCALE_UP_CANDIDATE_POOL:
-                        break
-            if candidates:
-                return random.choice(candidates)
+        # Disk probes are external Kubernetes work and must not retain an ORM
+        # transaction while a node is slow or unreachable.
+        candidates = []
+        for server in servers:
+            try:
+                Gepetto._require_validator_match(chute, server)
+            except DeploymentFailure as exc:
+                logger.error(f"Skipping invalid scale-up candidate: {exc}")
+                continue
+            if await k8s.check_node_has_disk_available(server.name, disk_gb):
+                candidates.append(server)
+                if len(candidates) >= SCALE_UP_CANDIDATE_POOL:
+                    break
+        if candidates:
+            return random.choice(candidates)
         return None
 
     def _get_global_instance_count(self, validator: str, chute_id: str) -> int:
@@ -2565,6 +2609,44 @@ class Gepetto:
                             break
                 await session.commit()
 
+        # Snapshot the rows that need a direct runtime read, then close the
+        # database transaction before any Kubernetes call. A newly eligible row
+        # is conservatively picked up on the next reconciliation pass.
+        async with get_session() as session:
+            runtime_candidates = list(
+                (
+                    await session.execute(
+                        select(
+                            Deployment.deployment_id,
+                            Deployment.active,
+                            Deployment.verified_at,
+                            Deployment.created_at,
+                        )
+                    )
+                ).all()
+            )
+        runtime_observations: dict[str, tuple[str, Any]] = {}
+        runtime_now = datetime.now(timezone.utc)
+        for deployment_id, active, verified_at, created_at in runtime_candidates:
+            if active and not (
+                verified_at is None and runtime_now - created_at >= timedelta(minutes=5)
+            ):
+                continue
+            try:
+                runtime_observations[deployment_id] = (
+                    "present",
+                    await k8s.get_deployment(deployment_id),
+                )
+            except Exception as exc:
+                status = (
+                    "absent"
+                    if "Not Found" in str(exc) or "(404)" in str(exc)
+                    else "unknown"
+                )
+                runtime_observations[deployment_id] = (status, exc)
+
+        nodes = await k8s.get_kubernetes_nodes()
+
         async with get_session() as session:
             # Clean up based on deployments/instances.
             async for row in (await session.stream(select(Deployment))).unique():
@@ -2768,10 +2850,12 @@ class Gepetto:
                     or deployment.verified_at is None
                     and deployment_age >= timedelta(minutes=5)
                 ):
-                    try:
-                        kd = await k8s.get_deployment(deployment.deployment_id)
-                    except Exception as exc:
-                        if "Not Found" in str(exc) or "(404)" in str(exc):
+                    runtime_status, runtime_payload = runtime_observations.get(
+                        deployment.deployment_id,
+                        ("unknown", None),
+                    )
+                    if runtime_status != "present":
+                        if runtime_status == "absent":
                             tasks.append(
                                 self.undeploy(
                                     deployment.deployment_id,
@@ -2779,6 +2863,7 @@ class Gepetto:
                                 )
                             )
                         continue
+                    kd = runtime_payload
 
                     destroyed = False
                     job_status = kd.get("status", {})
@@ -2959,7 +3044,6 @@ class Gepetto:
                         )
 
             # Check Kubernetes nodes
-            nodes = await k8s.get_kubernetes_nodes()
             node_ids = {node["server_id"] for node in nodes}
             all_server_ids = set()
 

@@ -984,9 +984,21 @@ class DeploymentTeardownCoordinator:
                     launch.launch_intent_id,
                     with_for_update=True,
                 )
+                if launch_intent is not None:
+                    validated_miner_launch_lineage(
+                        launch_intent,
+                        miner_hotkey=settings.miner_ss58,
+                        validator=deployment.validator,
+                        chute_id=deployment.chute_id,
+                        chute_version=deployment.version,
+                        server_id=deployment.server_id,
+                        job_id=deployment.job_id,
+                        require_gpu_lineage=settings.gpu_tee_only,
+                    )
                 if (
                     launch_intent is None
                     or launch_intent.deployment_id != deployment.deployment_id
+                    or launch_intent.job_cleanup_only
                 ):
                     raise DeploymentFailure("deployment launch intent binding is invalid")
                 if launch_intent.phase != "completed":
@@ -2447,6 +2459,17 @@ class DeploymentTeardownCoordinator:
                         launch_intent_id,
                         with_for_update=True,
                     )
+                    if intent is not None:
+                        validated_miner_launch_lineage(
+                            intent,
+                            miner_hotkey=settings.miner_ss58,
+                            validator=intent.validator,
+                            chute_id=intent.chute_id,
+                            chute_version=intent.chute_version,
+                            server_id=intent.server_id,
+                            job_id=intent.job_id,
+                            require_gpu_lineage=settings.gpu_tee_only,
+                        )
                     if intent is not None and intent.phase == "cleanup_required":
                         intent.phase = "completed"
                         intent.completed_at = utc_now()

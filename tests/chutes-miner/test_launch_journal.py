@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 from contextlib import asynccontextmanager
 from copy import deepcopy
 import hashlib
+import inspect
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
@@ -69,6 +72,111 @@ class _QueryResult:
 
     def all(self):
         return self.value
+
+
+def _canonical_intent(
+    *,
+    intent_id: str = "intent-1",
+    phase: str,
+    validator: str = "validator-1",
+    chute_id: str = "chute-1",
+    chute_version: str = "1.0.0",
+    server_id: str = "server-1",
+    job_id: str | None = None,
+    job_cleanup_only: bool = False,
+    **values,
+) -> SimpleNamespace:
+    lineage = {
+        "schema": "chutes.miner-launch-lineage",
+        "version": 1,
+        "miner_hotkey": gepetto_module.settings.miner_ss58,
+        "validator": validator,
+        "chute_id": chute_id,
+        "chute_version": chute_version,
+        "server_id": server_id,
+        "kubernetes_node_uid": "node-uid-1",
+        "kubernetes_node_generation": 1,
+        "gpu_allocation_group_id": "group-1",
+        "gpu_allocation_group_generation": 1,
+        "job_id": job_id,
+    }
+    request = {
+        "schema": (
+            "chutes.miner-job-release.v1"
+            if job_cleanup_only
+            else "chutes.miner-launch-request.v1"
+        ),
+        "miner_launch_request_id": intent_id,
+        "lineage": lineage,
+    }
+    fields = {
+        "intent_id": intent_id,
+        "phase": phase,
+        "validator": validator,
+        "chute_id": chute_id,
+        "chute_version": chute_version,
+        "server_id": server_id,
+        "job_id": job_id,
+        "job_cleanup_only": job_cleanup_only,
+        "request_payload": request,
+        "request_sha256": canonical_miner_launch_sha256(request),
+        "lineage_sha256": canonical_miner_launch_sha256(lineage),
+        "response_payload": None,
+        "response_sha256": None,
+        "token_sha256": None,
+        "authorized_token_sha256s": [],
+        "registry_ack": None,
+        "job_release_ack": None,
+        "job_released_at": None,
+        "deployment_id": None,
+        "completed_at": None,
+        "last_failure": None,
+    }
+    fields.update(values)
+    return SimpleNamespace(**fields)
+
+
+def test_every_gepetto_launch_intent_cas_uses_canonical_validator():
+    for method in (
+        Gepetto._begin_launch_intent,
+        Gepetto._begin_job_cleanup_intent,
+        Gepetto._record_launch_response,
+        Gepetto._record_registry_ack,
+        Gepetto._record_launch_intent_failure,
+        Gepetto._resume_launch_intent,
+        Gepetto.abort_launch_intent,
+    ):
+        assert "_validated_launch_intent" in inspect.getsource(method)
+
+
+def test_gepetto_kubernetes_awaits_are_outside_database_session_scopes():
+    for method in (Gepetto.optimal_scale_up_server, Gepetto.reconcile):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        for context in (
+            node for node in ast.walk(tree) if isinstance(node, ast.AsyncWith)
+        ):
+            opens_database_session = any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "get_session"
+                for item in context.items
+            )
+            if not opens_database_session:
+                continue
+            forbidden = []
+            for node in ast.walk(context):
+                if not isinstance(node, ast.Await) or not isinstance(
+                    node.value, ast.Call
+                ):
+                    continue
+                function = node.value.func
+                if (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "k8s"
+                ):
+                    forbidden.append(function.attr)
+            assert forbidden == []
 
 
 def _service() -> V1Service:
@@ -494,6 +602,12 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
     intent = SimpleNamespace(
         intent_id="intent-1",
         deployment_id="deployment-1",
+        validator="validator-1",
+        chute_id="chute-1",
+        chute_version="1.0.0",
+        server_id="server-1",
+        job_id=None,
+        job_cleanup_only=False,
         request_payload=request,
         request_sha256=canonical_miner_launch_sha256(request),
         lineage_sha256=canonical_miner_launch_sha256(lineage),
@@ -611,6 +725,12 @@ async def test_noncanonical_launch_intent_fails_before_external_create(
     intent = SimpleNamespace(
         intent_id="intent-1",
         deployment_id="deployment-1",
+        validator="validator-1",
+        chute_id="chute-1",
+        chute_version="1.0.0",
+        server_id="server-1",
+        job_id=None,
+        job_cleanup_only=False,
         request_payload=request,
         request_sha256=canonical_miner_launch_sha256(request),
         lineage_sha256=canonical_miner_launch_sha256(lineage),
@@ -759,14 +879,11 @@ async def test_ambiguous_create_retains_lease_until_teardown_can_prove_absence(
 
 
 @pytest.mark.asyncio
-async def test_launch_response_replay_accumulates_only_validator_returned_tokens(monkeypatch):
-    intent = SimpleNamespace(
+async def test_launch_response_replay_accumulates_only_validator_returned_tokens(
+    monkeypatch,
+):
+    intent = _canonical_intent(
         phase="pending",
-        response_payload=None,
-        response_sha256=None,
-        token_sha256=None,
-        authorized_token_sha256s=[],
-        last_failure=None,
     )
     session = SimpleNamespace(
         get=AsyncMock(return_value=intent),
@@ -798,6 +915,41 @@ async def test_launch_response_replay_accumulates_only_validator_returned_tokens
     )
     assert intent.token_sha256 == hashlib.sha256(b"token-2").hexdigest()
     assert session.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tampered_launch_intent_stops_before_external_replay_or_failure_mutation(
+    monkeypatch,
+):
+    intent = _canonical_intent(phase="pending")
+    intent.request_payload["unexpected"] = True
+    intent.request_sha256 = canonical_miner_launch_sha256(intent.request_payload)
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=intent),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+    gepetto._fetch_launch_config = AsyncMock()
+    gepetto._revoke_registry_scope = AsyncMock()
+    gepetto._release_job_exact = AsyncMock()
+
+    assert await gepetto._resume_launch_intent("intent-1") is False
+    assert intent.phase == "pending"
+    assert intent.last_failure is None
+    gepetto._fetch_launch_config.assert_not_awaited()
+    gepetto._revoke_registry_scope.assert_not_awaited()
+    gepetto._release_job_exact.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    assert all(
+        call.kwargs.get("with_for_update") is True
+        for call in session.get.await_args_list
+    )
 
 
 class _IntentResult:
@@ -856,19 +1008,16 @@ async def test_pre_request_job_cleanup_is_committed_before_external_release(
 
 
 @pytest.mark.asyncio
-async def test_pending_launch_recovery_replays_persisted_identity_not_current_rows(monkeypatch):
-    intent = SimpleNamespace(
-        intent_id="intent-1",
+async def test_pending_launch_recovery_replays_persisted_identity_not_current_rows(
+    monkeypatch,
+):
+    intent = _canonical_intent(
         phase="pending",
         chute_id="chute-original",
+        chute_version="1.0.0",
         server_id="server-original",
         job_id="job-1",
         validator="validator-original",
-        response_payload=None,
-        job_release_ack=None,
-        job_released_at=None,
-        completed_at=None,
-        last_failure=None,
     )
     session = SimpleNamespace(
         execute=AsyncMock(return_value=_IntentResult()),
@@ -920,18 +1069,10 @@ async def test_pending_launch_recovery_replays_persisted_identity_not_current_ro
 
 @pytest.mark.asyncio
 async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
-    intent = SimpleNamespace(
-        intent_id="intent-1",
+    intent = _canonical_intent(
         phase="cleanup_required",
-        chute_id="chute-1",
-        server_id="server-1",
         job_id="job-1",
-        validator="validator-1",
         response_payload={"config_id": "config-1", "registry": None},
-        job_release_ack=None,
-        job_released_at=None,
-        completed_at=None,
-        last_failure=None,
     )
     session = SimpleNamespace(
         execute=AsyncMock(return_value=_IntentResult()),
@@ -966,18 +1107,10 @@ async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
 async def test_predeployment_abort_persists_before_cleanup_and_retries_in_reconcile(
     monkeypatch,
 ):
-    intent = SimpleNamespace(
-        intent_id="intent-1",
+    intent = _canonical_intent(
         phase="registry_acked",
-        chute_id="chute-1",
-        server_id="server-1",
         job_id="job-1",
-        validator="validator-1",
         response_payload={"config_id": "config-1", "registry": None},
-        job_release_ack=None,
-        job_released_at=None,
-        completed_at=None,
-        last_failure=None,
     )
     session = SimpleNamespace(
         execute=AsyncMock(return_value=_IntentResult()),
@@ -1022,19 +1155,11 @@ async def test_predeployment_abort_persists_before_cleanup_and_retries_in_reconc
 async def test_job_cleanup_only_intent_releases_without_requesting_launch_config(
     monkeypatch,
 ):
-    intent = SimpleNamespace(
-        intent_id="intent-1",
+    intent = _canonical_intent(
         phase="cleanup_required",
-        chute_id="chute-1",
         server_id="invalid-server",
         job_id="job-1",
-        validator="validator-1",
         job_cleanup_only=True,
-        response_payload=None,
-        job_release_ack=None,
-        job_released_at=None,
-        completed_at=None,
-        last_failure=None,
     )
     session = SimpleNamespace(
         execute=AsyncMock(return_value=_IntentResult()),
