@@ -126,17 +126,55 @@ async def test_scope_ack_state_machine_is_idempotent_and_fail_closed(monkeypatch
         launch_config_id="config-1",
         validator="validator-1",
     )
-    revocation_ack = {"revoked": True, "launch_config_id": "config-1"}
-    await record_registry_scope_revoked("config-1", revocation_ack)
+    revocation_ack = {
+        "status": "already_absent",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
+    durable_ack = await record_registry_scope_revoked("config-1", revocation_ack)
     assert row.phase == "revoked"
     assert row.desired_state == "revoked"
-    assert row.revocation_ack == revocation_ack
+    assert durable_ack == {
+        **revocation_ack,
+        "status": "revoked",
+    }
+    assert row.revocation_ack == durable_ack
     assert row.revoked_at is not None
+
+    replay_ack = await record_registry_scope_revoked(
+        "config-1",
+        {**revocation_ack, "status": "revoked"},
+    )
+    assert replay_ack == durable_ack
 
     with pytest.raises(DeploymentFailure, match="malformed revocation ACK"):
         await record_registry_scope_revoked(
             "config-1",
-            {"revoked": True, "launch_config_id": "other-config"},
+            {
+                "revoked": True,
+                "launch_config_id": "config-1",
+            },
+        )
+    with pytest.raises(DeploymentFailure, match="malformed revocation ACK"):
+        await record_registry_scope_revoked(
+            "config-1",
+            {
+                "status": "already_absent",
+                "revoked": True,
+                "launch_config_id": "other-config",
+                "server_id": "server-1",
+            },
+        )
+    with pytest.raises(DeploymentFailure, match="malformed revocation ACK"):
+        await record_registry_scope_revoked(
+            "config-1",
+            {
+                "status": "already_absent",
+                "revoked": True,
+                "launch_config_id": "config-1",
+                "server_id": "server-other",
+            },
         )
 
 
@@ -225,7 +263,7 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
     }
     recorded.assert_awaited_once()
     coordinator._revoke_registry_scope.assert_awaited_once_with(
-        "validator-1", "config-revoked"
+        "validator-1", "config-revoked", "server-1"
     )
     failures.assert_not_awaited()
 

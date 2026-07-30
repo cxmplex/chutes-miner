@@ -517,6 +517,10 @@ async def revoke_registry_scope(
         None,
         alias="X-Chutes-Attested-Session",
     ),
+    expected_server_id: str | None = Header(
+        None,
+        alias="X-Chutes-Server-Id",
+    ),
 ):
     _private_request(request)
     if (
@@ -540,10 +544,18 @@ async def revoke_registry_scope(
             allow_redirects=False,
         ) as response:
             result = await response.json()
-            if response.status != 200 or result != {
+            expected = {
+                "status": result.get("status") if isinstance(result, dict) else None,
                 "revoked": True,
                 "launch_config_id": launch_config_id,
-            }:
+                "server_id": expected_server_id,
+            }
+            if (
+                not expected_server_id
+                or expected["status"] not in {"revoked", "already_absent"}
+                or response.status != 200
+                or result != expected
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Validator rejected exact registry scope revocation.",

@@ -18,6 +18,11 @@ FOLLOWUP_MIGRATION = (
     / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260727120000_miner_lifecycle_followup.sql"
 )
+FRONTIER_MIGRATION = (
+    ROOT
+    / "src/chutes-miner/chutes_miner/api/migrations/"
+    "20260730140000_teardown_frontier_parent_hold.sql"
+)
 
 
 def _ondelete(table: str, column: str) -> str:
@@ -58,9 +63,14 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "launch_phase_at_request",
         "launch_kubernetes_mutation_possible",
         "launch_create_results_sha256",
+        "launch_frontier",
+        "launch_frontier_sha256",
         "resource_discovery",
         "resource_discovery_sha256",
         "resource_discovered_at",
+        "pod_lifecycle_evidence",
+        "pod_lifecycle_evidence_sha256",
+        "pod_lifecycle_evidence_recorded_at",
     }.issubset(operation.c.keys())
     assert _ondelete("deployment_teardown_operations", "launch_operation_id") == "RESTRICT"
     assert "parent_deletion_children" in Base.metadata.tables
@@ -73,6 +83,10 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "node_name",
         "pod_termination_evidence",
         "pod_termination_evidence_sha256",
+        "pod_uid_absence_evidence",
+        "pod_uid_absence_evidence_sha256",
+        "pod_uid_absence_observed_at",
+        "pod_already_terminating",
         "pod_teardown_finalizer_attached_at",
         "pod_teardown_finalizer_removal_requested_at",
         "pod_teardown_finalizer_removed_at",
@@ -101,6 +115,12 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         "to_gpu_allocation_group_generation",
         "to_cluster_context_sha256",
     }.issubset(handoff.c.keys())
+    parent = Base.metadata.tables["parent_deletion_operations"]
+    assert {
+        "allocation_release_evidence",
+        "allocation_release_evidence_sha256",
+        "allocation_release_verified_at",
+    }.issubset(parent.c.keys())
 
 
 def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
@@ -224,3 +244,17 @@ def test_followup_migration_has_specific_locked_down_guard():
     assert "canonical_miner_teardown_jsonb" in sql
     assert "resource_discovery_sha256" in sql
     assert "launch_kubernetes_mutation_possible" in sql
+
+
+def test_frontier_migration_guards_new_closure_and_parent_allocation():
+    sql = FRONTIER_MIGRATION.read_text(encoding="utf-8")
+    assert "chutes.miner-launch-frontier.v1" in sql
+    assert "chutes.miner-pod-uid-absence.v1" in sql
+    assert "chutes.miner-pod-lifecycle.v1" in sql
+    assert "deployment_teardown_extended_closure_complete" in sql
+    assert "'awaiting_registry'" in sql
+    assert "fence_parent_allocation_ownership" in sql
+    assert "gpus_fence_parent_allocation" in sql
+    assert "servers_fence_parent_allocation" in sql
+    assert "allocation_release_evidence_sha256" in sql
+    assert "cannot remove teardown frontier authority while lifecycle history exists" in sql

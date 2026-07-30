@@ -781,7 +781,9 @@ class Gepetto:
                 }
             config_id = stable_response.get("config_id")
             if config_id:
-                await self._revoke_registry_scope(validator_hotkey, config_id)
+                await self._revoke_registry_scope(
+                    validator_hotkey, config_id, server_id
+                )
             if job_id and job_release_ack is None:
                 job_release_ack = await self._release_job_exact(
                     validator_hotkey,
@@ -863,6 +865,7 @@ class Gepetto:
         self,
         validator_hotkey: str,
         launch_config_id: str,
+        server_id: str,
     ) -> None:
         if not settings.gpu_tee_only:
             return
@@ -874,6 +877,7 @@ class Gepetto:
         if validator is None:
             raise DeploymentFailure("Registry scope validator is unavailable.")
         headers, _ = sign_request(purpose="registry")
+        headers["X-Chutes-Server-Id"] = server_id
         service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
         async with aiohttp.ClientSession(raise_for_status=False) as session:
             async with session.delete(
@@ -881,10 +885,17 @@ class Gepetto:
                 headers=headers,
             ) as response:
                 result = await response.json()
-                if response.status != 200 or result != {
+                expected = {
+                    "status": result.get("status") if isinstance(result, dict) else None,
                     "revoked": True,
                     "launch_config_id": launch_config_id,
-                }:
+                    "server_id": server_id,
+                }
+                if (
+                    expected["status"] not in {"revoked", "already_absent"}
+                    or response.status != 200
+                    or result != expected
+                ):
                     raise DeploymentFailure(
                         "Registry broker did not revoke exact launch lifecycle."
                     )
@@ -2529,7 +2540,7 @@ class Gepetto:
                     raise DeploymentFailure("registry scope validator is unavailable")
                 if item.desired_state == "revoked":
                     await self._revoke_registry_scope(
-                        item.validator, item.launch_config_id
+                        item.validator, item.launch_config_id, item.server_id
                     )
                     continue
                 body = {

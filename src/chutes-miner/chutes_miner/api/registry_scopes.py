@@ -223,10 +223,7 @@ async def request_registry_scope_revocation(
 async def record_registry_scope_revoked(
     launch_config_id: str,
     ack: dict[str, Any],
-) -> None:
-    expected = {"revoked": True, "launch_config_id": launch_config_id}
-    if ack != expected:
-        raise DeploymentFailure("registry broker returned a malformed revocation ACK")
+) -> dict[str, Any]:
     async with get_session() as session:
         row = await session.get(
             RegistryScopeIntent,
@@ -235,13 +232,32 @@ async def record_registry_scope_revoked(
         )
         if row is None or row.desired_state != "revoked":
             raise DeploymentFailure("registry scope revocation authority disappeared")
-        if row.revocation_ack is not None and row.revocation_ack != ack:
+        expected = {
+            "status": ack.get("status") if isinstance(ack, dict) else None,
+            "revoked": True,
+            "launch_config_id": launch_config_id,
+            "server_id": row.server_id,
+        }
+        if (
+            row.server_id is None
+            or expected["status"] not in {"revoked", "already_absent"}
+            or ack != expected
+        ):
+            raise DeploymentFailure("registry broker returned a malformed revocation ACK")
+        durable_ack = {
+            "status": "revoked",
+            "revoked": True,
+            "launch_config_id": launch_config_id,
+            "server_id": row.server_id,
+        }
+        if row.revocation_ack is not None and row.revocation_ack != durable_ack:
             raise DeploymentFailure("registry scope revocation replay changed its ACK")
-        row.revocation_ack = ack
+        row.revocation_ack = durable_ack
         row.revoked_at = row.revoked_at or _utc_now()
         row.phase = "revoked"
         row.last_failure = None
         await session.commit()
+        return durable_ack
 
 
 async def record_registry_scope_failure(

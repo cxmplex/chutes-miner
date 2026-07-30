@@ -64,7 +64,7 @@ def test_barrier_uses_exact_version_not_maximum():
     sql = str(schema_barrier._REQUIRED_SCHEMA_VERSION_PRESENT)
     assert "WHERE version = :required_version" in sql
     assert "MAX(" not in sql.upper()
-    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730120000"
+    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730140000"
     adoption_sql = str(schema_barrier._SEEDLESS_ADOPTION_PRESENT)
     assert "array_agg(gpu.hardware_uuid ORDER BY gpu.hardware_uuid)" in adoption_sql
     assert "server.registration_attestation_id = :attestation_id" in adoption_sql

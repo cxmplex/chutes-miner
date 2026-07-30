@@ -78,7 +78,12 @@ async def test_validator_outage_does_not_remove_local_scope_before_ack(
             return None
 
         async def json(self):
-            return {"revoked": True, "launch_config_id": "config-1"}
+            return {
+                "status": "already_absent",
+                "revoked": True,
+                "launch_config_id": "config-1",
+                "server_id": "server-1",
+            }
 
     class Client:
         def __init__(self, **_kwargs):
@@ -152,7 +157,12 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
             return None
 
         async def json(self):
-            return {"revoked": True, "launch_config_id": "config-1"}
+            return {
+                "status": "already_absent",
+                "revoked": True,
+                "launch_config_id": "config-1",
+                "server_id": "server-1",
+            }
 
     class Client:
         def __init__(self, **_kwargs):
@@ -177,8 +187,16 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
     registry_broker._scopes_loaded = True
 
     result = await registry_broker.revoke_registry_scope(
-        "config-1", _request(), attested_session="attested-session"
+        "config-1",
+        _request(),
+        attested_session="attested-session",
+        expected_server_id="server-1",
     )
-    assert result == {"revoked": True, "launch_config_id": "config-1"}
+    assert result == {
+        "status": "already_absent",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
     assert "config-1" not in registry_broker._scopes
     assert json.loads(path.read_text(encoding="ascii"))["scopes"] == {}

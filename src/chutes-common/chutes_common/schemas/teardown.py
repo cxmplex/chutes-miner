@@ -64,9 +64,14 @@ class DeploymentTeardownOperation(Base):
     launch_phase_at_request = Column(String, nullable=True)
     launch_kubernetes_mutation_possible = Column(Boolean, nullable=True)
     launch_create_results_sha256 = Column(String(64), nullable=True)
+    launch_frontier = Column(JSONB, nullable=True)
+    launch_frontier_sha256 = Column(String(64), nullable=True)
     resource_discovery = Column(JSONB, nullable=True)
     resource_discovery_sha256 = Column(String(64), nullable=True)
     resource_discovered_at = Column(DateTime(timezone=True), nullable=True)
+    pod_lifecycle_evidence = Column(JSONB, nullable=True)
+    pod_lifecycle_evidence_sha256 = Column(String(64), nullable=True)
+    pod_lifecycle_evidence_recorded_at = Column(DateTime(timezone=True), nullable=True)
 
     registry_revocation_ack = Column(JSONB, nullable=True)
     registry_revoked_at = Column(DateTime(timezone=True), nullable=True)
@@ -108,7 +113,7 @@ class DeploymentTeardownOperation(Base):
     __table_args__ = (
         CheckConstraint(
             "phase IN ('requested', 'discovering', 'revoking', 'deleting', "
-            "'verifying', 'finalizing', 'completed')",
+            "'verifying', 'awaiting_registry', 'finalizing', 'completed')",
             name="ck_deployment_teardown_phase",
         ),
         CheckConstraint(
@@ -169,14 +174,27 @@ class DeploymentTeardownOperation(Base):
             "(launch_operation_id IS NULL "
             "AND launch_phase_at_request IS NULL "
             "AND launch_kubernetes_mutation_possible IS NULL "
-            "AND launch_create_results_sha256 IS NULL) OR "
+            "AND launch_create_results_sha256 IS NULL "
+            "AND launch_frontier IS NULL "
+            "AND launch_frontier_sha256 IS NULL) OR "
             "(launch_operation_id IS NOT NULL "
             "AND launch_phase_at_request IN "
             "('reserved', 'creating', 'created', 'failed') "
             "AND launch_kubernetes_mutation_possible = "
             "(launch_phase_at_request <> 'reserved') "
-            "AND launch_create_results_sha256 ~ '^[0-9a-f]{64}$')",
+            "AND launch_create_results_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND launch_frontier IS NOT NULL "
+            "AND launch_frontier_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_deployment_teardown_launch_snapshot",
+        ),
+        CheckConstraint(
+            "(pod_lifecycle_evidence IS NULL "
+            "AND pod_lifecycle_evidence_sha256 IS NULL "
+            "AND pod_lifecycle_evidence_recorded_at IS NULL) OR "
+            "(pod_lifecycle_evidence IS NOT NULL "
+            "AND pod_lifecycle_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND pod_lifecycle_evidence_recorded_at IS NOT NULL)",
+            name="ck_deployment_teardown_pod_lifecycle_evidence",
         ),
     )
 
@@ -267,6 +285,12 @@ class DeploymentTeardownK8sResource(Base):
     labels_sha256 = Column(String, nullable=False)
     pod_termination_evidence = Column(JSONB, nullable=True)
     pod_termination_evidence_sha256 = Column(String, nullable=True)
+    pod_uid_absence_evidence = Column(JSONB, nullable=True)
+    pod_uid_absence_evidence_sha256 = Column(String, nullable=True)
+    pod_uid_absence_observed_at = Column(DateTime(timezone=True), nullable=True)
+    pod_already_terminating = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
     pod_teardown_finalizer_removal_requested_at = Column(
         DateTime(timezone=True), nullable=True
@@ -302,7 +326,15 @@ class DeploymentTeardownK8sResource(Base):
             "(pod_termination_evidence_sha256 IS NULL)) AND "
             "((pod_termination_evidence IS NULL) = "
             "(pod_teardown_finalizer_removal_requested_at IS NULL)) AND "
+            "((pod_uid_absence_evidence IS NULL) = "
+            "(pod_uid_absence_evidence_sha256 IS NULL)) AND "
+            "((pod_uid_absence_evidence IS NULL) = "
+            "(pod_uid_absence_observed_at IS NULL)) AND "
+            "NOT (pod_termination_evidence IS NOT NULL "
+            "AND pod_uid_absence_evidence IS NOT NULL) AND "
             "(kind = 'Pod' OR pod_termination_evidence IS NULL) AND "
+            "(kind = 'Pod' OR pod_uid_absence_evidence IS NULL) AND "
+            "(kind = 'Pod' OR pod_already_terminating IS FALSE) AND "
             "(kind = 'Pod' OR (pod_teardown_finalizer_attached_at IS NULL AND "
             "pod_teardown_finalizer_removal_requested_at IS NULL AND "
             "pod_teardown_finalizer_removed_at IS NULL)) AND "
@@ -311,14 +343,20 @@ class DeploymentTeardownK8sResource(Base):
             "(pod_teardown_finalizer_removed_at IS NULL OR "
             "pod_teardown_finalizer_removal_requested_at IS NOT NULL) AND "
             "(kind <> 'Pod' OR state NOT IN ('absent', 'replaced') OR "
-            "(pod_termination_evidence IS NOT NULL AND "
-            "pod_teardown_finalizer_removed_at IS NOT NULL))",
+            "((pod_termination_evidence IS NOT NULL AND "
+            "pod_teardown_finalizer_removed_at IS NOT NULL) OR "
+            "pod_uid_absence_evidence IS NOT NULL))",
             name="ck_deployment_teardown_resource_pod_termination",
         ),
         CheckConstraint(
             "pod_termination_evidence_sha256 IS NULL OR "
             "pod_termination_evidence_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_deployment_teardown_resource_pod_termination_sha256",
+        ),
+        CheckConstraint(
+            "pod_uid_absence_evidence_sha256 IS NULL OR "
+            "pod_uid_absence_evidence_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_deployment_teardown_resource_pod_uid_absence_sha256",
         ),
         CheckConstraint(
             "(owner_api_version IS NULL AND owner_kind IS NULL "
@@ -693,6 +731,9 @@ class ParentDeletionOperation(Base):
     monitor_stopped_at = Column(DateTime(timezone=True), nullable=True)
     validator_server_deletion_ack = Column(JSONB, nullable=True)
     validator_server_deleted_at = Column(DateTime(timezone=True), nullable=True)
+    allocation_release_evidence = Column(JSONB, nullable=True)
+    allocation_release_evidence_sha256 = Column(String(64), nullable=True)
+    allocation_release_verified_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
@@ -731,6 +772,16 @@ class ParentDeletionOperation(Base):
             "(validator_server_deletion_ack IS NULL) = "
             "(validator_server_deleted_at IS NULL)",
             name="ck_parent_deletion_validator_ack",
+        ),
+        CheckConstraint(
+            "(allocation_release_evidence IS NULL "
+            "AND allocation_release_evidence_sha256 IS NULL "
+            "AND allocation_release_verified_at IS NULL) OR "
+            "(parent_type = 'server' "
+            "AND allocation_release_evidence IS NOT NULL "
+            "AND allocation_release_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND allocation_release_verified_at IS NOT NULL)",
+            name="ck_parent_deletion_allocation_release",
         ),
     )
 

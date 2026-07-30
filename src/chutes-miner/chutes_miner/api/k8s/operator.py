@@ -2567,10 +2567,12 @@ class K8sOperator(abc.ABC):
     async def _revoke_registry_scope(
         validator_hotkey: str,
         config_id: str,
+        server_id: str,
     ) -> None:
         await request_registry_scope_revocation(
             launch_config_id=config_id,
             validator=validator_hotkey,
+            server_id=server_id,
         )
         validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
@@ -2581,13 +2583,21 @@ class K8sOperator(abc.ABC):
                 f"http://{service}/registry/scopes/{config_id}",
                 headers={
                     "X-Chutes-Attested-Session": settings.attested_session,
+                    "X-Chutes-Server-Id": server_id,
                 },
             ) as response:
                 result = await response.json()
-                if response.status != 200 or result != {
+                expected = {
+                    "status": result.get("status") if isinstance(result, dict) else None,
                     "revoked": True,
                     "launch_config_id": config_id,
-                }:
+                    "server_id": server_id,
+                }
+                if (
+                    expected["status"] not in {"revoked", "already_absent"}
+                    or response.status != 200
+                    or result != expected
+                ):
                     raise DeploymentFailure(
                         "registry scope revocation failed for aborted deployment"
                     )

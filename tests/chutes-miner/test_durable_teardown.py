@@ -511,6 +511,7 @@ async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
     )
     pod = SimpleNamespace(
         resource_id="pod-row",
+        operation_id="operation-1",
         api_version="v1",
         kind="Pod",
         name="pod-1",
@@ -587,7 +588,12 @@ async def test_validator_job_release_ack_is_required_and_retryable(monkeypatch):
     await coordinator._revoke(operation)
     assert operation.validator_job_release_ack == ack
     assert operation.validator_job_released_at is not None
-    coordinator._advance.assert_awaited_once_with("operation-1", "revoking", "deleting")
+    coordinator._advance.assert_awaited_once_with(
+        "operation-1",
+        "revoking",
+        "deleting",
+        last_failure=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -951,6 +957,157 @@ def test_pod_terminal_evidence_requires_our_finalizer_and_every_container_status
     assert teardown._pod_termination_evidence(pod) is None
 
 
+def test_pending_pod_persists_exact_never_started_evidence():
+    pod = _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER])
+    pod.status.phase = "Pending"
+    pod.status.container_statuses = [
+        SimpleNamespace(
+            name="worker",
+            container_id=None,
+            restart_count=0,
+            state=SimpleNamespace(
+                terminated=None,
+                running=None,
+                waiting=SimpleNamespace(reason="ImagePullBackOff"),
+            ),
+        )
+    ]
+
+    evidence = teardown._pod_termination_evidence(pod)
+
+    assert evidence["schema"] == teardown.POD_TERMINATION_EVIDENCE_V2_SCHEMA
+    assert evidence["outcome"] == "never_started"
+    assert evidence["pod_phase"] == "Pending"
+    assert evidence["containers"] == [
+        {
+            "group": "container",
+            "name": "worker",
+            "outcome": "never_started",
+            "waiting_reason": "ImagePullBackOff",
+            "restart_count": 0,
+        }
+    ]
+
+
+def test_never_started_evidence_rejects_non_pending_phase_even_with_matching_hash():
+    pod = _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER])
+    pod.status.phase = "Pending"
+    pod.status.container_statuses = []
+    evidence = teardown._pod_termination_evidence(pod)
+    resource = SimpleNamespace(
+        kind="Pod",
+        uid="pod-uid",
+        node_name="node-a",
+        pod_already_terminating=False,
+        pod_termination_evidence=evidence,
+        pod_termination_evidence_sha256=teardown.canonical_sha256(evidence),
+    )
+
+    assert teardown._verified_pod_termination_evidence(resource) == evidence
+
+    tampered = {**evidence, "pod_phase": "Running"}
+    resource.pod_termination_evidence = tampered
+    resource.pod_termination_evidence_sha256 = teardown.canonical_sha256(tampered)
+    with pytest.raises(LineageConflict, match="Pod termination evidence is invalid"):
+        teardown._verified_pod_termination_evidence(resource)
+
+
+def test_already_terminating_observation_is_first_class():
+    pod = _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER])
+    identity = teardown._identity("Pod", pod)
+    assert identity.pod_already_terminating is True
+
+    pod.metadata.deletion_timestamp = None
+    identity = teardown._identity("Pod", pod)
+    assert identity.pod_already_terminating is False
+
+
+@pytest.mark.parametrize(
+    ("job_uid", "outcome"),
+    [(None, "never_started"), ("job-uid", "no_pod_observed")],
+)
+def test_zero_pod_lifecycle_is_bound_to_exact_launch_frontier(job_uid, outcome):
+    launch = SimpleNamespace(
+        operation_id="launch-1",
+        deployment_id="deployment-1",
+        phase="created",
+        cluster_context="node-a",
+        canonical_workload_spec_sha256="c" * 64,
+        service_name="service-a",
+        service_uid="service-uid",
+        secret_name=None,
+        secret_uid=None,
+        job_name="job-a" if job_uid else None,
+        job_uid=job_uid,
+        create_results={},
+    )
+    frontier = teardown._launch_frontier_document(launch)
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        deployment_id="deployment-1",
+        launch_operation_id="launch-1",
+        launch_phase_at_request="created",
+        launch_create_results_sha256=teardown.canonical_sha256({}),
+        launch_frontier=frontier,
+        launch_frontier_sha256=teardown.canonical_sha256(frontier),
+        cluster_context="node-a",
+        resource_discovery_sha256="d" * 64,
+        gpu_hardware_uuids=["GPU-1"],
+        pod_lifecycle_evidence=None,
+        pod_lifecycle_evidence_sha256=None,
+        pod_lifecycle_evidence_recorded_at=None,
+    )
+    evidence = {
+        "schema": teardown.POD_LIFECYCLE_EVIDENCE_SCHEMA,
+        "outcome": outcome,
+        "operation_id": "operation-1",
+        "deployment_id": "deployment-1",
+        "launch_frontier_sha256": operation.launch_frontier_sha256,
+        "resource_discovery_sha256": operation.resource_discovery_sha256,
+        "job_uid": job_uid,
+        "controllers_absent": True,
+        "selector_absent": True,
+    }
+    operation.pod_lifecycle_evidence = evidence
+    operation.pod_lifecycle_evidence_sha256 = teardown.canonical_sha256(evidence)
+    operation.pod_lifecycle_evidence_recorded_at = object()
+
+    assert teardown._verified_launch_frontier(operation) == frontier
+    assert teardown._verified_pod_lifecycle_evidence(operation) == evidence
+    assert teardown._gpu_pod_lifecycle_closed(operation, [])
+
+    operation.pod_lifecycle_evidence = {**evidence, "job_uid": "wrong-uid"}
+    operation.pod_lifecycle_evidence_sha256 = teardown.canonical_sha256(
+        operation.pod_lifecycle_evidence
+    )
+    with pytest.raises(LineageConflict, match="no-Pod lifecycle evidence"):
+        teardown._verified_pod_lifecycle_evidence(operation)
+
+
+def test_pending_pod_with_restart_history_is_not_never_started():
+    pod = _terminal_pod(finalizers=[teardown.POD_TEARDOWN_FINALIZER])
+    pod.status.phase = "Pending"
+    pod.status.container_statuses = [
+        SimpleNamespace(
+            name="worker",
+            container_id=None,
+            restart_count=1,
+            started=False,
+            last_state=SimpleNamespace(
+                running=None,
+                terminated=SimpleNamespace(exit_code=1),
+            ),
+            state=SimpleNamespace(
+                terminated=None,
+                running=None,
+                waiting=SimpleNamespace(reason="CrashLoopBackOff"),
+            ),
+        )
+    ]
+
+    assert teardown._pod_termination_evidence(pod) is None
+
+
 @pytest.mark.parametrize(
     ("method", "finalizers"),
     [
@@ -991,9 +1148,10 @@ def test_pod_finalizer_resource_version_race_is_retryable(
 
 
 @pytest.mark.asyncio
-async def test_pod_404_without_terminal_finalizer_closure_retains_ownership():
+async def test_pod_404_plus_selector_absence_persists_uid_closure(monkeypatch):
     pod = SimpleNamespace(
         resource_id="pod-row",
+        operation_id="operation-1",
         api_version="v1",
         kind="Pod",
         name="pod-a",
@@ -1004,9 +1162,14 @@ async def test_pod_404_without_terminal_finalizer_closure_retains_ownership():
         owner_uid=None,
         pod_termination_evidence=None,
         pod_termination_evidence_sha256=None,
+        pod_uid_absence_evidence=None,
+        pod_uid_absence_evidence_sha256=None,
+        pod_uid_absence_observed_at=None,
+        pod_already_terminating=False,
         pod_teardown_finalizer_attached_at=object(),
         pod_teardown_finalizer_removal_requested_at=None,
         pod_teardown_finalizer_removed_at=None,
+        absent_at=None,
     )
     operation = SimpleNamespace(
         operation_id="operation-1",
@@ -1015,19 +1178,136 @@ async def test_pod_404_without_terminal_finalizer_closure_retains_ownership():
         namespace="chutes",
         config_id=None,
         immutable_labels=EXPECTED_LABELS,
+        phase="verifying",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        resource_discovery_sha256="d" * 64,
+        gpu_hardware_uuids=["GPU-1"],
+        pod_lifecycle_evidence=None,
         resources=[pod],
     )
     coordinator = teardown.DeploymentTeardownCoordinator(
-        kubernetes=SimpleNamespace(read_resource=Mock(return_value=None))
+        kubernetes=SimpleNamespace(
+            read_resource=Mock(return_value=None),
+            list_resources=Mock(return_value=[]),
+        )
     )
+    operation.retry_lease_owner = coordinator.worker_id
+    session = SimpleNamespace(
+        get=AsyncMock(
+            side_effect=lambda model, *_args, **_kwargs: (
+                operation
+                if model.__name__ == "DeploymentTeardownOperation"
+                else pod
+            )
+        ),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
     coordinator._renew_operation_lease = AsyncMock()
-    coordinator._pause_for_retry = AsyncMock()
+    coordinator._require_launch_quiesced = AsyncMock()
+    coordinator._advance = AsyncMock()
+
+    assert await coordinator._verify(operation) is True
+    assert pod.state == "absent"
+    assert pod.pod_uid_absence_evidence["outcome"] == "uid_absent"
+    assert pod.pod_uid_absence_evidence["selector_absent"] is True
+    coordinator._advance.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_registry_outage_does_not_block_local_resource_deletion(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        phase="revoking",
+        config_id="config-1",
+        registry_revocation_ack=None,
+        job_id=None,
+        instance_id=None,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    coordinator._revoke_registry = AsyncMock(
+        side_effect=DeploymentFailure("validator unavailable")
+    )
+    coordinator._advance = AsyncMock()
+    record_failure = AsyncMock()
+    monkeypatch.setattr(teardown, "record_registry_scope_failure", record_failure)
+
+    await coordinator._revoke(operation)
+
+    record_failure.assert_awaited_once()
+    coordinator._advance.assert_awaited_once()
+    call = coordinator._advance.await_args
+    assert call.args == ("operation-1", "revoking", "deleting")
+    assert "validator unavailable" in call.kwargs["last_failure"]
+
+
+@pytest.mark.asyncio
+async def test_local_closure_waits_in_registry_only_phase_before_finalization():
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        deployment_id="deployment-1",
+        cluster_context="node-a",
+        namespace="chutes",
+        config_id="config-1",
+        immutable_labels=EXPECTED_LABELS,
+        registry_revocation_ack=None,
+        gpu_hardware_uuids=[],
+        resources=[],
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(list_resources=Mock(return_value=[]))
+    )
+    coordinator._require_launch_quiesced = AsyncMock()
+    coordinator._renew_operation_lease = AsyncMock()
+    coordinator._wait_for_registry_after_local_closure = AsyncMock()
     coordinator._advance = AsyncMock()
 
     assert await coordinator._verify(operation) is False
-    assert pod.state == "delete_requested"
-    coordinator._pause_for_retry.assert_awaited_once()
+    coordinator._wait_for_registry_after_local_closure.assert_awaited_once()
     coordinator._advance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registry_only_retry_advances_exact_ack_to_finalization(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        phase="awaiting_registry",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        config_id="config-1",
+        registry_revocation_ack=None,
+        registry_revoked_at=None,
+        last_failure="validator unavailable",
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    operation.retry_lease_owner = coordinator.worker_id
+    ack = {
+        "status": "revoked",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
+    coordinator._revoke_registry = AsyncMock(return_value=ack)
+    session = SimpleNamespace(get=AsyncMock(return_value=operation), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+
+    await coordinator._retry_registry_after_local_closure(operation)
+
+    assert operation.registry_revocation_ack == ack
+    assert operation.registry_revoked_at is not None
+    assert operation.phase == "finalizing"
+    assert operation.last_failure is None
 
 
 @pytest.mark.asyncio
@@ -1289,9 +1569,20 @@ async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatc
         kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
     )
     coordinator._adopt_parent_children = AsyncMock(return_value=[])
+    coordinator._record_parent_allocation_release = AsyncMock()
     coordinator._delete_validator_server = AsyncMock(
         return_value={"status": "already_absent", "server_id": "server-1"}
     )
+    monkeypatch.setattr(
+        teardown,
+        "_assert_parent_allocation_released",
+        Mock(),
+    )
+    session.execute.side_effect = [
+        _QueryResult(None),
+        _QueryResult([]),
+        _QueryResult(None),
+    ]
 
     assert await coordinator.run_parent("parent-1") is False
     assert operation.monitor_stop_ack is None
@@ -1307,6 +1598,80 @@ async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatc
     assert operation.last_failure is None
     assert stop.await_count == 2
     assert clear.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parent_allocation_hold_precedes_monitor_and_validator_calls(monkeypatch):
+    operation = SimpleNamespace(
+        operation_id="parent-1",
+        parent_type="server",
+        parent_id="server-1",
+        phase="waiting_for_children",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        attempt_count=0,
+        last_failure=None,
+        validator="validator-1",
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=operation),
+        scalar=AsyncMock(return_value=None),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    stop = AsyncMock()
+    monkeypatch.setattr("chutes_miner.api.server.util.stop_server_monitoring", stop)
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
+    )
+    coordinator._adopt_parent_children = AsyncMock(return_value=[])
+    coordinator._record_parent_allocation_release = AsyncMock(
+        side_effect=DeploymentFailure(
+            "server parent deletion is held by allocation-group ownership"
+        )
+    )
+    coordinator._delete_validator_server = AsyncMock()
+
+    assert await coordinator.run_parent("parent-1") is False
+    assert "held by allocation-group ownership" in operation.last_failure
+    stop.assert_not_awaited()
+    coordinator._delete_validator_server.assert_not_awaited()
+
+
+def test_parent_allocation_release_evidence_rejects_any_owned_generation():
+    operation = SimpleNamespace(
+        operation_id="parent-1",
+        parent_type="server",
+        parent_id="server-1",
+        snapshot={
+            "allocation_group_id": "group-old",
+            "allocation_group_generation": 7,
+        },
+        allocation_release_verified_at=object(),
+    )
+    evidence = teardown._parent_allocation_release_document(operation)
+    operation.allocation_release_evidence = evidence
+    operation.allocation_release_evidence_sha256 = teardown.canonical_sha256(evidence)
+    server = SimpleNamespace(
+        gpu_allocation_group_id=None,
+        gpu_allocation_group_generation=None,
+    )
+    gpu = SimpleNamespace(
+        gpu_allocation_group_id=None,
+        gpu_allocation_group_generation=None,
+    )
+
+    teardown._assert_parent_allocation_released(operation, server, [gpu])
+
+    gpu.gpu_allocation_group_id = "group-owned"
+    gpu.gpu_allocation_group_generation = 8
+    with pytest.raises(DeploymentFailure, match="held by allocation-group"):
+        teardown._assert_parent_allocation_released(operation, server, [gpu])
 
 
 @pytest.mark.asyncio
