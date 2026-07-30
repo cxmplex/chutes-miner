@@ -54,8 +54,8 @@ def test_v2_nonce_consumption_is_single_use(monkeypatch):
         RedisClient,
     )
 
-    assert _consume_v2_nonce("signer", "123.random")
-    assert not _consume_v2_nonce("signer", "123.random")
+    assert _consume_v2_nonce("signer", "123.random", ttl_seconds=30)
+    assert not _consume_v2_nonce("signer", "123.random", ttl_seconds=30)
 
 
 def test_v2_nonce_consumption_fails_closed(monkeypatch):
@@ -68,4 +68,4 @@ def test_v2_nonce_consumption_fails_closed(monkeypatch):
         UnavailableRedis,
     )
 
-    assert not _consume_v2_nonce("signer", "123.random")
+    assert not _consume_v2_nonce("signer", "123.random", ttl_seconds=30)

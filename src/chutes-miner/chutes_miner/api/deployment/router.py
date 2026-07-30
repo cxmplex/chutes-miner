@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from chutes_miner.api.database import get_db_session
-from chutes_common.auth import authorize
+from chutes_miner.api.management_auth import destructive_management_authorization
 from chutes_common.schemas.deployment import Deployment
 
 router = APIRouter()
@@ -18,7 +18,7 @@ router = APIRouter()
 @router.delete("/purge")
 async def purge(
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Purge all deployments, allowing gepetto to re-scale for max $$$
@@ -56,7 +56,7 @@ async def purge(
 async def purge_deployment(
     deployment_id: str,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Purge the target deployment

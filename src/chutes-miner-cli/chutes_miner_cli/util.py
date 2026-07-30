@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import secrets
 import time
 from substrateinterface import Keypair
 from typing import Dict, Any
@@ -11,6 +12,8 @@ from chutes_miner_cli.constants import (
     MINER_HEADER,
     NONCE_HEADER,
     SIGNATURE_HEADER,
+    SIG_VERSION_HEADER,
+    SIG_VERSION_V2,
 )
 
 
@@ -42,12 +45,26 @@ def sign_request(
     purpose: str = None,
     remote: bool = False,
     management: bool = False,
+    method: str | None = None,
+    path: str | None = None,
 ):
     """
     Generate a signed request (for miner requests to validators).
     """
+    if (method is None) != (path is None):
+        raise ValueError("method and path must be supplied together")
+    use_management_v2 = method is not None
+    if use_management_v2 and (remote or not management):
+        raise ValueError(
+            "V2 method/path signing is only supported for management requests"
+        )
+
     hotkey_data = json.loads(open(hotkey).read())
-    nonce = str(int(time.time()))
+    nonce = (
+        f"{int(time.time())}.{secrets.token_hex(8)}"
+        if use_management_v2
+        else str(int(time.time()))
+    )
     headers = {
         MINER_HEADER: hotkey_data["ss58Address"],
         NONCE_HEADER: nonce,
@@ -56,7 +73,6 @@ def sign_request(
         headers[HOTKEY_HEADER] = headers.pop(MINER_HEADER)
     elif management:
         headers[VALIDATOR_HEADER] = headers[MINER_HEADER]
-    signature_string = None
     payload_string = None
     if payload is not None:
         if isinstance(payload, (list, dict)):
@@ -64,6 +80,24 @@ def sign_request(
             payload_string = json.dumps(payload)
         else:
             payload_string = payload
+
+    if use_management_v2:
+        payload_bytes = (
+            payload_string.encode()
+            if isinstance(payload_string, str)
+            else payload_string
+        )
+        body_sha256 = (
+            hashlib.sha256(payload_bytes).hexdigest()
+            if payload_bytes is not None
+            else ""
+        )
+        signature_string = (
+            f"v2:{hotkey_data['ss58Address']}:{hotkey_data['ss58Address']}:"
+            f"{method.upper()}:{path}:{nonce}:{body_sha256}"
+        )
+        headers[SIG_VERSION_HEADER] = SIG_VERSION_V2
+    elif payload is not None:
         signature_string = get_signing_message(
             hotkey_data["ss58Address"],
             nonce,
@@ -74,14 +108,29 @@ def sign_request(
         signature_string = get_signing_message(
             hotkey_data["ss58Address"], nonce, payload_str=None, purpose=purpose
         )
-    if not remote:
+
+    if not remote and not use_management_v2:
         signature_string = hotkey_data["ss58Address"] + ":" + signature_string
-        if management:
-            headers.pop(VALIDATOR_HEADER, None)
-            headers[MINER_HEADER] = hotkey_data["ss58Address"]
-            headers[VALIDATOR_HEADER] = headers[MINER_HEADER]
-        else:
-            headers[VALIDATOR_HEADER] = headers[MINER_HEADER]
+    if not remote:
+        headers[MINER_HEADER] = hotkey_data["ss58Address"]
+        headers[VALIDATOR_HEADER] = headers[MINER_HEADER]
     keypair = Keypair.create_from_seed(hotkey_data["secretSeed"])
     headers[SIGNATURE_HEADER] = keypair.sign(signature_string.encode()).hex()
     return headers, payload_string
+
+
+def sign_management_request(
+    hotkey: str,
+    *,
+    method: str,
+    path: str,
+    payload: Dict[str, Any] | str | None = None,
+):
+    """Sign one miner-management request with the replay-resistant V2 contract."""
+    return sign_request(
+        hotkey,
+        payload=payload,
+        management=True,
+        method=method,
+        path=path,
+    )

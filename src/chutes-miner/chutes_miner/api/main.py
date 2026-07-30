@@ -235,10 +235,9 @@ async def ready(request: Request):
 
 @app.middleware("http")
 async def request_body_checksum(request: Request, call_next):
-    if request.method in ["POST", "PUT", "PATCH"]:
+    if request.method in ["POST", "PUT", "PATCH", "DELETE"]:
         body = await request.body()
-        sha256_hash = hashlib.sha256(body).hexdigest()
-        request.state.body_sha256 = sha256_hash
+        request.state.body_sha256 = hashlib.sha256(body).hexdigest() if body else None
     else:
         request.state.body_sha256 = None
     return await call_next(request)

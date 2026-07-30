@@ -24,7 +24,7 @@ from chutes_miner_cli import tee_maintenance
 from chutes_miner_cli import tee_status
 from chutes_miner_cli import l0
 from chutes_miner_cli import l0_providers
-from chutes_miner_cli.util import sign_request
+from chutes_miner_cli.util import sign_management_request, sign_request
 from loguru import logger
 import yaml
 
@@ -464,9 +464,15 @@ def add_node(
                 "gpu_short_ref": gpu_short_ref,
                 "agent_api": agent_api,
             }
-            headers, payload_string = sign_request(hotkey, payload=payload)
+            target = "/servers/"
+            headers, payload_string = sign_management_request(
+                hotkey,
+                method="POST",
+                path=target,
+                payload=payload,
+            )
             async with session.post(
-                f"{miner_api.rstrip('/')}/servers/",
+                f"{miner_api.rstrip('/')}{target}",
                 headers=headers,
                 data=payload_string,
                 timeout=900,
@@ -509,9 +515,14 @@ def delete_node(
 
         # Proceed with deletion.
         async with aiohttp.ClientSession(raise_for_status=False) as session:
-            headers, payload_string = sign_request(hotkey, purpose="management")
+            target = f"/servers/{name}"
+            headers, _ = sign_management_request(
+                hotkey,
+                method="DELETE",
+                path=target,
+            )
             async with session.delete(
-                f"{miner_api.rstrip('/')}/servers/{name}",
+                f"{miner_api.rstrip('/')}{target}",
                 headers=headers,
             ) as resp:
                 if resp.status == 404:
@@ -543,9 +554,14 @@ def purge_deployments(
     async def _purge_deployments():
         nonlocal hotkey, miner_api
         async with aiohttp.ClientSession(raise_for_status=True) as session:
-            headers, payload_string = sign_request(hotkey, purpose="management")
+            target = "/deployments/purge"
+            headers, _ = sign_management_request(
+                hotkey,
+                method="DELETE",
+                path=target,
+            )
             async with session.delete(
-                f"{miner_api.rstrip('/')}/deployments/purge",
+                f"{miner_api.rstrip('/')}{target}",
                 headers=headers,
             ) as resp:
                 print(json.dumps(await resp.json(), indent=2))
@@ -592,9 +608,14 @@ def purge_deployment(
             return
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
-            headers, payload_string = sign_request(hotkey, purpose="management")
+            target = f"/{endpoint}"
+            headers, _ = sign_management_request(
+                hotkey,
+                method="DELETE",
+                path=target,
+            )
             async with session.delete(
-                f"{miner_api.rstrip('/')}/{endpoint}",
+                f"{miner_api.rstrip('/')}{target}",
                 headers=headers,
             ) as resp:
                 print(json.dumps(await resp.json(), indent=2))
@@ -633,9 +654,14 @@ def purge_server(
             return
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
-            headers, _ = sign_request(hotkey, purpose="management")
+            target = f"/servers/{name}/deployments"
+            headers, _ = sign_management_request(
+                hotkey,
+                method="DELETE",
+                path=target,
+            )
             async with session.delete(
-                f"{miner_api.rstrip('/')}/servers/{name}/deployments",
+                f"{miner_api.rstrip('/')}{target}",
                 headers=headers,
             ) as resp:
                 print(json.dumps(await resp.json(), indent=2))
@@ -716,10 +742,15 @@ def delete_remote(
 
 async def _lock_or_unlock_server(lock: bool, name: str, hotkey: str, miner_api: str):
     async with aiohttp.ClientSession(raise_for_status=True) as session:
-        headers, _ = sign_request(hotkey, purpose="management")
-        path = "/lock" if lock else "/unlock"
+        action = "lock" if lock else "unlock"
+        target = f"/servers/{name}/{action}"
+        headers, _ = sign_management_request(
+            hotkey,
+            method="GET",
+            path=target,
+        )
         async with session.get(
-            f"{miner_api.rstrip('/')}/servers/{name}{path}",
+            f"{miner_api.rstrip('/')}{target}",
             headers=headers,
         ) as resp:
             server = await resp.json()

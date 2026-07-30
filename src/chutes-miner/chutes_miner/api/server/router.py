@@ -13,6 +13,7 @@ from sqlalchemy import select, exists, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from chutes_miner.api.database import get_db_session
 from chutes_miner.api.config import settings, validator_by_hotkey
+from chutes_miner.api.management_auth import destructive_management_authorization
 from chutes_miner.api.exceptions import UnsupportedRuntime
 from chutes_common.auth import authorize
 from chutes_common.schemas.deployment import Deployment
@@ -62,7 +63,7 @@ async def list_servers(
 async def create_server(
     server_args: ServerArgs,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, allow_validator=False)),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Add a new server/kubernetes cluster to our inventory.  This is a very
@@ -128,7 +129,7 @@ async def create_server(
 async def lock_server(
     id_or_name: str,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, allow_validator=False, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Lock a server's deployments so it won't chase bounties.
@@ -170,7 +171,7 @@ async def preflight_delete_check(
 async def unlock_server(
     id_or_name: str,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, allow_validator=False, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Unlock a server's deployments so it can chase bounties.
@@ -186,7 +187,7 @@ async def unlock_server(
 async def delete_server(
     id_or_name: str,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, allow_validator=False, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Remove a kubernetes node from the cluster.
@@ -215,7 +216,7 @@ async def delete_server(
 async def purge_server(
     id_or_name: str,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(authorize(allow_miner=True, allow_validator=False, purpose="management")),
+    _: None = Depends(destructive_management_authorization),
 ):
     """
     Purges deployments from a kubernetes node in the cluster.

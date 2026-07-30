@@ -34,6 +34,9 @@ validators:
       socket: wss://ws.chutes.ai
 
 minerApi:
+  # Set to "false" only for the measured producer-first migration window.
+  # The final remediation deployment must restore "true".
+  requireV2ManagementSignatures: "true"
   imagePullPolicy: IfNotPresent
   resources:
     requests:

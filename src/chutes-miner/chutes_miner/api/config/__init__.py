@@ -10,7 +10,7 @@ from typing import Any
 from kubernetes import client
 from kubernetes.config import load_kube_config, load_incluster_config
 from chutes_common.settings import MinerSettings as CommonSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 def create_kubernetes_client(cls: Any = client.CoreV1Api):
@@ -96,6 +96,23 @@ class Settings(CommonSettings):
     validator_migrations_enabled: bool = (
         os.getenv("VALIDATOR_MIGRATIONS_ENABLED", "false").lower() == "true"
     )
+    require_v2_management_signatures: bool = Field(
+        default=True,
+        validation_alias="CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES",
+    )
+
+    @field_validator("require_v2_management_signatures", mode="before")
+    @classmethod
+    def _strict_management_signature_cutover(cls, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "false"}:
+                return normalized == "true"
+        raise ValueError(
+            "CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES must be exactly true or false"
+        )
 
     monitor_api: str = str(os.getenv("MONITOR_API", ""))
 

@@ -10,6 +10,9 @@ postgresql+asyncpg://{{ .Values.postgres.database.user }}:$(POSTGRES_PASSWORD)@p
 {{- if .Values.multiCluster }}
 {{- fail "seedless whole-fabric mode requires the single-cluster operator" }}
 {{- end }}
+{{- if not (has .Values.minerApi.requireV2ManagementSignatures (list "true" "false")) }}
+{{- fail "minerApi.requireV2ManagementSignatures must be explicitly true or false" }}
+{{- end }}
 {{- if not (regexMatch "^chutes[.]local/seedless-stack@sha256:[0-9a-f]{64}$" .Values.seedlessStack.image) }}
 {{- fail "seedless stack image must be the measured digest reference" }}
 {{- end }}
@@ -106,6 +109,8 @@ spec:
               value: {{ .Values.seedlessStack.registrationPath | quote }}
             - name: GPU_TEE_ONLY
               value: "true"
+            - name: CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES
+              value: {{ .Values.minerApi.requireV2ManagementSignatures | quote }}
             - name: REGISTRY_PROXY_PORT
               value: "{{ .Values.registry.service.nodePort }}"
             {{- if not .Values.multiCluster }}

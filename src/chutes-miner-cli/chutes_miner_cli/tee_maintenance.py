@@ -16,7 +16,7 @@ from rich.table import Table
 from rich import box
 
 from chutes_miner_cli.constants import HOTKEY_ENVVAR, MINER_API_ENVVAR, VALIDATOR_API_ENVVAR
-from chutes_miner_cli.util import sign_request
+from chutes_miner_cli.util import sign_management_request, sign_request
 
 console = Console()
 
@@ -228,9 +228,14 @@ def register(app: typer.Typer) -> None:
                 typer.confirm("Proceed?", abort=True)
 
             # Lock the server via the miner API so gepetto stops scheduling new workloads.
-            lock_headers, _ = sign_request(hotkey, purpose="management")
+            lock_target = f"/servers/{name}/lock"
+            lock_headers, _ = sign_management_request(
+                hotkey,
+                method="GET",
+                path=lock_target,
+            )
             async with aiohttp.ClientSession(raise_for_status=False) as session:
-                lock_url = f"{miner_api.rstrip('/')}/servers/{name}/lock"
+                lock_url = f"{miner_api.rstrip('/')}{lock_target}"
                 async with session.get(lock_url, headers=lock_headers, timeout=30) as resp:
                     if resp.status >= 400:
                         body = await resp.text()
