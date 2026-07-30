@@ -13,6 +13,7 @@ from sqlalchemy import select, exists, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from chutes_miner.api.database import get_db_session
 from chutes_miner.api.config import settings, validator_by_hotkey
+from chutes_miner.api.exceptions import UnsupportedRuntime
 from chutes_common.auth import authorize
 from chutes_common.schemas.deployment import Deployment
 from chutes_miner.api.k8s.operator import K8sOperator
@@ -68,12 +69,13 @@ async def create_server(
     slow/long-running response via SSE, since it needs to do a lot of things.
     """
     if settings.gpu_tee_only:
+        error = UnsupportedRuntime(
+            "Legacy server creation is disabled; the seedless GPU server "
+            "is adopted from authenticated registrar state."
+        )
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "Legacy server creation is disabled; the seedless GPU server "
-                "is adopted from authenticated registrar state."
-            ),
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"code": error.code, "message": str(error)},
         )
     server_kubeconfig: Optional[KubeConfig] = None
     if server_args.agent_api:

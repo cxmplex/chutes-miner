@@ -1,6 +1,6 @@
 from chutes_common.schemas.gpu import GPU
 from chutes_common.schemas.server import ServerArgs
-from chutes_miner.api.exceptions import GraValBootstrapFailure
+from chutes_miner.api.exceptions import GraValBootstrapFailure, UnsupportedRuntime
 from chutes_miner.api.server.verification import GravalVerificationStrategy
 import pytest
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
@@ -124,6 +124,18 @@ def mock_validator_lookup():
         side_effect=_build_validator,
     ):
         yield
+
+
+@pytest.mark.asyncio
+async def test_wallet_authenticated_device_fetch_is_typed_unsupported():
+    strategy = object.__new__(GravalVerificationStrategy)
+    with (
+        patch("chutes_miner.api.server.verification.aiohttp.ClientSession") as client,
+        pytest.raises(UnsupportedRuntime, match="wallet-authenticated GraVal") as caught,
+    ):
+        await strategy._fetch_devices("http://retired.example/devices")
+    assert caught.value.code == "unsupported_runtime"
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -293,6 +305,40 @@ async def test_watch_stream_exception(mock_node, mock_job, mock_service):
                 graval_job=mock_job,
                 graval_service=mock_service,
             )
+
+
+@pytest.mark.asyncio
+async def test_typed_unsupported_propagates_through_gpu_gathering(
+    mock_node, mock_job, mock_service
+):
+    mock_ready_pod = Mock()
+    mock_ready_pod.status = Mock(
+        phase="Running",
+        container_statuses=[MagicMock(ready=True)],
+    )
+    mock_watch_event = Mock(object=mock_ready_pod)
+
+    with (
+        patch("chutes_miner.api.server.verification.K8sOperator") as mock_operator,
+        patch.object(
+            GravalVerificationStrategy,
+            "_fetch_devices",
+            side_effect=UnsupportedRuntime("wallet-authenticated GraVal is retired"),
+        ),
+        patch("chutes_miner.api.server.verification.settings") as mock_settings,
+    ):
+        mock_settings.graval_bootstrap_timeout = 60
+        mock_operator.return_value.watch_pods.return_value = iter([mock_watch_event])
+
+        with pytest.raises(UnsupportedRuntime, match="wallet-authenticated GraVal") as caught:
+            await gather_gpu_info(
+                server_id="server-123",
+                validator="validator-456",
+                node_object=mock_node,
+                graval_job=mock_job,
+                graval_service=mock_service,
+            )
+    assert caught.value.code == "unsupported_runtime"
 
 
 @pytest.mark.asyncio

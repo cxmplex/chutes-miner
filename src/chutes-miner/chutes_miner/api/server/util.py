@@ -29,7 +29,7 @@ from chutes_common.schemas.server import Server, ServerArgs
 from chutes_common.schemas.gpu import GPU
 from chutes_miner.api.exceptions import (
     DuplicateServer,
-    TEEBootstrapFailure,
+    UnsupportedRuntime,
     VerificationFailure,
 )
 import yaml
@@ -237,7 +237,7 @@ async def bootstrap_server(
     Bootstrap a server from start to finish, yielding SSEs for miner to track status.
     """
     if settings.gpu_tee_only:
-        raise TEEBootstrapFailure(
+        raise UnsupportedRuntime(
             "seedless GPU artifact disables legacy server bootstrap and adopts "
             "the registrar-created logical identity"
         )

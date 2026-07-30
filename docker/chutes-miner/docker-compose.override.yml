@@ -28,8 +28,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      # The base compose's MINER_SS58 (5E6xfU3o...) does NOT match its MINER_SEED.
-      # 5Df8x... is the ss58 actually derived from MINER_SEED=e031170f...; the validator
-      # verifies the socket signature against this, and it must be seeded into metagraph_nodes.
-      MINER_SS58: 5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj
+      # Public owner identity expected by the local validator fixture; no wallet is mounted.
+      MINER_OWNER_SS58: 5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj
       VALIDATORS: '{"supported": [{"hotkey": "5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4", "registry": "http://host.docker.internal:5000", "api": "http://host.docker.internal:8000", "socket": "ws://host.docker.internal:8080"}]}'

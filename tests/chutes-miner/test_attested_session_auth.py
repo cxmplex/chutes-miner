@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from chutes_common.auth import sign_request
 from chutes_common.settings import (
     GPU_REGISTRATION_IDENTITY_FIELDS,
@@ -12,7 +13,7 @@ from chutes_common.settings import (
     miner_settings,
 )
 from chutes_miner.api.config import settings
-from chutes_miner.api.exceptions import TEEBootstrapFailure
+from chutes_miner.api.exceptions import UnsupportedRuntime
 from chutes_miner.api.server.util import bootstrap_server
 from chutes_miner.gepetto import Gepetto
 
@@ -77,8 +78,27 @@ async def test_seedless_runtime_rejects_legacy_bootstrap_before_side_effects(
 ):
     monkeypatch.setattr(settings, "gpu_tee_only", True)
     stream = bootstrap_server(None, SimpleNamespace(), None)
-    with pytest.raises(TEEBootstrapFailure, match="disables legacy server bootstrap"):
+    with pytest.raises(UnsupportedRuntime, match="disables legacy server bootstrap") as caught:
         await stream.__anext__()
+    assert caught.value.code == "unsupported_runtime"
+
+
+@pytest.mark.asyncio
+async def test_seedless_route_returns_typed_unsupported_error(monkeypatch):
+    from chutes_miner.api.server.router import create_server
+
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    with pytest.raises(HTTPException) as caught:
+        await create_server(SimpleNamespace(), None, None)
+
+    assert caught.value.status_code == 501
+    assert caught.value.detail == {
+        "code": "unsupported_runtime",
+        "message": (
+            "Legacy server creation is disabled; the seedless GPU server is adopted from "
+            "authenticated registrar state."
+        ),
+    }
 
 
 def test_gepetto_generic_gpu_deletion_rejects_reservation_owned_nodes():
@@ -304,14 +324,36 @@ def test_seedless_api_leader_election_uses_postgres_not_stale_pidfile():
     assert "/tmp/api.pid" not in source
 
 
-def test_seedless_chart_uses_logical_node_scheduling_and_disables_wallet_audit():
+def test_seedless_chart_removes_unsupported_wallet_audit_exporter():
     root = Path(__file__).resolve().parents[2]
     values = (root / "charts/chutes-miner/values.yaml").read_text()
-    audit = (root / "charts/chutes-miner/templates/audit-export-cronjob.yaml").read_text()
     assert "chutes-miner-cpu-0" not in values
     assert 'chutes/seedless-control-plane: "true"' in values
-    assert "auditExporter:\n  enabled: false" in values
-    assert ".Values.auditExporter.enabled" in audit
+    assert "auditExporter:" not in values
+    for retired_path in (
+        root / "src/chutes-miner/chutes_miner/audit_exporter.py",
+        root / "charts/chutes-miner/templates/audit-export-cronjob.yaml",
+        root / "charts/chutes-miner/templates/audit-exporter.rbac.yaml",
+    ):
+        assert not retired_path.exists()
+
+
+def test_dev_helpers_use_public_owner_without_wallet_material():
+    root = Path(__file__).resolve().parents[2]
+    for path in (
+        root / "docker/chutes-miner/docker-compose.yaml",
+        root / "docker/chutes-miner/docker-compose.override.yml",
+        root / "scripts/seed.py",
+    ):
+        source = path.read_text()
+        assert "MINER_OWNER_SS58" in source
+        assert "MINER_" + "SEED" not in source
+        assert "MINER_SS58" not in source
+
+    verification = (
+        root / "src/chutes-miner/chutes_miner/api/server/verification.py"
+    ).read_text()
+    assert "miner_" + "keypair" not in verification
 
 
 def test_seedless_workload_cache_redis_and_registry_scopes_are_ephemeral():

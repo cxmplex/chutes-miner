@@ -15,7 +15,6 @@ from chutes_miner.api.server.schemas import (
     NodeArgs,
     ServerArgsRequest,
 )
-import chutes_common.constants as cst
 from chutes_common.auth import sign_request
 from chutes_common.k8s import WatchEventType
 from chutes_common.schemas.gpu import GPU
@@ -30,6 +29,7 @@ from chutes_miner.api.exceptions import (
     NonEmptyServer,
     TEEBootstrapFailure,
     VerificationFailure,
+    UnsupportedRuntime,
 )
 from chutes_miner.api.k8s.constants import GRAVAL_JOB_PREFIX, GRAVAL_SVC_PREFIX
 from chutes_miner.api.k8s.operator import K8sOperator
@@ -98,7 +98,7 @@ class VerificationStrategy(ABC):
     async def create(cls, node: V1Node, server_args: ServerArgs, server: Server):
         """Async factory method."""
         if settings.gpu_tee_only:
-            raise TEEBootstrapFailure(
+            raise UnsupportedRuntime(
                 "GPU TEE 1.11 uses registrar adoption and cannot activate legacy verification."
             )
         is_tee = node.metadata.labels.get("chutes/tee", "false").lower() == "true"
@@ -419,6 +419,8 @@ class GravalVerificationStrategy(VerificationStrategy):
             devices = await self._fetch_devices(f"http://{node_ip}:{node_port}/devices")
             assert devices
             assert len(devices) == expected_gpu_count
+        except UnsupportedRuntime:
+            raise
         except Exception as exc:
             raise GraValBootstrapFailure(
                 f"Failed to fetch devices from GraVal bootstrap: {node_ip}:{node_port}/devices: {exc}"
@@ -426,34 +428,12 @@ class GravalVerificationStrategy(VerificationStrategy):
 
         return devices
 
-    @backoff.on_exception(
-        backoff.constant,
-        Exception,
-        jitter=None,
-        interval=3,
-        max_tries=5,
-    )
     async def _fetch_devices(self, url):
-        """
-        Query the GraVal bootstrap API for device info.
-        """
-        if settings.gpu_tee_only:
-            raise TEEBootstrapFailure(
-                "GPU TEE 1.11 cannot use miner-keypair GraVal authentication."
-            )
-        nonce = str(int(time.time()))
-        headers = {
-            cst.MINER_HEADER: settings.miner_ss58,
-            cst.VALIDATOR_HEADER: settings.miner_ss58,
-            cst.NONCE_HEADER: nonce,
-        }
-        headers[cst.SIGNATURE_HEADER] = settings.miner_keypair.sign(
-            ":".join([settings.miner_ss58, settings.miner_ss58, nonce, "graval"])
-        ).hex()
-        logger.debug(f"Authenticating: {headers}")
-        async with aiohttp.ClientSession(raise_for_status=True) as session:
-            async with session.get(url, headers=headers, timeout=5) as response:
-                return (await response.json())["devices"]
+        """Reject the retired wallet-authenticated GraVal device endpoint."""
+
+        raise UnsupportedRuntime(
+            "wallet-authenticated GraVal bootstrap is unsupported by the seedless miner runtime"
+        )
 
     async def verify_with_validator(self):
         """
