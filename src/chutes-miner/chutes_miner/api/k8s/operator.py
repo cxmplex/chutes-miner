@@ -60,6 +60,10 @@ from chutes_miner.api.k8s.util import (
     resolve_deployment_validator,
     validated_miner_launch_lineage,
 )
+from chutes_miner.api.registry_scopes import (
+    record_registry_scope_revoked,
+    request_registry_scope_revocation,
+)
 from kubernetes import watch
 from kubernetes.client import (
     ApiClient,
@@ -1529,6 +1533,7 @@ class K8sOperator(abc.ABC):
         expected_lineage = {
             "schema": "chutes.miner-launch-lineage",
             "version": 1,
+            "deployment_id": intent.deployment_id if intent is not None else None,
             "miner_hotkey": settings.miner_ss58,
             "validator": chute.validator,
             "chute_id": chute.chute_id,
@@ -1570,7 +1575,7 @@ class K8sOperator(abc.ABC):
             )
         ):
             raise DeploymentFailure("durable miner launch intent lineage conflicts")
-        deployment_id = str(uuid.uuid4())
+        deployment_id = intent.deployment_id
         gpu_candidates = [gpu for gpu in server.gpus if gpu.gpu_id in available_gpus][
             : chute.gpu_count
         ]
@@ -1697,6 +1702,7 @@ class K8sOperator(abc.ABC):
         expected_lineage = {
             "schema": "chutes.miner-launch-lineage",
             "version": 1,
+            "deployment_id": deployment.deployment_id,
             "miner_hotkey": settings.miner_ss58,
             "validator": deployment.validator,
             "chute_id": deployment.chute_id,
@@ -2562,6 +2568,10 @@ class K8sOperator(abc.ABC):
         validator_hotkey: str,
         config_id: str,
     ) -> None:
+        await request_registry_scope_revocation(
+            launch_config_id=config_id,
+            validator=validator_hotkey,
+        )
         validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
             raise DeploymentFailure("registry scope validator is unavailable")
@@ -2581,6 +2591,7 @@ class K8sOperator(abc.ABC):
                     raise DeploymentFailure(
                         "registry scope revocation failed for aborted deployment"
                     )
+        await record_registry_scope_revoked(config_id, result)
 
 
 # Legacy single-cluster implementation

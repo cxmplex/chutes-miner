@@ -32,10 +32,19 @@ from chutes_miner.api.k8s.util import canonical_miner_launch_sha256
 
 
 @contextmanager
-def _mock_durable_launch(mock_db_session, deployment, chute, server):
+def _mock_durable_launch(
+    mock_db_session,
+    deployment,
+    chute,
+    server,
+    deployment_id="11111111-1111-4111-8111-111111111111",
+):
+    if deployment is not None:
+        deployment_id = str(deployment.deployment_id)
     lineage = {
         "schema": "chutes.miner-launch-lineage",
         "version": 1,
+        "deployment_id": deployment_id,
         "miner_hotkey": settings.miner_ss58,
         "validator": chute.validator,
         "chute_id": chute.chute_id,
@@ -68,7 +77,7 @@ def _mock_durable_launch(mock_db_session, deployment, chute, server):
             lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": "config-1", "registry": None},
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
-            deployment_id=None,
+            deployment_id=deployment_id,
             last_failure=None,
         )
     )
@@ -812,7 +821,13 @@ async def test_deploy_chute_deployment_disappeared(
     # Call the function and expect exception
     with (
         patch("chutes_miner.api.k8s.operator.uuid.uuid4", return_value=deployment_id),
-        _mock_durable_launch(mock_db_session, None, sample_chute, sample_server),
+        _mock_durable_launch(
+            mock_db_session,
+            None,
+            sample_chute,
+            sample_server,
+            deployment_id=deployment_id,
+        ),
         patch.object(
             K8sOperator,
             "_clear_deployment",

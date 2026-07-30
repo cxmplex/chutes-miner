@@ -46,6 +46,11 @@ from chutes_miner.api.k8s.util import (
     registry_pull_secret_name,
     validated_miner_launch_lineage,
 )
+from chutes_miner.api.registry_scopes import (
+    record_registry_scope_revoked,
+    request_registry_scope_revocation,
+    request_registry_scope_revocation_in_session,
+)
 from kubernetes.client import V1DeleteOptions, V1Preconditions
 from kubernetes.client.rest import ApiException
 from loguru import logger
@@ -1031,6 +1036,14 @@ class DeploymentTeardownCoordinator:
         deployment: Deployment,
         reason: str,
     ) -> DeploymentTeardownOperation:
+        if settings.gpu_tee_only and deployment.config_id:
+            await request_registry_scope_revocation_in_session(
+                session,
+                launch_config_id=deployment.config_id,
+                validator=deployment.validator,
+                server_id=deployment.server_id,
+                deployment_id=deployment.deployment_id,
+            )
         launch = None
         launch_intent = None
         launch_phase_at_request = None
@@ -1901,6 +1914,12 @@ class DeploymentTeardownCoordinator:
     async def _revoke_registry(self, operation: DeploymentTeardownOperation) -> dict[str, Any]:
         if not operation.config_id or not settings.gpu_tee_only:
             return {"status": "not_required", "config_id": operation.config_id}
+        await request_registry_scope_revocation(
+            launch_config_id=operation.config_id,
+            validator=operation.validator,
+            server_id=operation.server_id,
+            deployment_id=operation.deployment_id,
+        )
         validator = validator_by_hotkey(operation.validator)
         if validator is None:
             raise DeploymentFailure("registry scope validator is unavailable")
@@ -1920,6 +1939,7 @@ class DeploymentTeardownCoordinator:
                     "launch_config_id": operation.config_id,
                 }:
                     raise DeploymentFailure("registry scope revocation was not acknowledged")
+        await record_registry_scope_revoked(operation.config_id, payload)
         return payload
 
     async def _delete_validator_instance(

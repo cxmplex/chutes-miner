@@ -35,11 +35,21 @@ from chutes_miner.api.k8s.util import (
     resolve_deployment_validator,
     validated_miner_launch_lineage,
 )
+from chutes_miner.api.registry_scopes import (
+    ensure_registry_scope_registration_in_session,
+    record_registry_scope_failure,
+    record_registry_scope_registered,
+    record_registry_scope_registered_in_session,
+    record_registry_scope_revoked,
+    registry_scope_work_items,
+    request_registry_scope_revocation,
+)
 from chutes_miner.api.redis_pubsub import RedisListener
 from chutes_miner.api.schema_barrier import (
     wait_for_required_schema,
     wait_for_seedless_adoption,
 )
+from chutes_miner.leader import run_gepetto_leader_loop
 from chutes_miner.validator_migrations import run_validator_migrations
 from loguru import logger
 from sqlalchemy import case, func, select, text, update
@@ -118,11 +128,13 @@ class Gepetto:
             await run_validator_migrations()
         await self.resume_launch_intents()
         await self.teardown.resume_pending()
+        await self.reconcile_registry_scope_intents(reconstruct_active=True)
         await k8s.purge_legacy_source_config_maps()
         await self.reconcile()
-        asyncio.create_task(self.autoscaler())
-        asyncio.create_task(self.reconciler())
-        await self.pubsub.start()
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.autoscaler())
+            tasks.create_task(self.reconciler())
+            tasks.create_task(self.pubsub.start())
 
     @staticmethod
     async def _remote_refresh_objects(
@@ -422,6 +434,32 @@ class Gepetto:
                 .scalar_one_or_none()
             )
 
+    async def _send_registry_scope_registration(
+        self,
+        validator: Validator,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        headers, serialized = sign_request(payload=body, purpose="registry")
+        service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
+        async with aiohttp.ClientSession(raise_for_status=False) as session:
+            async with session.post(
+                f"http://{service}/registry/scopes",
+                data=serialized,
+                headers=headers,
+            ) as response:
+                result = await response.json()
+                if (
+                    response.status != 200
+                    or not isinstance(result, dict)
+                    or set(result) != {"registered", "launch_config_id", "expires_at"}
+                    or result["registered"] is not True
+                    or result["launch_config_id"] != body["launch_config_id"]
+                ):
+                    raise DeploymentFailure(
+                        "Registry broker rejected the exact launch-config scope."
+                    )
+                return result
+
     async def _register_registry_scope(
         self,
         validator: Validator,
@@ -443,35 +481,19 @@ class Gepetto:
             "repository": registry["repository"],
             "manifest_digest": registry["manifest_digest"],
         }
-        headers, serialized = sign_request(
-            payload=body,
-            purpose="registry",
-        )
-        service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
-            async with session.post(
-                f"http://{service}/registry/scopes",
-                data=serialized,
-                headers=headers,
-            ) as response:
-                result = await response.json()
-                if (
-                    response.status != 200
-                    or not isinstance(result, dict)
-                    or set(result) != {"registered", "launch_config_id", "expires_at"}
-                    or result["registered"] is not True
-                    or result["launch_config_id"] != payload["config_id"]
-                ):
-                    raise DeploymentFailure(
-                        "Registry broker rejected the exact launch-config scope."
-                    )
-                return result
+        return await self._send_registry_scope_registration(validator, body)
 
     @staticmethod
-    def _launch_lineage(chute: Chute, server: Server, job_id: str | None) -> dict[str, Any]:
+    def _launch_lineage(
+        chute: Chute,
+        server: Server,
+        job_id: str | None,
+        deployment_id: str | None,
+    ) -> dict[str, Any]:
         return {
             "schema": "chutes.miner-launch-lineage",
             "version": 1,
+            "deployment_id": deployment_id,
             "miner_hotkey": settings.miner_ss58,
             "validator": chute.validator,
             "chute_id": chute.chute_id,
@@ -504,9 +526,16 @@ class Gepetto:
         chute: Chute,
         server: Server,
         job_id: str | None,
+        deployment_id: str,
     ) -> str:
         """Persist/reuse one request UUID before any validator or registry call."""
-        lineage = self._launch_lineage(chute, server, job_id)
+        try:
+            canonical_deployment_id = str(uuid.UUID(deployment_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DeploymentFailure("miner deployment identity is not a UUID") from exc
+        if canonical_deployment_id != deployment_id:
+            raise DeploymentFailure("miner deployment identity is not canonical")
+        lineage = self._launch_lineage(chute, server, job_id, deployment_id)
         lineage_sha256 = _canonical_sha256(lineage)
         async with get_session() as session:
             await session.execute(
@@ -549,6 +578,7 @@ class Gepetto:
                     chute_version=chute.version,
                     server_id=server.server_id,
                     job_id=job_id,
+                    deployment_id=deployment_id,
                     request_payload=request_payload,
                     request_sha256=_canonical_sha256(request_payload),
                     lineage_sha256=lineage_sha256,
@@ -564,7 +594,7 @@ class Gepetto:
         job_id: str,
     ) -> str:
         """Persist validator job cleanup when launch validation fails pre-request."""
-        lineage = self._launch_lineage(chute, server, job_id)
+        lineage = self._launch_lineage(chute, server, job_id, None)
         lineage_sha256 = _canonical_sha256(lineage)
         async with get_session() as session:
             await session.execute(
@@ -645,6 +675,8 @@ class Gepetto:
             if intent.phase not in {"registry_acked", "cleanup_required"}:
                 intent.phase = "response_persisted"
             intent.last_failure = None
+            if settings.gpu_tee_only:
+                await ensure_registry_scope_registration_in_session(session, intent, payload)
             await session.commit()
 
     async def _record_registry_ack(
@@ -664,8 +696,21 @@ class Gepetto:
                 raise DeploymentFailure(
                     "registry ACK arrived in an invalid launch phase"
                 )
+            expected_config_id = (intent.response_payload or {}).get("config_id")
+            if (
+                not isinstance(ack, dict)
+                or ack.get("launch_config_id") != expected_config_id
+            ):
+                raise DeploymentFailure("registry ACK changed the launch config authority")
             if intent.registry_ack is not None and intent.registry_ack != ack:
                 raise DeploymentFailure("registry replay changed the launch ACK")
+            if settings.gpu_tee_only:
+                await record_registry_scope_registered_in_session(
+                    session,
+                    expected_config_id,
+                    ack,
+                    launch_intent_id=intent_id,
+                )
             intent.registry_ack = ack
             intent.phase = "registry_acked"
             intent.last_failure = None
@@ -709,6 +754,7 @@ class Gepetto:
                 chute_id = intent.chute_id
                 server_id = intent.server_id
                 job_id = intent.job_id
+                deployment_id = intent.deployment_id
                 validator_hotkey = intent.validator
                 job_cleanup_only = bool(getattr(intent, "job_cleanup_only", False))
                 job_release_ack = intent.job_release_ack
@@ -726,6 +772,7 @@ class Gepetto:
                     server_id=server_id,
                     job_id=job_id,
                     intent_id=intent_id,
+                    deployment_id=deployment_id,
                 )
                 await self._record_launch_response(intent_id, payload)
                 stable_response = {
@@ -819,6 +866,10 @@ class Gepetto:
     ) -> None:
         if not settings.gpu_tee_only:
             return
+        await request_registry_scope_revocation(
+            launch_config_id=launch_config_id,
+            validator=validator_hotkey,
+        )
         validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
             raise DeploymentFailure("Registry scope validator is unavailable.")
@@ -837,6 +888,7 @@ class Gepetto:
                     raise DeploymentFailure(
                         "Registry broker did not revoke exact launch lifecycle."
                     )
+        await record_registry_scope_revoked(launch_config_id, result)
 
     async def _fetch_launch_config(
         self,
@@ -846,6 +898,7 @@ class Gepetto:
         server_id: str,
         job_id: str | None,
         intent_id: str,
+        deployment_id: str,
     ) -> dict[str, Any]:
         """Replay one persisted validator request without recomputing its lineage."""
         async with aiohttp.ClientSession(raise_for_status=False) as session:
@@ -854,6 +907,7 @@ class Gepetto:
             if job_id:
                 params["job_id"] = job_id
             params["miner_launch_request_id"] = intent_id
+            params["miner_deployment_id"] = deployment_id
             async with session.get(
                 f"{validator.api}/instances/launch_config",
                 headers=headers,
@@ -915,6 +969,7 @@ class Gepetto:
         chute: Chute,
         server: Server,
         job_id: str = None,
+        deployment_id: str | None = None,
     ):
         """
         Fetch the validator-issued launch config required to deliver source.
@@ -922,7 +977,10 @@ class Gepetto:
         require_supported_chutes_version(chute.chutes_version, chute.chute_id)
         if (validator := validator_by_hotkey(chute.validator)) is None:
             raise DeploymentFailure(f"Validator not found: {chute.validator}")
-        intent_id = await self._begin_launch_intent(chute, server, job_id)
+        deployment_id = deployment_id or str(uuid.uuid4())
+        intent_id = await self._begin_launch_intent(
+            chute, server, job_id, deployment_id
+        )
         try:
             payload = await self._fetch_launch_config(
                 validator=validator,
@@ -930,6 +988,7 @@ class Gepetto:
                 server_id=server.server_id,
                 job_id=job_id,
                 intent_id=intent_id,
+                deployment_id=deployment_id,
             )
             await self._record_launch_response(intent_id, payload)
             registry_ack = await self._register_registry_scope(
@@ -939,6 +998,7 @@ class Gepetto:
             )
             await self._record_registry_ack(intent_id, registry_ack)
             payload["_miner_launch_request_id"] = intent_id
+            payload["_miner_deployment_id"] = deployment_id
             return payload
         except DeploymentFailure as exc:
             await self._record_launch_intent_failure(intent_id, exc)
@@ -2443,7 +2503,12 @@ class Gepetto:
         """Return observed config IDs, or None when the pod inventory is unavailable."""
         try:
             pods = K8sOperator().get_pods(label_selector="chutes/config-id")
-            return {pod.metadata.labels["chutes/config-id"] for pod in pods.items}
+            return {
+                pod.metadata.labels["chutes/config-id"]
+                for pod in pods.items
+                if getattr(pod.metadata, "deletion_timestamp", None) is None
+                and getattr(pod.status, "phase", None) in {"Pending", "Running"}
+            }
         except Exception as exc:
             logger.error(f"Failed to get pods by config-id label: {exc}")
             return None
@@ -2454,12 +2519,51 @@ class Gepetto:
     ) -> bool:
         return bool(k8s_config_ids is not None and config_id and config_id not in k8s_config_ids)
 
+    async def reconcile_registry_scope_intents(self, *, reconstruct_active: bool) -> None:
+        if not settings.gpu_tee_only:
+            return
+        for item in await registry_scope_work_items(reconstruct_active=reconstruct_active):
+            try:
+                validator = validator_by_hotkey(item.validator)
+                if validator is None:
+                    raise DeploymentFailure("registry scope validator is unavailable")
+                if item.desired_state == "revoked":
+                    await self._revoke_registry_scope(
+                        item.validator, item.launch_config_id
+                    )
+                    continue
+                body = {
+                    "schema": "chutes.miner-registry-scope",
+                    "version": 1,
+                    "server_id": item.server_id,
+                    "launch_config_id": item.launch_config_id,
+                    "repository": item.repository,
+                    "manifest_digest": item.manifest_digest,
+                }
+                if not all(
+                    body[key]
+                    for key in ("server_id", "repository", "manifest_digest")
+                ):
+                    raise DeploymentFailure(
+                        "active registry scope lacks exact reconstruction identity"
+                    )
+                ack = await self._send_registry_scope_registration(validator, body)
+                await record_registry_scope_registered(item.launch_config_id, ack)
+            except Exception as exc:
+                await record_registry_scope_failure(item.launch_config_id, exc)
+                logger.warning(
+                    "registry scope {} reconciliation paused for retry: {}",
+                    item.launch_config_id,
+                    exc,
+                )
+
     async def reconcile(self):
         """
         Put our local system back in harmony with the validators.
         """
         await self.resume_aborted_launch_intents()
         await self.teardown.resume_pending()
+        await self.reconcile_registry_scope_intents(reconstruct_active=False)
         try:
             await self.remote_refresh_all()
         except Exception as exc:
@@ -3075,8 +3179,7 @@ class Gepetto:
 
 
 async def main():
-    gepetto = Gepetto()
-    await gepetto.run()
+    await run_gepetto_leader_loop(engine, lambda: Gepetto().run())
 
 
 def run():

@@ -16,6 +16,7 @@ import chutes_miner.gepetto as gepetto_module
 from chutes_miner.gepetto import Gepetto
 
 
+DEPLOYMENT_ID = "11111111-1111-4111-8111-111111111111"
 VALIDATOR = "test_validator"
 
 
@@ -193,10 +194,13 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "config_id": "config-1",
     }
 
-    assert await gepetto.get_launch_token(_chute(), _server()) == {
+    assert await gepetto.get_launch_token(
+        _chute(), _server(), deployment_id=DEPLOYMENT_ID
+    ) == {
         "token": "launch-token",
         "config_id": "config-1",
         "_miner_launch_request_id": "request-1",
+        "_miner_deployment_id": DEPLOYMENT_ID,
     }
 
     mock_aiohttp_response.json.return_value = {
@@ -205,7 +209,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "code": "print('legacy placeholder')",
     }
     with pytest.raises(DeploymentFailure, match="expected exactly"):
-        await gepetto.get_launch_token(_chute(), _server())
+        await gepetto.get_launch_token(_chute(), _server(), deployment_id=DEPLOYMENT_ID)
     gepetto.abort_launch_intent.assert_awaited_once_with("request-1")
 
     mock_aiohttp_response.json.return_value = {
@@ -214,7 +218,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "storage_session": "must-arrive-only-after-verified-launch",
     }
     with pytest.raises(DeploymentFailure, match="expected exactly"):
-        await gepetto.get_launch_token(_chute(), _server())
+        await gepetto.get_launch_token(_chute(), _server(), deployment_id=DEPLOYMENT_ID)
 
 
 @pytest.mark.asyncio
@@ -254,7 +258,9 @@ async def test_launch_token_replay_uses_persisted_request_id(
         "config_id": "config-1",
     }
 
-    await gepetto.get_launch_token(_chute(), _server(), job_id="job-1")
+    await gepetto.get_launch_token(
+        _chute(), _server(), job_id="job-1", deployment_id=DEPLOYMENT_ID
+    )
 
     request = mock_aiohttp_client_session.return_value.get
     assert request.call_args.kwargs["params"] == {
@@ -262,6 +268,7 @@ async def test_launch_token_replay_uses_persisted_request_id(
         "server_id": "server-1",
         "job_id": "job-1",
         "miner_launch_request_id": "request-1",
+        "miner_deployment_id": DEPLOYMENT_ID,
     }
     gepetto._record_launch_response.assert_awaited_once()
     gepetto._record_registry_ack.assert_awaited_once()
@@ -758,6 +765,7 @@ class _ClaimSession:
             "server_id": server.server_id,
             "kubernetes_node_uid": server.kubernetes_node_uid,
             "kubernetes_node_generation": server.kubernetes_node_generation,
+            "deployment_id": DEPLOYMENT_ID,
             "gpu_allocation_group_id": server.gpu_allocation_group_id,
             "gpu_allocation_group_generation": server.gpu_allocation_group_generation,
             "job_id": job_id,
@@ -781,7 +789,7 @@ class _ClaimSession:
             lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": None, "registry": None},
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
-            deployment_id=None,
+            deployment_id=DEPLOYMENT_ID,
             last_failure=None,
         )
 

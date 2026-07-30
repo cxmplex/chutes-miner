@@ -23,10 +23,19 @@ from chutes_common.k8s import serializer
 
 
 @contextmanager
-def _mock_durable_launch(mock_db_session, deployment, chute, server):
+def _mock_durable_launch(
+    mock_db_session,
+    deployment,
+    chute,
+    server,
+    deployment_id="11111111-1111-4111-8111-111111111111",
+):
+    if deployment is not None:
+        deployment_id = str(deployment.deployment_id)
     lineage = {
         "schema": "chutes.miner-launch-lineage",
         "version": 1,
+        "deployment_id": deployment_id,
         "miner_hotkey": settings.miner_ss58,
         "validator": chute.validator,
         "chute_id": chute.chute_id,
@@ -59,7 +68,7 @@ def _mock_durable_launch(mock_db_session, deployment, chute, server):
             lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": "config-1", "registry": None},
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
-            deployment_id=None,
+            deployment_id=deployment_id,
             last_failure=None,
         )
     )
@@ -597,13 +606,20 @@ async def test_deploy_chute_deployment_disappeared(
     mock_k8s_core_client.read_node.return_value = serializer.deserialize(nodes[0], "V1Node")
 
     pods = create_api_test_pods(1)
+    deployment_id = pods[0]["metadata"]["labels"]["chutes/deployment-id"]
     mock_k8s_core_client.list_namespaced_pod.return_value = V1PodList(
         items=serializer.deserialize(pods, "list[V1Pod]")
     )
 
     # Call the function and expect exception
     with (
-        _mock_durable_launch(mock_db_session, None, sample_chute, sample_server),
+        _mock_durable_launch(
+            mock_db_session,
+            None,
+            sample_chute,
+            sample_server,
+            deployment_id=deployment_id,
+        ),
         patch.object(
             K8sOperator,
             "_clear_deployment",

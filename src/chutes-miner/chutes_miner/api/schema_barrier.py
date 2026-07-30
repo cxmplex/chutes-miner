@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 
-REQUIRED_SCHEMA_VERSION = "20260727120000"
+REQUIRED_SCHEMA_VERSION = "20260730120000"
 _SCHEMA_MIGRATIONS_PRESENT = text(
     "SELECT to_regclass('schema_migrations') IS NOT NULL"
 )

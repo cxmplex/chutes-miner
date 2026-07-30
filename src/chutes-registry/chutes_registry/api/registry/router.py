@@ -7,10 +7,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import ssl
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -23,6 +25,7 @@ from chutes_common.settings import miner_settings as settings
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 _scopes: dict[str, dict] = {}
 _scope_lock = asyncio.Lock()
@@ -84,7 +87,7 @@ def _persist_scopes() -> None:
             pass
 
 
-def _load_scopes() -> None:
+def _load_scopes_unchecked() -> None:
     global _scopes_loaded
     if _scopes_loaded:
         return
@@ -126,6 +129,31 @@ def _load_scopes() -> None:
     if len(_scopes) != len(loaded):
         _persist_scopes()
 
+def _quarantine_corrupt_scope_cache(path: Path, exc: Exception) -> None:
+    quarantine = path.with_name(f"{path.name}.corrupt-{time.time_ns()}-{os.getpid()}")
+    try:
+        os.replace(path, quarantine)
+    except FileNotFoundError:
+        return
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    logger.error("quarantined corrupt registry scope cache %s as %s: %s", path, quarantine, exc)
+
+
+def _load_scopes() -> None:
+    global _scopes_loaded
+    if _scopes_loaded:
+        return
+    path = Path(settings.registry_scopes_file)
+    try:
+        _load_scopes_unchecked()
+    except (json.JSONDecodeError, UnicodeError, RuntimeError, TypeError, ValueError) as exc:
+        _quarantine_corrupt_scope_cache(path, exc)
+        _scopes.clear()
+        _scopes_loaded = True
 
 def _garbage_collect_scopes(now: datetime) -> bool:
     removed = [
@@ -500,11 +528,6 @@ async def revoke_registry_scope(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Registry scope revocation requires current attested identity.",
         )
-    async with _scope_lock:
-        _load_scopes()
-        _scopes.pop(launch_config_id, None)
-        _garbage_collect_scopes(datetime.now(timezone.utc))
-        _persist_scopes()
     validator = settings.validators[0]
     context = ssl.create_default_context()
     context.load_cert_chain(settings.attested_cert_file, settings.attested_key_file)
@@ -525,6 +548,11 @@ async def revoke_registry_scope(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Validator rejected exact registry scope revocation.",
                 )
+    async with _scope_lock:
+        _load_scopes()
+        _scopes.pop(launch_config_id, None)
+        _garbage_collect_scopes(datetime.now(timezone.utc))
+        _persist_scopes()
     return result
 
 

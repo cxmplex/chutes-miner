@@ -64,7 +64,7 @@ def test_barrier_uses_exact_version_not_maximum():
     sql = str(schema_barrier._REQUIRED_SCHEMA_VERSION_PRESENT)
     assert "WHERE version = :required_version" in sql
     assert "MAX(" not in sql.upper()
-    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260727120000"
+    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730120000"
     adoption_sql = str(schema_barrier._SEEDLESS_ADOPTION_PRESENT)
     assert "array_agg(gpu.hardware_uuid ORDER BY gpu.hardware_uuid)" in adoption_sql
     assert "server.registration_attestation_id = :attestation_id" in adoption_sql
@@ -109,7 +109,17 @@ def test_all_api_workers_and_gepetto_wait_before_work():
     validator_migrations = run_source.index("await run_validator_migrations()")
     launch_resume = run_source.index("await self.resume_launch_intents()")
     resume = run_source.index("await self.teardown.resume_pending()")
-    assert gepetto_wait < gepetto_adoption < validator_migrations < launch_resume < resume
+    scope_rebuild = run_source.index(
+        "await self.reconcile_registry_scope_intents(reconstruct_active=True)"
+    )
+    assert (
+        gepetto_wait
+        < gepetto_adoption
+        < validator_migrations
+        < launch_resume
+        < resume
+        < scope_rebuild
+    )
 
 
 @pytest.mark.asyncio
@@ -139,6 +149,7 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     coordinator = object.__new__(gepetto.Gepetto)
     coordinator.resume_launch_intents = AsyncMock()
     coordinator.teardown = SimpleNamespace(resume_pending=AsyncMock())
+    coordinator.reconcile_registry_scope_intents = AsyncMock()
     coordinator.reconcile = AsyncMock()
     coordinator.autoscaler = AsyncMock()
     coordinator.reconciler = AsyncMock()
@@ -151,10 +162,14 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     coordinator.reconcile.assert_not_awaited()
 
     release_adoption.set()
+    coordinator.reconcile_registry_scope_intents.assert_not_awaited()
     await task
     coordinator.resume_launch_intents.assert_awaited_once()
     coordinator.teardown.resume_pending.assert_awaited_once()
     coordinator.reconcile.assert_awaited_once()
+    coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(
+        reconstruct_active=True
+    )
 
 
 def test_api_chart_keeps_liveness_open_and_readiness_schema_gated():

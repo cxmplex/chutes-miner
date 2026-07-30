@@ -228,10 +228,16 @@ async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
     monkeypatch,
 ):
     monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    deployment_id = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation_in_session",
+        AsyncMock(),
+    )
     deployment = SimpleNamespace(
         launch_operation_id="launch-1",
         teardown_operation_id=None,
-        deployment_id="deployment-1",
+        deployment_id=deployment_id,
         validator="validator-1",
         server_id="server-1",
         chute_id="chute-1",
@@ -252,7 +258,7 @@ async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
     )
     launch = SimpleNamespace(
         operation_id="launch-1",
-        deployment_id="deployment-1",
+        deployment_id=deployment_id,
         launch_intent_id="intent-1",
         phase="created",
         lease_owner=None,
@@ -274,6 +280,7 @@ async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
         "version": 1,
         "miner_hotkey": teardown.settings.miner_ss58,
         "validator": "validator-1",
+        "deployment_id": deployment_id,
         "chute_id": "chute-1",
         "chute_version": "1.0.0",
         "server_id": "server-1",
@@ -290,7 +297,7 @@ async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
     }
     intent = SimpleNamespace(
         intent_id="intent-1",
-        deployment_id="deployment-1",
+        deployment_id=deployment_id,
         phase="completed",
         validator="validator-1",
         chute_id="chute-1",
@@ -331,7 +338,7 @@ async def test_teardown_after_supported_rotation_uses_original_launch_lineage(
         gpu_id="gpu-1",
         hardware_uuid="GPU-1",
         server_id="server-1",
-        deployment_id="deployment-1",
+        deployment_id=deployment_id,
         validator="validator-1",
         gpu_allocation_group_id="group-2",
         gpu_allocation_group_generation=2,

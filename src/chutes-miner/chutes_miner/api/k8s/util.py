@@ -1,6 +1,7 @@
 import hashlib
 import re
 from typing import Any, Optional
+from uuid import UUID
 
 import orjson
 from chutes_common.schemas.chute import Chute
@@ -41,6 +42,7 @@ MINER_LAUNCH_LINEAGE_FIELDS = frozenset(
     {
         "schema",
         "version",
+        "deployment_id",
         "miner_hotkey",
         "validator",
         "chute_id",
@@ -94,7 +96,24 @@ def validated_miner_launch_lineage(
         != canonical_miner_launch_sha256(lineage)
     ):
         raise DeploymentFailure("durable miner launch lineage is invalid")
+    expected_deployment_id = getattr(intent, "deployment_id", None)
+    if job_cleanup_only:
+        if expected_deployment_id is not None or lineage.get("deployment_id") is not None:
+            raise DeploymentFailure("durable cleanup lineage has deployment authority")
+    else:
+        try:
+            canonical_deployment_id = str(UUID(expected_deployment_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DeploymentFailure(
+                "durable miner deployment identity is invalid"
+            ) from exc
+        if (
+            canonical_deployment_id != expected_deployment_id
+            or lineage.get("deployment_id") != expected_deployment_id
+        ):
+            raise DeploymentFailure("durable miner deployment identity changed")
     expected = {
+        "deployment_id": expected_deployment_id,
         "miner_hotkey": miner_hotkey,
         "validator": validator,
         "chute_id": chute_id,

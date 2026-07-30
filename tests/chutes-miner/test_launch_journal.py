@@ -56,6 +56,8 @@ LABELS = {
     "chutes/config-id": "config-1",
 }
 
+DEPLOYMENT_UUID = "11111111-1111-4111-8111-111111111111"
+
 
 class _QueryResult:
     def __init__(self, value):
@@ -89,6 +91,7 @@ def _canonical_intent(
     lineage = {
         "schema": "chutes.miner-launch-lineage",
         "version": 1,
+        "deployment_id": None if job_cleanup_only else DEPLOYMENT_UUID,
         "miner_hotkey": gepetto_module.settings.miner_ss58,
         "validator": validator,
         "chute_id": chute_id,
@@ -128,7 +131,7 @@ def _canonical_intent(
         "registry_ack": None,
         "job_release_ack": None,
         "job_released_at": None,
-        "deployment_id": None,
+        "deployment_id": None if job_cleanup_only else DEPLOYMENT_UUID,
         "completed_at": None,
         "last_failure": None,
     }
@@ -560,7 +563,7 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
 ):
     monkeypatch.setattr(operator_module.settings, "gpu_tee_only", True)
     deployment = SimpleNamespace(
-        deployment_id="deployment-1",
+        deployment_id=DEPLOYMENT_UUID,
         launch_operation_id="launch-1",
         teardown_operation_id=None,
         validator="validator-1",
@@ -583,6 +586,7 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
     lineage = {
         "schema": "chutes.miner-launch-lineage",
         "version": 1,
+        "deployment_id": DEPLOYMENT_UUID,
         "miner_hotkey": operator_module.settings.miner_ss58,
         "validator": "validator-1",
         "chute_id": "chute-1",
@@ -601,7 +605,7 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
     }
     intent = SimpleNamespace(
         intent_id="intent-1",
-        deployment_id="deployment-1",
+        deployment_id=DEPLOYMENT_UUID,
         validator="validator-1",
         chute_id="chute-1",
         chute_version="1.0.0",
@@ -662,7 +666,7 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
     )
     with pytest.raises(DeploymentFailure, match="server/node lineage changed"):
         await K8sOperator._record_launch_resource(
-            operator, "deployment-1", "lease-1", "Service", readback
+            operator, DEPLOYMENT_UUID, "lease-1", "Service", readback
         )
 
     assert launch.service_uid == "service-uid-1"
@@ -683,7 +687,7 @@ async def test_noncanonical_launch_intent_fails_before_external_create(
 ):
     monkeypatch.setattr(operator_module.settings, "gpu_tee_only", True)
     deployment = SimpleNamespace(
-        deployment_id="deployment-1",
+        deployment_id=DEPLOYMENT_UUID,
         launch_operation_id="launch-1",
         teardown_operation_id=None,
         validator="validator-1",
@@ -707,6 +711,7 @@ async def test_noncanonical_launch_intent_fails_before_external_create(
         "schema": "chutes.miner-launch-lineage",
         "version": 1,
         "miner_hotkey": operator_module.settings.miner_ss58,
+        "deployment_id": DEPLOYMENT_UUID,
         "validator": "validator-1",
         "chute_id": "chute-1",
         "chute_version": "1.0.0",
@@ -724,7 +729,7 @@ async def test_noncanonical_launch_intent_fails_before_external_create(
     }
     intent = SimpleNamespace(
         intent_id="intent-1",
-        deployment_id="deployment-1",
+        deployment_id=DEPLOYMENT_UUID,
         validator="validator-1",
         chute_id="chute-1",
         chute_version="1.0.0",
@@ -782,7 +787,7 @@ async def test_noncanonical_launch_intent_fails_before_external_create(
     async def persist_then_create():
         await K8sOperator._persist_launch_resource_intent(
             operator,
-            "deployment-1",
+            DEPLOYMENT_UUID,
             "lease-1",
             "Service",
             _service(),
@@ -1061,6 +1066,7 @@ async def test_pending_launch_recovery_replays_persisted_identity_not_current_ro
         server_id="server-original",
         job_id="job-1",
         intent_id="intent-1",
+        deployment_id=DEPLOYMENT_UUID,
     )
     assert intent.phase == "completed"
     assert intent.job_release_ack == {"status": "released", "job_id": "job-1"}

@@ -515,6 +515,10 @@ class MinerLaunchIntent(Base):
             "AND deployment_id IS NULL)",
             name="ck_miner_launch_intent_job_cleanup_only",
         ),
+        CheckConstraint(
+            "job_cleanup_only OR deployment_id IS NOT NULL",
+            name="ck_miner_launch_intent_deployment_authority",
+        ),
         Index(
             "miner_launch_intent_recovery_idx",
             "phase",
@@ -526,6 +530,100 @@ class MinerLaunchIntent(Base):
             "lineage_sha256",
             unique=True,
             postgresql_where=text("phase NOT IN ('completed', 'failed')"),
+        ),
+    )
+
+
+class RegistryScopeIntent(Base):
+    """Database authority and durable outbox for one registry launch scope."""
+
+    __tablename__ = "registry_scope_intents"
+
+    launch_config_id = Column(String, primary_key=True)
+    launch_intent_id = Column(
+        String,
+        ForeignKey("miner_launch_intents.intent_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    deployment_id = Column(String, nullable=True)
+    validator = Column(String, nullable=False)
+    server_id = Column(String, nullable=True)
+    repository = Column(String, nullable=True)
+    manifest_digest = Column(String, nullable=True)
+    desired_state = Column(
+        String,
+        nullable=False,
+        default="active",
+        server_default="active",
+    )
+    phase = Column(
+        String,
+        nullable=False,
+        default="register_pending",
+        server_default="register_pending",
+    )
+    registration_ack = Column(JSONB, nullable=True)
+    registered_at = Column(DateTime(timezone=True), nullable=True)
+    revocation_ack = Column(JSONB, nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_failure = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "desired_state IN ('active', 'revoked')",
+            name="ck_registry_scope_desired_state",
+        ),
+        CheckConstraint(
+            "phase IN ('register_pending', 'active', 'revoke_pending', 'revoked')",
+            name="ck_registry_scope_phase",
+        ),
+        CheckConstraint(
+            "(desired_state = 'active' AND phase IN ('register_pending', 'active')) "
+            "OR (desired_state = 'revoked' AND phase IN ('revoke_pending', 'revoked'))",
+            name="ck_registry_scope_state_phase",
+        ),
+        CheckConstraint(
+            "desired_state = 'revoked' OR ("
+            "launch_intent_id IS NOT NULL AND deployment_id IS NOT NULL "
+            "AND server_id IS NOT NULL AND repository IS NOT NULL "
+            "AND manifest_digest ~ '^sha256:[0-9a-f]{64}$')",
+            name="ck_registry_scope_active_identity",
+        ),
+        CheckConstraint(
+            "(registration_ack IS NULL) = (registered_at IS NULL)",
+            name="ck_registry_scope_registration_ack",
+        ),
+        CheckConstraint(
+            "(revocation_ack IS NULL) = (revoked_at IS NULL)",
+            name="ck_registry_scope_revocation_ack",
+        ),
+        CheckConstraint(
+            "phase <> 'active' OR registration_ack IS NOT NULL",
+            name="ck_registry_scope_active_ack",
+        ),
+        CheckConstraint(
+            "phase <> 'revoked' OR revocation_ack IS NOT NULL",
+            name="ck_registry_scope_revoked_ack",
+        ),
+        Index(
+            "registry_scope_launch_intent_key",
+            "launch_intent_id",
+            unique=True,
+            postgresql_where=text("launch_intent_id IS NOT NULL"),
+        ),
+        Index(
+            "registry_scope_recovery_idx",
+            "desired_state",
+            "phase",
+            "updated_at",
+            postgresql_where=text("phase <> 'revoked'"),
         ),
     )
 
