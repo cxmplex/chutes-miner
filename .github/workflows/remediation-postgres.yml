@@ -1,0 +1,52 @@
+name: Remediation PostgreSQL
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, master]
+
+jobs:
+  miner-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: chutes_miner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d chutes_miner"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://user:password@127.0.0.1:5432/chutes_miner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      - name: Install test dependencies
+        run: poetry install --no-interaction
+      - name: Run mandatory miner migration suites on PostgreSQL
+        run: >-
+          poetry run pytest -q
+          tests/chutes-miner/*_postgres.py
+          tests/chutes-miner/test_legacy_chute_source_migration.py
+          --junitxml=miner-postgres.xml
+      - name: Reject skipped real-PostgreSQL tests
+        run: >-
+          poetry run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('miner-postgres.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} mandatory miner PostgreSQL tests skipped'"
