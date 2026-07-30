@@ -124,7 +124,11 @@ class Gepetto:
         """
         await wait_for_required_schema(engine)
         if settings.gpu_tee_only:
-            await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)
+            await wait_for_seedless_adoption(
+                engine,
+                settings.seedless_gpu_identity,
+                on_blocked=self.teardown.resume_pending,
+            )
         if settings.validator_migrations_enabled:
             await run_validator_migrations()
         await self.resume_launch_intents()

@@ -1,6 +1,7 @@
 import chutes_common.schemas.chute  # noqa: F401
 import chutes_common.schemas.deployment  # noqa: F401
 import chutes_common.schemas.gpu  # noqa: F401
+import chutes_common.schemas.gpu_adoption  # noqa: F401
 import chutes_common.schemas.server  # noqa: F401
 import chutes_common.schemas.teardown  # noqa: F401
 import chutes_common.schemas.validator_migration  # noqa: F401

@@ -5,10 +5,15 @@ import uuid
 from datetime import datetime, timezone
 
 from chutes_common.schemas.gpu import GPU
+from chutes_common.schemas.gpu_adoption import GPUAdoptionRetirement
 from chutes_common.schemas.server import Server, ServerNodeIdentity
 from chutes_miner.api.config import k8s_core_client, settings
 from chutes_miner.api.database import get_session
 from sqlalchemy import or_, select, text
+
+
+class SeedlessAdoptionBlocked(RuntimeError):
+    """A retryable adoption barrier caused by deployment-owned stale GPU rows."""
 
 
 def _control_plane_node():
@@ -79,6 +84,88 @@ def _node_resources(node, *, assigned_gpu_count: int) -> tuple[int, int, int]:
     )
 
 
+def _canonical_gpu_id(logical_server_id: str, hardware_uuid: str) -> str:
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"chutes:nvidia:{logical_server_id}:{hardware_uuid}",
+        )
+    )
+
+
+def _tracked_hardware_uuid(item, canonical_hardware_by_gpu_id: dict[str, str]) -> str | None:
+    device_info = item.device_info if isinstance(item.device_info, dict) else {}
+    return (
+        item.hardware_uuid
+        or device_info.get("uuid")
+        or (item.gpu_id if item.gpu_id.startswith("GPU-") else None)
+        or canonical_hardware_by_gpu_id.get(item.gpu_id)
+    )
+
+
+async def _retire_unassigned_tracked_gpus(
+    session,
+    *,
+    tracked: list[GPU],
+    identity: dict,
+    logical_server_id: str,
+) -> list[str]:
+    """Audit and remove stale rows only after proving they have no deployment."""
+
+    assigned = set(identity["gpu_uuids"])
+    canonical_hardware_by_gpu_id = {
+        _canonical_gpu_id(logical_server_id, hardware_uuid): hardware_uuid
+        for hardware_uuid in assigned
+    }
+    retireable: list[tuple[GPU, str | None]] = []
+    blockers: list[tuple[str, str]] = []
+    for item in tracked:
+        hardware_uuid = _tracked_hardware_uuid(item, canonical_hardware_by_gpu_id)
+        if hardware_uuid in assigned:
+            item.hardware_uuid = hardware_uuid
+            continue
+        if item.deployment_id is not None:
+            blockers.append((item.gpu_id, item.deployment_id))
+        else:
+            retireable.append((item, hardware_uuid))
+
+    if blockers:
+        summary = ", ".join(
+            f"gpu={gpu_id} deployment={deployment_id}"
+            for gpu_id, deployment_id in sorted(blockers)
+        )
+        raise SeedlessAdoptionBlocked(
+            "seedless GPU adoption is blocked by active/nonterminal deployment "
+            f"assignments outside the registrar GPU set: {summary}"
+        )
+
+    retired_ids: list[str] = []
+    for item, hardware_uuid in retireable:
+        session.add(
+            GPUAdoptionRetirement(
+                retirement_id=str(uuid.uuid4()),
+                server_id=logical_server_id,
+                gpu_id=item.gpu_id,
+                hardware_uuid=hardware_uuid,
+                deployment_id=item.deployment_id,
+                validator=item.validator,
+                device_info=item.device_info,
+                model_short_ref=item.model_short_ref,
+                verified=item.verified,
+                prior_gpu_allocation_group_id=item.gpu_allocation_group_id,
+                prior_gpu_allocation_group_generation=item.gpu_allocation_group_generation,
+                replacement_registration_attestation_id=identity["attestation_id"],
+                replacement_gpu_allocation_group_id=identity["allocation_group_id"],
+                replacement_gpu_allocation_group_generation=identity[
+                    "allocation_group_generation"
+                ],
+            )
+        )
+        await session.delete(item)
+        retired_ids.append(item.gpu_id)
+    return retired_ids
+
+
 async def adopt_seedless_gpu_server() -> str:
     """Bind one K3s node UID to the authenticated logical validator server."""
 
@@ -94,27 +181,15 @@ async def adopt_seedless_gpu_server() -> str:
     bound_id = labels.get("chutes/logical-server-id")
     if bound_id not in {None, logical_server_id}:
         raise RuntimeError("Kubernetes node is bound to another logical GPU server")
+    adopted_id = labels.get("chutes/seedless-adopted")
+    if adopted_id not in {None, logical_server_id}:
+        raise RuntimeError("Kubernetes node was adopted by another logical GPU server")
     if len(set(identity["gpu_uuids"])) != len(identity["gpu_uuids"]):
         raise RuntimeError("Registrar GPU assignment contains duplicate hardware UUIDs")
     gpu_count, cpu_per_gpu, memory_per_gpu = _node_resources(
         node,
         assigned_gpu_count=len(identity["gpu_uuids"]),
     )
-    if bound_id is None:
-        labels["chutes/logical-server-id"] = logical_server_id
-        node = k8s_core_client().patch_node(
-            node.metadata.name,
-            {"metadata": {"labels": labels}},
-        )
-        labels = dict(node.metadata.labels or labels)
-    if labels.get("chutes/seedless-adopted") != logical_server_id:
-        labels["chutes/seedless-adopted"] = logical_server_id
-        node = k8s_core_client().patch_node(
-            node.metadata.name,
-            {"metadata": {"labels": labels}},
-        )
-        labels = dict(node.metadata.labels or labels)
-
     async with get_session() as session:
         candidates = (
             (
@@ -249,44 +324,36 @@ async def adopt_seedless_gpu_server() -> str:
         server.gpu_allocation_group_generation = identity["allocation_group_generation"]
         server.validator = validator
         server.name = node.metadata.name
-        server.ip_address = labels.get("chutes/external-ip")
         server.status = "Ready"
-        server.labels = labels
         server.gpu_count = gpu_count
         server.cpu_per_gpu = cpu_per_gpu
         server.memory_per_gpu = memory_per_gpu
         server.hourly_cost = hourly_cost
         server.is_tee = True
-        assigned = set(identity["gpu_uuids"])
         tracked = (
-            (await session.execute(select(GPU).where(GPU.server_id == logical_server_id)))
+            (
+                await session.execute(
+                    select(GPU)
+                    .where(GPU.server_id == logical_server_id)
+                    .with_for_update(of=GPU)
+                )
+            )
             .unique()
             .scalars()
             .all()
         )
-        for item in tracked:
-            device_info = item.device_info if isinstance(item.device_info, dict) else {}
-            hardware_uuid = (
-                item.hardware_uuid
-                or device_info.get("uuid")
-                or (item.gpu_id if item.gpu_id.startswith("GPU-") else None)
-            )
-            if hardware_uuid not in assigned:
-                raise RuntimeError(
-                    "Logical GPU server has local devices outside its registrar assignment"
-                )
-            item.hardware_uuid = hardware_uuid
+        await _retire_unassigned_tracked_gpus(
+            session,
+            tracked=tracked,
+            identity=identity,
+            logical_server_id=logical_server_id,
+        )
         for gpu_uuid, identifier in zip(
             identity["gpu_uuids"],
             identity["gpu_identifiers"],
             strict=True,
         ):
-            local_gpu_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"chutes:nvidia:{logical_server_id}:{gpu_uuid}",
-                )
-            )
+            local_gpu_id = _canonical_gpu_id(logical_server_id, gpu_uuid)
             gpu = (
                 await session.execute(select(GPU).where(GPU.hardware_uuid == gpu_uuid))
             ).scalar_one_or_none()
@@ -321,5 +388,25 @@ async def adopt_seedless_gpu_server() -> str:
             gpu.verified = True
             gpu.gpu_allocation_group_id = identity["allocation_group_id"]
             gpu.gpu_allocation_group_generation = identity["allocation_group_generation"]
+
+        # The node labels are the external commit marker. Publish them only after every locked DB
+        # precondition (especially deployment-owned stale GPUs) has passed. GPU rows remain locked
+        # through the patch and commit, so a deployment cannot appear in the intervening window.
+        desired_labels = dict(labels)
+        desired_labels["chutes/logical-server-id"] = logical_server_id
+        desired_labels["chutes/seedless-adopted"] = logical_server_id
+        if desired_labels != labels:
+            node = k8s_core_client().patch_node(
+                node.metadata.name,
+                {"metadata": {"labels": desired_labels}},
+            )
+            labels = dict(getattr(node.metadata, "labels", None) or {})
+        if (
+            labels.get("chutes/logical-server-id") != logical_server_id
+            or labels.get("chutes/seedless-adopted") != logical_server_id
+        ):
+            raise RuntimeError("Kubernetes node did not persist the exact adoption labels")
+        server.ip_address = labels.get("chutes/external-ip")
+        server.labels = labels
         await session.commit()
     return logical_server_id

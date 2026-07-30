@@ -51,73 +51,297 @@ async def test_every_worker_waits_for_exact_seedless_adoption(monkeypatch):
         sleeps.append(delay)
 
     monkeypatch.setattr(schema_barrier, "seedless_adoption_is_present", fake_present)
+    blockers = AsyncMock(return_value=[])
+    monkeypatch.setattr(schema_barrier, "seedless_adoption_blockers", blockers)
+    engine = object()
+    identity = {"server_id": "server-1"}
     await schema_barrier.wait_for_seedless_adoption(
-        object(),
-        {"server_id": "server-1"},
+        engine,
+        identity,
         poll_seconds=0.125,
         sleep=fake_sleep,
     )
     assert sleeps == [0.125]
+    blockers.assert_awaited_once_with(engine, identity)
+
+
+@pytest.mark.asyncio
+async def test_adoption_wait_allows_only_supplied_teardown_progress(monkeypatch):
+    observed = iter([False, True])
+
+    async def fake_present(_engine, _identity):
+        return next(observed)
+
+    monkeypatch.setattr(schema_barrier, "seedless_adoption_is_present", fake_present)
+    monkeypatch.setattr(
+        schema_barrier,
+        "seedless_adoption_blockers",
+        AsyncMock(return_value=[("stale-gpu", "deployment-live")]),
+    )
+    teardown = AsyncMock()
+    sleep = AsyncMock()
+
+    await schema_barrier.wait_for_seedless_adoption(
+        object(),
+        {"server_id": "server-1"},
+        sleep=sleep,
+        on_blocked=teardown,
+    )
+
+    teardown.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adoption_wait_does_not_run_teardown_without_deployment_blockers(monkeypatch):
+    observed = iter([False, True])
+
+    async def fake_present(_engine, _identity):
+        return next(observed)
+
+    monkeypatch.setattr(schema_barrier, "seedless_adoption_is_present", fake_present)
+    monkeypatch.setattr(
+        schema_barrier,
+        "seedless_adoption_blockers",
+        AsyncMock(return_value=[]),
+    )
+    teardown = AsyncMock()
+    sleep = AsyncMock()
+
+    await schema_barrier.wait_for_seedless_adoption(
+        object(),
+        {"server_id": "server-1"},
+        sleep=sleep,
+        on_blocked=teardown,
+    )
+
+    teardown.assert_not_awaited()
+    sleep.assert_awaited_once()
 
 
 def test_barrier_uses_exact_version_not_maximum():
     sql = str(schema_barrier._REQUIRED_SCHEMA_VERSION_PRESENT)
     assert "WHERE version = :required_version" in sql
     assert "MAX(" not in sql.upper()
-    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730140000"
+    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730160000"
     adoption_sql = str(schema_barrier._SEEDLESS_ADOPTION_PRESENT)
     assert "array_agg(gpu.hardware_uuid ORDER BY gpu.hardware_uuid)" in adoption_sql
     assert "server.registration_attestation_id = :attestation_id" in adoption_sql
     assert "server.gpu_allocation_group_generation" in adoption_sql
     assert "chutes/seedless-adopted" in adoption_sql
+    blocker_sql = str(schema_barrier._SEEDLESS_ADOPTION_BLOCKERS)
+    assert "gpu.deployment_id IS NOT NULL" in blocker_sql
+    assert "canonical_gpu_ids" in blocker_sql
+
+
+@pytest.mark.asyncio
+async def test_active_stale_gpu_blockers_are_structured_for_readiness():
+    captured = {}
+
+    class Connection:
+        async def execute(self, statement, parameters):
+            captured["statement"] = statement
+            captured["parameters"] = parameters
+            return [
+                SimpleNamespace(
+                    gpu_id="stale-gpu",
+                    deployment_id="deployment-live",
+                )
+            ]
+
+    class Context:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Engine:
+        def connect(self):
+            return Context()
+
+    identity = {
+        "server_id": "server-1",
+        "validator": {"hotkey": "validator-1"},
+        "attestation_id": "attestation-1",
+        "allocation_group_id": "group-1",
+        "allocation_group_generation": 3,
+        "gpu_uuids": ["GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
+    }
+    assert await schema_barrier.seedless_adoption_blockers(Engine(), identity) == [
+        ("stale-gpu", "deployment-live")
+    ]
+    assert captured["statement"] is schema_barrier._SEEDLESS_ADOPTION_BLOCKERS
+    assert captured["parameters"]["server_id"] == "server-1"
+    assert captured["parameters"]["gpu_uuids"] == identity["gpu_uuids"]
+    assert len(captured["parameters"]["canonical_gpu_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_migration_leader_retries_only_deployment_owned_adoption_blockers(monkeypatch):
+    from chutes_miner.api import main
+    from chutes_miner.api.server.seedless_adoption import SeedlessAdoptionBlocked
+
+    adoption = AsyncMock(
+        side_effect=[
+            SeedlessAdoptionBlocked(
+                "gpu=stale-gpu deployment=deployment-live"
+            ),
+            "logical-server",
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(main, "adopt_seedless_gpu_server", adoption)
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    assert await main._adopt_seedless_gpu_server_with_retry() == "logical-server"
+    assert adoption.await_count == 2
+    sleep.assert_awaited_once_with(main.SEEDLESS_ADOPTION_RETRY_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_blocked_adoption_keeps_health_live_and_all_other_routes_unready():
+    from chutes_miner.api import main
+
+    state = SimpleNamespace(
+        schema_ready=False,
+        readiness_reason="seedless_adoption_blocked",
+    )
+    application = SimpleNamespace(state=state)
+    blocked_request = SimpleNamespace(
+        app=application,
+        url=SimpleNamespace(path="/deployments"),
+    )
+    call_next = AsyncMock()
+
+    response = await main.readiness_barrier(blocked_request, call_next)
+    assert response.status_code == 503
+    assert b"seedless_adoption_blocked" in response.body
+    call_next.assert_not_awaited()
+
+    health_request = SimpleNamespace(
+        app=application,
+        url=SimpleNamespace(path="/ready"),
+    )
+    health_response = await main.ready(health_request)
+    assert health_response.status_code == 503
+    assert b"seedless_adoption_blocked" in health_response.body
+
+    ping_next = AsyncMock(return_value="pong")
+    assert await main.readiness_barrier(
+        SimpleNamespace(app=application, url=SimpleNamespace(path="/ping")),
+        ping_next,
+    ) == "pong"
+    ping_next.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_adoption_opens_readiness_only_after_exact_barrier(monkeypatch):
+    from chutes_miner.api import main
+
+    application = SimpleNamespace(
+        state=SimpleNamespace(
+            schema_ready=False,
+            readiness_reason="seedless_adoption_blocked",
+            socket_tasks=[],
+        )
+    )
+    identity = {"server_id": "logical-server"}
+    adopt = AsyncMock(return_value="logical-server")
+    barrier = AsyncMock()
+    monkeypatch.setattr(main, "_adopt_seedless_gpu_server_with_retry", adopt)
+    monkeypatch.setattr(main, "wait_for_seedless_adoption", barrier)
+    monkeypatch.setattr(main, "_start_socket_clients", lambda: [])
+    monkeypatch.setattr(
+        main,
+        "settings",
+        SimpleNamespace(seedless_gpu_identity=identity),
+    )
+
+    await main._complete_blocked_leader_readiness(application)
+
+    adopt.assert_awaited_once()
+    barrier.assert_awaited_once_with(main.engine, identity)
+    assert application.state.schema_ready is True
+    assert application.state.readiness_reason is None
+
+
+@pytest.mark.asyncio
+async def test_background_nonblocker_failure_closes_liveness_for_restart(monkeypatch):
+    from chutes_miner.api import main
+
+    application = SimpleNamespace(
+        state=SimpleNamespace(
+            schema_ready=False,
+            readiness_reason="seedless_adoption_blocked",
+            socket_tasks=[],
+        )
+    )
+    monkeypatch.setattr(
+        main,
+        "_adopt_seedless_gpu_server_with_retry",
+        AsyncMock(side_effect=RuntimeError("database invariant failed")),
+    )
+
+    await main._complete_blocked_leader_readiness(application)
+
+    assert application.state.schema_ready is False
+    assert application.state.readiness_reason == "seedless_adoption_failed"
+    response = await main.ping(SimpleNamespace(app=application))
+    assert response.status_code == 500
+    assert b"seedless_adoption_failed" in response.body
 
 
 def test_all_api_workers_and_gepetto_wait_before_work():
-    from chutes_miner.api import main
     from chutes_miner import gepetto
+    from chutes_miner.api import main
 
     lifespan_source = inspect.getsource(main.lifespan)
     nonleader = lifespan_source.index("if not is_migration_process:")
-    nonleader_wait = lifespan_source.index(
-        "await wait_for_required_schema(engine)",
-        nonleader,
+    nonleader_schema = lifespan_source.index(
+        "await wait_for_required_schema(engine)", nonleader
     )
-    nonleader_adoption = lifespan_source.index(
-        "await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)",
-        nonleader_wait,
+    nonleader_background = lifespan_source.index(
+        "_complete_follower_readiness(application)", nonleader_schema
     )
-    nonleader_yield = lifespan_source.index("yield", nonleader)
-    assert nonleader_wait < nonleader_adoption < nonleader_yield
+    nonleader_yield = lifespan_source.index("yield", nonleader_background)
+    assert nonleader_schema < nonleader_background < nonleader_yield
 
-    leader_wait = lifespan_source.index(
-        "await wait_for_required_schema(engine)",
-        nonleader_wait + 1,
+    leader_schema = lifespan_source.index(
+        "await wait_for_required_schema(engine)", nonleader_schema + 1
     )
-    adoption = lifespan_source.index("await adopt_seedless_gpu_server()")
-    leader_adoption_barrier = lifespan_source.index(
-        "await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)",
-        nonleader_adoption + 1,
+    direct_adoption = lifespan_source.index(
+        "server_id = await adopt_seedless_gpu_server()", leader_schema
     )
-    assert leader_wait < adoption < leader_adoption_barrier
+    typed_blocker = lifespan_source.index(
+        "except SeedlessAdoptionBlocked as exc:", direct_adoption
+    )
+    blocked_background = lifespan_source.index(
+        "_complete_blocked_leader_readiness(application)", typed_blocker
+    )
+    leader_yield = lifespan_source.index("yield", blocked_background)
+    assert leader_schema < direct_adoption < typed_blocker < blocked_background < leader_yield
 
     run_source = inspect.getsource(gepetto.Gepetto.run)
     assert "Base.metadata.create_all" not in run_source
-    gepetto_wait = run_source.index("await wait_for_required_schema(engine)")
-    gepetto_adoption = run_source.index(
-        "await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)"
+    schema_wait = run_source.index("await wait_for_required_schema(engine)")
+    adoption_wait = run_source.index("await wait_for_seedless_adoption(")
+    teardown_only_progress = run_source.index(
+        "on_blocked=self.teardown.resume_pending", adoption_wait
     )
     validator_migrations = run_source.index("await run_validator_migrations()")
     launch_resume = run_source.index("await self.resume_launch_intents()")
-    resume = run_source.index("await self.teardown.resume_pending()")
+    normal_teardown_resume = run_source.index("await self.teardown.resume_pending()")
     scope_rebuild = run_source.index(
         "await self.reconcile_registry_scope_intents(reconstruct_active=True)"
     )
     assert (
-        gepetto_wait
-        < gepetto_adoption
+        schema_wait
+        < adoption_wait
+        < teardown_only_progress
         < validator_migrations
         < launch_resume
-        < resume
+        < normal_teardown_resume
         < scope_rebuild
     )
 
@@ -129,9 +353,11 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     adoption_started = asyncio.Event()
     release_adoption = asyncio.Event()
 
-    async def wait_for_adoption(_engine, identity):
+    async def wait_for_adoption(_engine, identity, *, on_blocked=None):
         assert identity == {"server_id": "server-1"}
+        assert on_blocked is not None
         adoption_started.set()
+        await on_blocked()
         await release_adoption.wait()
 
     monkeypatch.setattr(gepetto, "wait_for_required_schema", AsyncMock())
@@ -158,14 +384,14 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     task = asyncio.create_task(coordinator.run())
     await adoption_started.wait()
     coordinator.resume_launch_intents.assert_not_awaited()
-    coordinator.teardown.resume_pending.assert_not_awaited()
+    coordinator.teardown.resume_pending.assert_awaited_once()
     coordinator.reconcile.assert_not_awaited()
 
     release_adoption.set()
     coordinator.reconcile_registry_scope_intents.assert_not_awaited()
     await task
     coordinator.resume_launch_intents.assert_awaited_once()
-    coordinator.teardown.resume_pending.assert_awaited_once()
+    assert coordinator.teardown.resume_pending.await_count == 2
     coordinator.reconcile.assert_awaited_once()
     coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(
         reconstruct_active=True
