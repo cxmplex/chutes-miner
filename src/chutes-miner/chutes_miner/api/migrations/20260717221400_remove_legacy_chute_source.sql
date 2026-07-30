@@ -1,7 +1,8 @@
 -- migrate:up
-ALTER TABLE chutes DROP COLUMN IF EXISTS code;
-ALTER TABLE chutes DROP COLUMN IF EXISTS filename;
+-- This migration has not shipped. Preserve the production source columns and
+-- their data while seedless readers stop depending on them.
+SELECT 1;
 
 -- migrate:down
-ALTER TABLE chutes ADD COLUMN IF NOT EXISTS code TEXT;
-ALTER TABLE chutes ADD COLUMN IF NOT EXISTS filename TEXT;
+-- The up migration is intentionally non-destructive.
+SELECT 1;

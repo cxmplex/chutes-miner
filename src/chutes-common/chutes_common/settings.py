@@ -18,6 +18,38 @@ GPU_MINER_RUNTIME_PURPOSES = [
     "sockets",
 ]
 
+GPU_REGISTRATION_V2_SCHEMA = "chutes.gpu-registration-response.v2"
+GPU_REGISTRATION_IDENTITY_FIELDS = (
+    "server_id",
+    "owner_hotkey",
+    "reservation_id",
+    "claims_sha256",
+    "allocation_group_id",
+    "allocation_group_generation",
+    "process_incarnation",
+    "gpu_uuids",
+    "gpu_identifiers",
+    "management_mode",
+    "measurement_version",
+    "measurement_name",
+    "measurement_config_fingerprint",
+    "trust_set_fingerprint",
+    "attestation_id",
+    "verified_at",
+    "runtime_session",
+    "runtime_session_expires_at",
+    "status",
+)
+_GPU_REGISTRATION_STRING_FIELDS = frozenset(GPU_REGISTRATION_IDENTITY_FIELDS) - {
+    "allocation_group_generation",
+    "gpu_uuids",
+    "gpu_identifiers",
+}
+
+
+class SeedlessGPUConfigurationError(ValueError):
+    """The measured seedless GPU runtime files cannot be consumed safely."""
+
 
 class Validator(BaseModel):
     hotkey: str
@@ -149,48 +181,50 @@ class MinerSettings(BaseSettings):
             Path(self.gpu_registration_file),
             "registration",
         )
-        required = {
-            "server_id",
-            "owner_hotkey",
-            "reservation_id",
-            "claims_sha256",
-            "allocation_group_id",
-            "allocation_group_generation",
-            "process_incarnation",
-            "gpu_uuids",
-            "gpu_identifiers",
-            "management_mode",
-            "measurement_version",
-            "measurement_name",
-            "measurement_config_fingerprint",
-            "trust_set_fingerprint",
-            "attestation_id",
-            "verified_at",
-            "runtime_session",
-            "runtime_session_expires_at",
-            "status",
-        }
         if (
-            set(registration) != required
+            registration.get("schema") != GPU_REGISTRATION_V2_SCHEMA
+            or type(registration.get("version")) is not int
+            or registration["version"] != 2
+            or registration.get("state") != "completed"
             or registration.get("management_mode") != "miner"
             or registration.get("status") != "registered"
-            or registration.get("server_id") != runtime["server_id"]
-            or registration.get("owner_hotkey") != runtime["owner_hotkey"]
-            or registration.get("gpu_uuids") != runtime["gpu_uuids"]
-            or registration.get("gpu_identifiers") != runtime["gpu_identifiers"]
-            or registration.get("runtime_session") != runtime["runtime_session"]
-            or registration.get("runtime_session_expires_at")
-            != runtime["runtime_session_expires_at"]
-            or not isinstance(registration.get("attestation_id"), str)
-            or not registration["attestation_id"]
-            or not isinstance(registration.get("allocation_group_id"), str)
-            or not registration["allocation_group_id"]
-            or not isinstance(registration.get("allocation_group_generation"), int)
+            or any(
+                not isinstance(registration.get(field), str) or not registration[field]
+                for field in _GPU_REGISTRATION_STRING_FIELDS
+            )
+            or type(registration.get("allocation_group_generation")) is not int
             or registration["allocation_group_generation"] < 1
+            or not isinstance(registration.get("gpu_uuids"), list)
+            or not registration["gpu_uuids"]
+            or any(
+                not isinstance(value, str) or not value
+                for value in registration["gpu_uuids"]
+            )
+            or not isinstance(registration.get("gpu_identifiers"), list)
+            or not registration["gpu_identifiers"]
+            or any(
+                not isinstance(value, str) or not value
+                for value in registration["gpu_identifiers"]
+            )
+            or len(registration["gpu_uuids"]) != len(registration["gpu_identifiers"])
+        ):
+            raise ValueError("seedless GPU Registration V2 document is invalid")
+        identity = {
+            field: registration[field]
+            for field in GPU_REGISTRATION_IDENTITY_FIELDS
+        }
+        if (
+            registration["server_id"] != runtime["server_id"]
+            or registration["owner_hotkey"] != runtime["owner_hotkey"]
+            or registration["gpu_uuids"] != runtime["gpu_uuids"]
+            or registration["gpu_identifiers"] != runtime["gpu_identifiers"]
+            or registration["runtime_session"] != runtime["runtime_session"]
+            or registration["runtime_session_expires_at"]
+            != runtime["runtime_session_expires_at"]
         ):
             raise ValueError("seedless GPU registration and runtime identities do not match")
         return {
-            **registration,
+            **identity,
             "validator": runtime["validator"],
         }
 
@@ -199,7 +233,16 @@ class MinerSettings(BaseSettings):
         if not self.gpu_tee_only:
             raise ValueError("signed miner hourly cost is available only in GPU TEE mode")
         values: dict[str, str] = {}
-        for line in Path(self.gpu_verified_env_file).read_text(encoding="ascii").splitlines():
+        verified_env_path = Path(self.gpu_verified_env_file)
+        try:
+            lines = verified_env_path.read_text(encoding="ascii").splitlines()
+        except PermissionError as exc:
+            raise SeedlessGPUConfigurationError(
+                "seedless GPU verified environment file is not readable at "
+                f"{verified_env_path}: grant the miner process (UID 65532) directory "
+                "traversal and file read permission"
+            ) from exc
+        for line in lines:
             key, separator, value = line.partition("=")
             if not separator or not key or key in values:
                 raise ValueError("verified GPU environment file is invalid")

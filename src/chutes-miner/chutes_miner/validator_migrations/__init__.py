@@ -21,12 +21,14 @@ from chutes_miner.api.config import settings
 from chutes_miner.api.database import get_session
 
 from chutes_miner.validator_migrations.base import ValidatorMigration
-from chutes_miner.validator_migrations.migrations import SyncServerKeysMigration
 
 # Registry: unique key YYYYMMDDXX -> migration. Run in sorted order by key.
-MIGRATIONS: dict[str, ValidatorMigration] = {
-    "2025013101": SyncServerKeysMigration(),
-}
+MIGRATIONS: dict[str, ValidatorMigration] = {}
+
+# This migration belonged to the pre-seedless stack and used legacy ``tee``
+# request authority. Its durable validator_migrations row is retained as audit
+# history, but seedless startup must never import or execute it.
+RETIRED_MIGRATION_KEYS = frozenset({"2025013101"})
 
 # Key format: YYYYMMDDXX (10 digits). Enforced at import.
 _MIGRATION_KEY_RE = re.compile(r"^\d{10}$")
@@ -36,6 +38,9 @@ def _assert_migration_keys_unique() -> None:
     """Enforce at build/load time that keys are unique and match YYYYMMDDXX."""
     keys = list(MIGRATIONS.keys())
     assert len(keys) == len(set(keys)), "validator migration keys must be unique"
+    assert not RETIRED_MIGRATION_KEYS.intersection(keys), (
+        "retired validator migration keys must not be registered"
+    )
     for k in keys:
         assert _MIGRATION_KEY_RE.match(k), f"validator migration key must be YYYYMMDDXX, got {k!r}"
 

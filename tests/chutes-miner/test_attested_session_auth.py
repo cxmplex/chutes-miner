@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 from chutes_common.auth import sign_request
-from chutes_common.settings import MinerSettings, miner_settings
+from chutes_common.settings import (
+    GPU_REGISTRATION_IDENTITY_FIELDS,
+    MinerSettings,
+    SeedlessGPUConfigurationError,
+    miner_settings,
+)
 from chutes_miner.api.config import settings
 from chutes_miner.api.exceptions import TEEBootstrapFailure
 from chutes_miner.api.server.util import bootstrap_server
@@ -153,6 +158,11 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
         },
     }
     registration = {
+        "schema": "chutes.gpu-registration-response.v2",
+        "version": 2,
+        "attempt_id": "attempt-1",
+        "state": "completed",
+        "status_url": "/servers/gpu/registration/attempts/attempt-1",
         "server_id": "logical-gpu-server",
         "owner_hotkey": "5Owner",
         "reservation_id": "reservation-1",
@@ -167,10 +177,12 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
         "measurement_name": "gpu-miner",
         "measurement_config_fingerprint": "a" * 64,
         "trust_set_fingerprint": "b" * 64,
+        "registration_id": "registration-1",
         "attestation_id": "attestation-1",
         "verified_at": "2026-07-24T12:45:00Z",
         "runtime_session": "attested-session",
         "runtime_session_expires_at": "2026-07-24T13:00:00Z",
+        "registration_replay_until": "2026-07-24T13:00:00Z",
         "status": "registered",
     }
     runtime_path = tmp_path / "miner-session.json"
@@ -185,15 +197,53 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
         validators_file=str(runtime_path),
         gpu_registration_file=str(registration_path),
     ).seedless_gpu_identity
+    assert set(parsed) == {*GPU_REGISTRATION_IDENTITY_FIELDS, "validator"}
     assert parsed["server_id"] == "logical-gpu-server"
     assert parsed["attestation_id"] == "attestation-1"
     assert parsed["validator"]["hotkey"] == "5Validator"
+    assert "attempt_id" not in parsed
+    assert "registration_replay_until" not in parsed
 
     registration["server_id"] = "duplicate-server"
     registration_path.write_text(
         json.dumps(registration, sort_keys=True, separators=(",", ":")) + "\n"
     )
     with pytest.raises(ValueError, match="identities do not match"):
+        MinerSettings(
+            miner_ss58="5Owner",
+            gpu_tee_only=True,
+            validators_file=str(runtime_path),
+            gpu_registration_file=str(registration_path),
+        ).seedless_gpu_identity
+
+    registration["server_id"] = "logical-gpu-server"
+    invalid_documents = (
+        {**registration, "schema": "chutes.gpu-registration-response.v3"},
+        {**registration, "version": 3},
+        {**registration, "state": "processing"},
+        {**registration, "status": "failed"},
+        {**registration, "runtime_session": 123},
+        {**registration, "allocation_group_generation": True},
+        {**registration, "gpu_uuids": [1]},
+    )
+    for invalid in invalid_documents:
+        registration_path.write_text(
+            json.dumps(invalid, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        with pytest.raises(ValueError, match="Registration V2 document is invalid"):
+            MinerSettings(
+                miner_ss58="5Owner",
+                gpu_tee_only=True,
+                validators_file=str(runtime_path),
+                gpu_registration_file=str(registration_path),
+            ).seedless_gpu_identity
+
+    missing = dict(registration)
+    missing.pop("attestation_id")
+    registration_path.write_text(
+        json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    with pytest.raises(ValueError, match="Registration V2 document is invalid"):
         MinerSettings(
             miner_ss58="5Owner",
             gpu_tee_only=True,
@@ -217,6 +267,30 @@ def test_seedless_hourly_cost_comes_from_verified_claim_environment(tmp_path):
     verified.write_text("CHUTES_MINER_HOURLY_COST=0\n", encoding="ascii")
     with pytest.raises(ValueError, match="positive and finite"):
         _ = settings.miner_hourly_cost
+
+
+def test_seedless_hourly_cost_reports_actionable_permission_error(monkeypatch, tmp_path):
+    verified = tmp_path / "verified.env"
+    verified.write_text("CHUTES_MINER_HOURLY_COST=12.5\n", encoding="ascii")
+    settings = MinerSettings(
+        miner_ss58="5Owner",
+        gpu_tee_only=True,
+        gpu_verified_env_file=str(verified),
+    )
+    read_text = Path.read_text
+
+    def deny_verified_env(path, *args, **kwargs):
+        if path == verified:
+            raise PermissionError("permission denied")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_verified_env)
+    with pytest.raises(
+        SeedlessGPUConfigurationError,
+        match=r"UID 65532.*directory traversal.*file read permission",
+    ) as caught:
+        _ = settings.miner_hourly_cost
+    assert isinstance(caught.value.__cause__, PermissionError)
 
 
 def test_seedless_api_leader_election_uses_postgres_not_stale_pidfile():
