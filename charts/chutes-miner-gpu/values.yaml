@@ -78,8 +78,6 @@ failedChuteCleanup:
   image: parachutes/failed-chute-cleanup@sha256:2b90539e78e997254ee3a6f0c6d0f5e597e164503cd8a2620ce9f933b0450e28
   imagePullPolicy: Always
 
-# Miner credentials - These are provided via Ansible deployment
-# These values are automatically injected during deployment and should not be set manually
-# as they are sensitive values
+# Public miner owner identity, injected by Ansible during deployment.
 minerCredentials:
   ownerSs58: "REPLACE_WITH_ATTESTED_OWNER_SS58"

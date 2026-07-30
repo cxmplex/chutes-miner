@@ -55,8 +55,6 @@ spec:
               value: {{ .Values.seedlessStack.attestedCertPath | quote }}
             - name: GPU_TEE_ONLY
               value: "true"
-            - name: CHUTES_ATTESTED_CERT_FILE
-              value: /run/chutes-tls/server.crt
             - name: CHUTES_ATTESTED_KEY_FILE
               value: /run/chutes-tls/server.key
             - name: CHUTES_REGISTRY_SCOPES_FILE

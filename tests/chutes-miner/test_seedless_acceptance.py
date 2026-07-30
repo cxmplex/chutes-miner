@@ -159,6 +159,43 @@ def test_fresh_install_render_uses_exact_single_node_placement(chart):
     assert STACK_IMAGE in images
 
 
+def test_rendered_registry_has_one_attested_certificate_binding():
+    documents = _render("chutes-miner-gpu")
+    registry = next(
+        item
+        for item in documents
+        if item.get("kind") == "DaemonSet"
+        and item.get("metadata", {}).get("name") == "registry"
+    )
+    auth = next(
+        container
+        for container in registry["spec"]["template"]["spec"]["initContainers"]
+        if container["name"] == "auth"
+    )
+    cert_entries = [
+        entry for entry in auth["env"] if entry["name"] == "CHUTES_ATTESTED_CERT_FILE"
+    ]
+    assert cert_entries == [
+        {"name": "CHUTES_ATTESTED_CERT_FILE", "value": "/run/chutes-tls/server.crt"}
+    ]
+
+
+def test_fleet_uses_public_owner_chart_value_without_seed_material():
+    parse_credentials = (
+        ROOT / "ansible/k3s/tasks/charts/parse_credentials.yml"
+    ).read_text(encoding="utf-8")
+    assert "owner_ss58" in parse_credentials
+    assert "secretSeed" not in parse_credentials
+    assert "miner_secret_seed" not in parse_credentials
+    for name in ("deploy_miner.yml", "deploy_miner_gpu.yml"):
+        deployment = (
+            ROOT / "ansible/k3s/tasks/charts" / name
+        ).read_text(encoding="utf-8")
+        assert "minerCredentials.ownerSs58" in deployment
+        assert "minerCredentials.ss58Address" not in deployment
+        assert "minerCredentials.secretSeed" not in deployment
+
+
 def test_migrated_install_reconstructs_measured_releases():
     reconciler = (
         repository_root("sek8s", start=Path(__file__))
