@@ -39,13 +39,28 @@ def _control_plane_node():
     return node
 
 
-def _node_resources(node) -> tuple[int, int, int]:
+def _node_resources(node, *, assigned_gpu_count: int) -> tuple[int, int, int]:
     capacity = node.status.capacity
-    gpu_count = int(capacity.get("nvidia.com/gpu", "0"))
-    cpu_count = int(capacity.get("cpu", "0")) - 2
+    allocatable = getattr(node.status, "allocatable", None)
+    try:
+        capacity_gpu_count = int(capacity.get("nvidia.com/gpu", "0"))
+        gpu_count = int((allocatable or {}).get("nvidia.com/gpu", "0"))
+        cpu_count = int(capacity.get("cpu", "0")) - 2
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("seedless GPU Kubernetes capacity is invalid") from exc
     memory = capacity.get("memory", "")
-    if gpu_count < 1 or cpu_count < 1:
+    if (
+        capacity_gpu_count < 1
+        or gpu_count < 1
+        or gpu_count > capacity_gpu_count
+        or cpu_count < 1
+    ):
         raise RuntimeError("seedless GPU Kubernetes capacity is invalid")
+    if assigned_gpu_count != gpu_count:
+        raise RuntimeError(
+            "Registrar-assigned GPU UUID cardinality does not match Kubernetes "
+            f"allocatable GPU capacity: assigned={assigned_gpu_count} allocatable={gpu_count}"
+        )
     if memory.endswith("Ki"):
         memory_gib = int(memory[:-2]) // 1024 // 1024
     elif memory.endswith("Mi"):
@@ -79,6 +94,12 @@ async def adopt_seedless_gpu_server() -> str:
     bound_id = labels.get("chutes/logical-server-id")
     if bound_id not in {None, logical_server_id}:
         raise RuntimeError("Kubernetes node is bound to another logical GPU server")
+    if len(set(identity["gpu_uuids"])) != len(identity["gpu_uuids"]):
+        raise RuntimeError("Registrar GPU assignment contains duplicate hardware UUIDs")
+    gpu_count, cpu_per_gpu, memory_per_gpu = _node_resources(
+        node,
+        assigned_gpu_count=len(identity["gpu_uuids"]),
+    )
     if bound_id is None:
         labels["chutes/logical-server-id"] = logical_server_id
         node = k8s_core_client().patch_node(
@@ -93,7 +114,6 @@ async def adopt_seedless_gpu_server() -> str:
             {"metadata": {"labels": labels}},
         )
         labels = dict(node.metadata.labels or labels)
-    gpu_count, cpu_per_gpu, memory_per_gpu = _node_resources(node)
 
     async with get_session() as session:
         candidates = (

@@ -541,6 +541,7 @@ def create_api_test_nodes():
                             "cpu": "8",
                             "memory": "32Gi",
                             "nvidia.com/gpu": "2",
+                            "ephemeral-storage": "1024Gi",
                         },
                     },
                 }

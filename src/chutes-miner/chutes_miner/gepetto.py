@@ -31,6 +31,7 @@ from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
 from chutes_miner.api.k8s.util import (
     canonical_miner_launch_sha256,
+    deployment_disk_requirements,
     require_supported_chutes_version,
     resolve_deployment_validator,
     validated_miner_launch_lineage,
@@ -2086,7 +2087,10 @@ class Gepetto:
             except DeploymentFailure as exc:
                 logger.error(f"Skipping invalid scale-up candidate: {exc}")
                 continue
-            if await k8s.check_node_has_disk_available(server.name, disk_gb):
+            required_disk_gb = deployment_disk_requirements(
+                server, disk_gb
+            ).ephemeral_storage_gb
+            if await k8s.check_node_has_disk_available(server.name, required_disk_gb):
                 candidates.append(server)
                 if len(candidates) >= SCALE_UP_CANDIDATE_POOL:
                     break
@@ -2218,7 +2222,10 @@ class Gepetto:
             except DeploymentFailure as exc:
                 logger.error(f"Skipping invalid preemption candidate: {exc}")
                 continue
-            if await k8s.check_node_has_disk_available(server.name, disk_gb):
+            required_disk_gb = deployment_disk_requirements(
+                server, disk_gb
+            ).ephemeral_storage_gb
+            if await k8s.check_node_has_disk_available(server.name, required_disk_gb):
                 eligible_servers.append(server)
         servers = eligible_servers
 

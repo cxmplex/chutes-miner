@@ -400,6 +400,7 @@ async def test_registrar_identity_is_adopted_without_duplicate_server(monkeypatc
                 "cpu": "16",
                 "memory": "65536Mi",
             },
+            allocatable={"nvidia.com/gpu": "1"},
             conditions=[SimpleNamespace(type="Ready", status="True")],
         ),
     )
@@ -521,6 +522,7 @@ async def test_new_attestation_rotates_node_uid_without_rotating_logical_server(
                 "cpu": "16",
                 "memory": "65536Mi",
             },
+            allocatable={"nvidia.com/gpu": "1"},
             conditions=[SimpleNamespace(type="Ready", status="True")],
         ),
     )
@@ -649,6 +651,7 @@ async def test_legacy_db_identity_rekeys_before_conflict_checks(monkeypatch):
         ),
         status=SimpleNamespace(
             capacity={"nvidia.com/gpu": "1", "cpu": "16", "memory": "65536Mi"},
+            allocatable={"nvidia.com/gpu": "1"},
             conditions=[SimpleNamespace(type="Ready", status="True")],
         ),
     )

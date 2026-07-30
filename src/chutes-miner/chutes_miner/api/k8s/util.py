@@ -1,5 +1,6 @@
 import hashlib
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import UUID
 
@@ -188,6 +189,44 @@ def _needs_attestation_port(chute: Chute) -> bool:
     return bool(chute.tee and semcomp(version_str, "0.6.0") >= 0)
 
 
+@dataclass(frozen=True, slots=True)
+class DeploymentDiskRequirements:
+    """One authoritative whole-GiB storage calculation for a chute Pod."""
+
+    workload_gb: int
+    cache_gb: int
+
+    @property
+    def ephemeral_storage_gb(self) -> int:
+        return self.workload_gb + self.cache_gb
+
+
+def _positive_whole_gib(value: Any, *, field: str) -> int:
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+        result = int(value)
+    else:
+        raise DeploymentFailure(f"{field} must be a positive whole GiB value")
+    if result < 1:
+        raise DeploymentFailure(f"{field} must be a positive whole GiB value")
+    return result
+
+
+def deployment_disk_requirements(
+    server: Server,
+    workload_disk_gb: int,
+) -> DeploymentDiskRequirements:
+    """Return the exact cache, workload, and Pod ephemeral-storage admission values."""
+
+    workload_gb = _positive_whole_gib(workload_disk_gb, field="workload disk")
+    cache_gb = _positive_whole_gib(
+        settings.cache_overrides.get(server.name, settings.cache_max_size_gb),
+        field=f"cache disk for node {server.name}",
+    )
+    return DeploymentDiskRequirements(workload_gb=workload_gb, cache_gb=cache_gb)
+
+
 def _tee_download_env(vm_version: Optional[str]) -> list[V1EnvVar]:
     """Select only download controls supported by the measured guest generation."""
     if not vm_version or _VERSION_PREFIX_RE.match(vm_version) is None:
@@ -298,11 +337,7 @@ def build_chute_job(
                 f"Missing descriptor-closed registry scope for chute {chute.chute_id}."
             )
         image = f"{registry_repository}@{registry_manifest_digest}"
-    cache_size_gb = max(
-        1,
-        int(settings.cache_overrides.get(server.name, settings.cache_max_size_gb)),
-    )
-    ephemeral_storage_gb = int(disk_gb) + cache_size_gb
+    disk_requirements = deployment_disk_requirements(server, disk_gb)
 
     return V1Job(
         metadata=V1ObjectMeta(
@@ -345,12 +380,14 @@ def build_chute_job(
                         V1Volume(
                             name="cache",
                             empty_dir=V1EmptyDirVolumeSource(
-                                size_limit=f"{cache_size_gb}Gi",
+                                size_limit=f"{disk_requirements.cache_gb}Gi",
                             ),
                         ),
                         V1Volume(
                             name="tmp",
-                            empty_dir=V1EmptyDirVolumeSource(size_limit=f"{disk_gb}Gi"),
+                            empty_dir=V1EmptyDirVolumeSource(
+                                size_limit=f"{disk_requirements.workload_gb}Gi"
+                            ),
                         ),
                         V1Volume(
                             name="shm",
@@ -436,12 +473,12 @@ def build_chute_job(
                                 requests={
                                     "cpu": cpu,
                                     "memory": ram,
-                                    "ephemeral-storage": f"{ephemeral_storage_gb}Gi",
+                                    "ephemeral-storage": f"{disk_requirements.ephemeral_storage_gb}Gi",
                                 },
                                 limits={
                                     "cpu": cpu,
                                     "memory": ram,
-                                    "ephemeral-storage": f"{ephemeral_storage_gb}Gi",
+                                    "ephemeral-storage": f"{disk_requirements.ephemeral_storage_gb}Gi",
                                 },
                             ),
                             volume_mounts=[

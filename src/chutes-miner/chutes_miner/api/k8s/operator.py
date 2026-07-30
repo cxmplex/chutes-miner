@@ -55,6 +55,7 @@ from chutes_miner.api.k8s.constants import (
 from chutes_miner.api.k8s.util import (
     build_chute_job,
     build_chute_service,
+    deployment_disk_requirements,
     registry_pull_secret_name,
     require_supported_chutes_version,
     resolve_deployment_validator,
@@ -2168,10 +2169,14 @@ class K8sOperator(abc.ABC):
             return deployment
 
     async def _verify_disk_space(self, server: Server, disk_gb: int):
-        # Check disk space availability
-        if not await self.check_node_has_disk_available(server.name, disk_gb):
+        requirements = deployment_disk_requirements(server, disk_gb)
+        required_gb = requirements.ephemeral_storage_gb
+        if not await self.check_node_has_disk_available(server.name, required_gb):
             raise DeploymentFailure(
-                f"Server {server.server_id} name={server.name} does not have {disk_gb}GB disk space available"
+                f"Server {server.server_id} name={server.name} does not have "
+                f"{required_gb}GB disk space available "
+                f"({requirements.workload_gb}GB workload + "
+                f"{requirements.cache_gb}GB cache)"
             )
 
     def _get_probe_port(self, chute: Chute):

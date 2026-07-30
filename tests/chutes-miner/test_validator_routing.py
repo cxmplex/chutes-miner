@@ -407,6 +407,31 @@ async def test_scale_up_candidate_selection_skips_validator_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_scale_up_disk_admission_includes_node_cache(monkeypatch):
+    chute = _chute()
+    server = _server()
+    monkeypatch.setattr(settings, "cache_overrides", {server.name: 37})
+    monkeypatch.setattr(settings, "cache_max_size_gb", 500)
+
+    with (
+        patch.object(
+            gepetto_module,
+            "get_session",
+            _session_factory([_ScalarResult(scalars=[server])]),
+        ),
+        patch.object(
+            gepetto_module.k8s,
+            "check_node_has_disk_available",
+            new=AsyncMock(return_value=True),
+        ) as disk_check,
+    ):
+        selected = await Gepetto.optimal_scale_up_server(chute, disk_gb=11)
+
+    assert selected is server
+    disk_check.assert_awaited_once_with(server.name, 48)
+
+
+@pytest.mark.asyncio
 async def test_scale_up_candidate_selection_rejects_unknown_validator():
     chute = _chute(validator="unknown-validator")
 
@@ -530,11 +555,13 @@ async def test_normal_scale_up_propagates_server_version():
 
 
 @pytest.mark.asyncio
-async def test_preemption_job_propagates_version_and_job_identity():
+async def test_preemption_job_propagates_version_job_identity_and_exact_disk(monkeypatch):
     gepetto = _gepetto()
     chute = _chute()
     gepetto.remote_chutes[VALIDATOR][chute.chute_id] = {"effective_compute_multiplier": 2.0}
     server = _server()
+    monkeypatch.setattr(settings, "cache_overrides", {server.name: 37})
+    monkeypatch.setattr(settings, "cache_max_size_gb", 500)
     results = [
         _ScalarResult(scalar=None),
         _ScalarResult(scalars=[server]),
@@ -555,15 +582,18 @@ async def test_preemption_job_propagates_version_and_job_identity():
             gepetto_module.k8s,
             "check_node_has_disk_available",
             new=AsyncMock(return_value=True),
-        ),
+        ) as disk_check,
         patch.object(
             gepetto_module.k8s,
             "deploy_chute",
             new=AsyncMock(return_value=(deployment, object())),
         ) as deploy,
     ):
-        assert await gepetto.preempting_deploy(chute, job_id="job-1")
+        assert await gepetto.preempting_deploy(
+            chute, job_id="job-1", disk_gb=11
+        )
 
+    disk_check.assert_awaited_once_with(server.name, 48)
     assert deploy.await_args.kwargs["vm_version"] == "1.8.0"
     assert deploy.await_args.kwargs["job_id"] == "job-1"
 
