@@ -1,4 +1,6 @@
-from unittest.mock import AsyncMock, Mock, patch
+# ruff: noqa: F405
+
+from unittest.mock import AsyncMock, patch
 
 from chutes_common.k8s import WatchEvent, WatchEventType
 
@@ -16,6 +18,25 @@ def mock_fetch_devices(mock_gpus):
     ):
         _mock.return_value = [{"uuid": gpu.gpu_id, **gpu.device_info} for gpu in mock_gpus]
         yield _mock
+
+@pytest.fixture
+def mock_parent_teardown():
+    with (
+        patch(
+            "chutes_miner.api.deployment.teardown."
+            "DeploymentTeardownCoordinator.request_parent",
+            new_callable=AsyncMock,
+            return_value="parent-operation",
+        ) as request_parent,
+        patch(
+            "chutes_miner.api.deployment.teardown."
+            "DeploymentTeardownCoordinator.run_parent",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as run_parent,
+    ):
+        yield request_parent, run_parent
+
 
 
 @pytest.mark.asyncio
@@ -87,6 +108,7 @@ async def test_bootstrap_server_graval_pod_failure(
     set_mock_db_session_result,
     mock_server,
     mock_gpus,
+    mock_parent_teardown,
 ):
     """Test bootstrap failure due to GPU verification failure"""
     mock_pod.status.phase = "Failed"
@@ -106,8 +128,9 @@ async def test_bootstrap_server_graval_pod_failure(
 
     # Verify cleanup was called
     mock_k8s_operator.cleanup_graval.assert_called()
-    # Verify server was cleaned up from validator
-    assert mock_aiohttp_session.delete.call_count == 1
+    request_parent, run_parent = mock_parent_teardown
+    request_parent.assert_awaited_once()
+    run_parent.assert_awaited_once_with("parent-operation")
 
 
 @pytest.mark.asyncio
@@ -121,6 +144,7 @@ async def test_bootstrap_server_fetch_devices_failure(
     mock_server,
     mock_gpus,
     mock_fetch_devices,
+    mock_parent_teardown,
 ):
     """Test bootstrap failure due to GPU verification failure"""
     mock_fetch_devices.side_effect = Exception("Failure to fetch.")
@@ -137,8 +161,9 @@ async def test_bootstrap_server_fetch_devices_failure(
 
     # Verify cleanup was called
     mock_k8s_operator.cleanup_graval.assert_called()
-    # Verify server was cleaned up from validator
-    assert mock_aiohttp_session.delete.call_count == 1
+    request_parent, run_parent = mock_parent_teardown
+    request_parent.assert_awaited_once()
+    run_parent.assert_awaited_once_with("parent-operation")
 
 
 @pytest.mark.asyncio
@@ -150,6 +175,7 @@ async def test_bootstrap_server_advertise_nodes_failure(
     mock_gpus,
     set_mock_db_session_result,
     mock_aiohttp_session,
+    mock_parent_teardown,
 ):
     """Test bootstrap failure during node advertisement"""
     # Setup mocks
@@ -169,8 +195,9 @@ async def test_bootstrap_server_advertise_nodes_failure(
 
     # Verify cleanup was called with delete_node=True
     mock_k8s_operator.cleanup_graval.assert_called()
-    # Verify server was cleaned up from validator
-    assert mock_aiohttp_session.delete.call_count == 1
+    request_parent, run_parent = mock_parent_teardown
+    request_parent.assert_awaited_once()
+    run_parent.assert_awaited_once_with("parent-operation")
 
 
 @pytest.mark.asyncio

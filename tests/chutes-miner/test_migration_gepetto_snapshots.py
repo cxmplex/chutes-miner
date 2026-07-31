@@ -22,7 +22,8 @@ def test_migration_removes_both_retired_gepetto_source_overrides():
     assert "state: absent" in migrate_playbook
     assert "MicroK8s" in verification_tasks
     assert "k3s" in verification_tasks
-    assert verification_tasks.count("state: absent") == 2
+    assert verification_tasks.count("Remove retired gepetto source override") == 2
+    assert verification_tasks.count("name: gepetto-code") == 2
     assert "gepetto-code" not in deployment
     assert "subPath: gepetto.py" not in deployment
 
