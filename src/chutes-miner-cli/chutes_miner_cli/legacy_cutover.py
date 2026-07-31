@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import ssl
 import stat
 import subprocess  # nosec B404
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ import aiohttp
 BUNDLE_PATH = "/run/chutes/legacy-gpu-cutover.json"
 CUTOVER_STATE_PATH = "/var/lib/chutes/legacy-gpu-cutover/state.json"
 CUTOVER_PENDING_STATE_PATH = "/var/lib/chutes/legacy-gpu-cutover/state.pending.json"
+CUTOVER_LOCK_PATH = "/var/lib/chutes/legacy-gpu-cutover/operation.lock"
 CLOSURE_PATH = "/var/lib/chutes/legacy-gpu-cutover/closure.json"
 AUTHORIZATION_PATH = "/var/lib/chutes/legacy-gpu-cutover/authorization.json"
 CUTOVER_SOURCE_ABSENCE_PATH = (
@@ -44,6 +47,7 @@ CUTOVER_STATE_PHASES = (
     "filesystems_unmounted",
     "mappers_closed",
     "transfer_acknowledged",
+    "abort_requested",
 )
 CUTOVER_STATE_COMMON_FIELDS = frozenset(
     {
@@ -88,6 +92,35 @@ _LEGACY_SOURCE_DEVICES = (
 
 class LegacyCutoverError(RuntimeError):
     """Legacy volume closure or custody transfer failed."""
+
+
+@contextmanager
+def _cutover_lock():
+    """Serialize cutover, recovery, and abort across CLI processes."""
+    path = Path(CUTOVER_LOCK_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise LegacyCutoverError("cutover operation lock is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise LegacyCutoverError("cutover operation lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _canonical_json(document: dict[str, Any]) -> bytes:
@@ -363,7 +396,7 @@ def _persist_authorization(
     )
 
 
-def rebind_closure_authorization(token: str) -> None:
+def _rebind_closure_authorization_unlocked(token: str) -> None:
     if not token:
         raise LegacyCutoverError("replacement cutover authorization is empty")
     if _path_present(CUTOVER_STATE_PATH):
@@ -372,8 +405,10 @@ def rebind_closure_authorization(token: str) -> None:
             state,
             repair_prepared=True,
         )
-        if state["phase"] == "transfer_acknowledged":
-            raise LegacyCutoverError("acknowledged cutover authorization is immutable")
+        if state["phase"] in {"transfer_acknowledged", "abort_requested"}:
+            raise LegacyCutoverError(
+                "terminal cutover authorization is immutable"
+            )
         legacy_server_id = state["legacy_server_id"]
         target_host_id = state["target_host_id"]
     elif Path(BUNDLE_PATH).exists():
@@ -387,6 +422,65 @@ def rebind_closure_authorization(token: str) -> None:
         target_host_id=target_host_id,
         token=token,
     )
+
+
+def rebind_closure_authorization(token: str) -> None:
+    with _cutover_lock():
+        _rebind_closure_authorization_unlocked(token)
+
+
+def _validated_initiation_state_unlocked(
+    kubeconfig_path: str,
+) -> dict[str, Any] | None:
+    if _path_present(CUTOVER_STATE_PATH):
+        state = _load_cutover_state(CUTOVER_STATE_PATH)
+        state, _marker = _reconcile_cutover_fence(
+            state,
+            repair_prepared=True,
+        )
+        if state["phase"] in {"transfer_acknowledged", "abort_requested"}:
+            raise LegacyCutoverError("terminal cutover cannot be reauthorized")
+        return state
+    try:
+        _verified_postgres_password(kubeconfig_path)
+    except LegacyCutoverError as exc:
+        raise LegacyCutoverError(
+            "no validated runtime kubeconfig is available; reboot the live source "
+            "before starting a new cutover"
+        ) from exc
+    return None
+
+
+def require_cutover_initiation_access() -> None:
+    """Require boot-prepared K3s access only when no durable cutover exists."""
+
+    with _cutover_lock():
+        _validated_initiation_state_unlocked(K3S_ADMIN_KUBECONFIG)
+
+
+def persist_cutover_bundle(bundle: dict[str, Any]) -> None:
+    """Durably stage one local initiation without racing cutover transitions."""
+
+    with _cutover_lock():
+        state = _validated_initiation_state_unlocked(bundle["kubeconfig_path"])
+        if state is not None:
+            _require_state_bundle_identity(state, bundle)
+        elif _path_present(BUNDLE_PATH):
+            existing = _load_bundle(BUNDLE_PATH)
+            existing_identity = dict(existing)
+            existing_identity.pop("cutover_authorization")
+            requested_identity = dict(bundle)
+            requested_identity.pop("cutover_authorization", None)
+            if existing_identity != requested_identity:
+                raise LegacyCutoverError(
+                    "pending cutover bundle belongs to different custody"
+                )
+
+        _write_private_json(BUNDLE_PATH, bundle)
+        persisted = _load_bundle(BUNDLE_PATH)
+        if persisted != bundle:
+            raise LegacyCutoverError("persisted cutover bundle changed exact bytes")
+        _rebind_closure_authorization_unlocked(bundle["cutover_authorization"])
 
 
 def _load_authorization(state: dict[str, Any]) -> str:
@@ -540,6 +634,66 @@ def _require_k3s_quiesced() -> None:
         raise LegacyCutoverError("K3s container shims remain active")
     if shims.returncode != 1:
         raise LegacyCutoverError("K3s container-shim state is unavailable")
+
+
+def _require_source_generations(state: dict[str, Any]) -> None:
+    observed = {
+        "storage_generation": _generation("/cache/storage"),
+        "cache_generation": _generation("/var/snap"),
+    }
+    expected = {
+        "storage_generation": state["storage_generation"],
+        "cache_generation": state["cache_generation"],
+    }
+    if observed != expected:
+        raise LegacyCutoverError("legacy volume generation changed before unmount")
+
+
+def _require_prequiescence_source(state: dict[str, Any]) -> None:
+    service = _run(["systemctl", "is-active", "--quiet", "k3s.service"])
+    if service.returncode != 0:
+        raise LegacyCutoverError(
+            "legacy cutover cannot abort after K3s quiescence has begun"
+        )
+
+    for path in ("/cache/storage", "/var/snap"):
+        if not _mountpoint(path):
+            raise LegacyCutoverError(
+                f"legacy cutover cannot abort after source unmount: {path}"
+            )
+
+    for name in ("storage", "tdx-cache"):
+        mapper = f"/dev/mapper/{name}"
+        status = _run(["cryptsetup", "status", name])
+        if not os.path.exists(mapper) or status.returncode != 0:
+            raise LegacyCutoverError(f"legacy source mapper is not active: {name}")
+
+    observed = {
+        "storage_luks_uuid": _output(
+            ["cryptsetup", "luksUUID", "/dev/disk/by-label/storage"],
+            "legacy storage LUKS UUID",
+        ),
+        "storage_filesystem_uuid": _output(
+            ["blkid", "-o", "value", "-s", "UUID", "/dev/mapper/storage"],
+            "legacy storage filesystem UUID",
+        ),
+        "cache_luks_uuid": _output(
+            ["cryptsetup", "luksUUID", "/dev/disk/by-label/tdx-cache"],
+            "legacy tdx-cache LUKS UUID",
+        ),
+        "cache_filesystem_uuid": _output(
+            ["blkid", "-o", "value", "-s", "UUID", "/dev/mapper/tdx-cache"],
+            "legacy tdx-cache filesystem UUID",
+        ),
+        "cache_filesystem_type": _output(
+            ["blkid", "-o", "value", "-s", "TYPE", "/dev/mapper/tdx-cache"],
+            "legacy tdx-cache filesystem type",
+        ),
+    }
+    for field, value in observed.items():
+        if value != state[field]:
+            raise LegacyCutoverError(f"legacy source identity changed: {field}")
+    _require_source_generations(state)
 
 
 def _require_filesystems_unmounted() -> None:
@@ -1008,14 +1162,95 @@ def _finalize_acknowledged_source(state: dict[str, Any]) -> bool:
     reloaded = _load_cutover_state(CUTOVER_STATE_PATH)
     reloaded, marker = _reconcile_cutover_fence(reloaded)
     if reloaded != state or marker != _fence_marker_document(state):
-        raise LegacyCutoverError(
-            "cutover state changed before source fence release"
-        )
+        raise LegacyCutoverError("cutover state changed before source fence release")
     _unlink_private(CUTOVER_FENCE_MARKER_PATH)
     return True
 
 
-async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
+def _aborted_result() -> dict[str, Any]:
+    return {
+        "schema": "chutes.legacy-gpu-cutover-aborted",
+        "version": 1,
+        "status": "aborted",
+    }
+
+
+def _finalize_prequiescence_abort(
+    state: dict[str, Any],
+    bundle_path: str,
+) -> dict[str, Any]:
+    if state.get("phase") != "abort_requested":
+        raise LegacyCutoverError("only an abort-requested cutover can be finalized")
+    if _path_present(CUTOVER_FENCE_MARKER_PATH):
+        state, marker = _reconcile_cutover_fence(state)
+        if marker != _fence_marker_document(state):
+            raise LegacyCutoverError("abort state is not durably fenced")
+        _unlink_private(CUTOVER_FENCE_MARKER_PATH)
+    for path in (
+        CLOSURE_PATH,
+        AUTHORIZATION_PATH,
+        bundle_path,
+        K3S_ADMIN_KUBECONFIG,
+        CUTOVER_PENDING_STATE_PATH,
+        CUTOVER_STATE_PATH,
+    ):
+        _unlink_private(path)
+    return _aborted_result()
+
+
+def _abort_legacy_cutover_unlocked(bundle_path: str) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise LegacyCutoverError("legacy GPU cutover abort must run as root")
+    _verify_host_mount_namespace()
+    marker_present = _path_present(CUTOVER_FENCE_MARKER_PATH)
+    if not _path_present(CUTOVER_STATE_PATH):
+        if marker_present:
+            raise LegacyCutoverError("cutover fence has no durable state to abort")
+        for path in (
+            CLOSURE_PATH,
+            AUTHORIZATION_PATH,
+            bundle_path,
+            K3S_ADMIN_KUBECONFIG,
+        ):
+            _unlink_private(path)
+        return _aborted_result()
+
+    state = _load_cutover_state(CUTOVER_STATE_PATH)
+    if state["phase"] == "prepared":
+        state, _marker = _reconcile_cutover_fence(
+            state,
+            repair_prepared=True,
+        )
+        _require_prequiescence_source(state)
+        updated = dict(state)
+        updated["phase"] = "abort_requested"
+        state = _persist_state_transition(state, updated)
+    elif state["phase"] == "abort_requested":
+        if marker_present:
+            state, _marker = _reconcile_cutover_fence(state)
+    else:
+        raise LegacyCutoverError(
+            "legacy cutover cannot abort after quiescence has begun"
+        )
+    return _finalize_prequiescence_abort(state, bundle_path)
+
+
+def abort_legacy_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
+    with _cutover_lock():
+        return _abort_legacy_cutover_unlocked(bundle_path)
+
+
+def _has_durable_cutover_progress() -> bool:
+    if not _path_present(CUTOVER_STATE_PATH):
+        return False
+    try:
+        _load_cutover_state(CUTOVER_STATE_PATH)
+    except (LegacyCutoverError, OSError):
+        return False
+    return True
+
+
+async def _run_cutover_unlocked(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise LegacyCutoverError("legacy GPU cutover must run as root")
     _verify_host_mount_namespace()
@@ -1032,6 +1267,11 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
         raise LegacyCutoverError(
             "root-visible cutover fence has no mounted recovery state"
         )
+    if state is not None and state["phase"] == "abort_requested":
+        if marker_present:
+            state, _marker = _reconcile_cutover_fence(state)
+        return _finalize_prequiescence_abort(state, bundle_path)
+
     if (
         state is not None
         and state["phase"] == "transfer_acknowledged"
@@ -1098,6 +1338,7 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     if state["phase"] == "k3s_quiesced":
         _require_k3s_quiesced()
         os.sync()
+        _require_source_generations(state)
         for path in _LEGACY_MOUNTS:
             _unmount(path)
         os.sync()
@@ -1195,12 +1436,21 @@ async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
     return state["api_result"]
 
 
-def recover_legacy_cutover() -> None:
+async def run_cutover(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
+    with _cutover_lock():
+        return await _run_cutover_unlocked(bundle_path)
+
+
+def _recover_legacy_cutover_unlocked() -> None:
     if os.geteuid() != 0:
         raise LegacyCutoverError("legacy GPU recovery must run as root")
     if not Path(CUTOVER_STATE_PATH).is_file():
         raise LegacyCutoverError("no failed legacy cutover requires recovery")
     state = _load_cutover_state(CUTOVER_STATE_PATH)
+    if state["phase"] == "abort_requested":
+        _finalize_prequiescence_abort(state, BUNDLE_PATH)
+        return
+
     if (
         state["phase"] == "transfer_acknowledged"
         and not _path_present(CUTOVER_FENCE_MARKER_PATH)
@@ -1219,6 +1469,11 @@ def recover_legacy_cutover() -> None:
     action = "poweroff" if state["phase"] == "transfer_acknowledged" else "reboot"
     if _run(["systemctl", action, "--no-block"]).returncode != 0:
         raise LegacyCutoverError(f"legacy recovery {action} failed")
+
+
+def recover_legacy_cutover() -> None:
+    with _cutover_lock():
+        _recover_legacy_cutover_unlocked()
 
 
 def enforce_reboot_fence() -> None:
@@ -1240,5 +1495,5 @@ def run(bundle_path: str = BUNDLE_PATH) -> dict[str, Any]:
             kubeconfig = _load_bundle(bundle_path)["kubeconfig_path"]
         return asyncio.run(run_cutover(bundle_path))
     finally:
-        if kubeconfig:
-            Path(kubeconfig).unlink(missing_ok=True)
+        if kubeconfig and _has_durable_cutover_progress():
+            _unlink_private(kubeconfig)

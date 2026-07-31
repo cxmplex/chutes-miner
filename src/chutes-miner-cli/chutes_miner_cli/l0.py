@@ -43,9 +43,11 @@ from chutes_miner_cli.legacy_cutover import (
     BUNDLE_PATH as LEGACY_CUTOVER_BUNDLE_PATH,
     K3S_ADMIN_KUBECONFIG,
     LegacyCutoverError,
+    abort_legacy_cutover,
     enforce_reboot_fence,
+    persist_cutover_bundle,
     recover_legacy_cutover,
-    rebind_closure_authorization,
+    require_cutover_initiation_access,
     run as run_legacy_cutover,
 )
 
@@ -1171,6 +1173,12 @@ def gpu_legacy_cutover(
             raise L0CliError("operator cutover bundle path must match the installed service")
         if not _ID.fullmatch(host_id) or not _ID.fullmatch(legacy_server_id):
             raise L0CliError("legacy cutover host/server identity is invalid")
+        if kubeconfig_path != K3S_ADMIN_KUBECONFIG:
+            raise L0CliError("legacy cutover kubeconfig must use the persisted K3s admin contract")
+        try:
+            require_cutover_initiation_access()
+        except LegacyCutoverError as exc:
+            raise L0CliError(str(exc)) from exc
         target = f"/hosts/{quote(host_id, safe='')}/gpu/migrations/legacy/authorize"
         async with aiohttp.ClientSession() as session:
             status_code, payload = await _api_request(
@@ -1185,8 +1193,6 @@ def gpu_legacy_cutover(
                     "legacy_server_id": legacy_server_id,
                 },
             )
-        if kubeconfig_path != K3S_ADMIN_KUBECONFIG:
-            raise L0CliError("legacy cutover kubeconfig must use the persisted K3s admin contract")
         payload = _require_success(
             status_code,
             payload,
@@ -1226,11 +1232,7 @@ def gpu_legacy_cutover(
             "ca_path": ca_path,
             "kubeconfig_path": kubeconfig_path,
         }
-        write_private(
-            Path(bundle_path),
-            canonical_json_bytes(bundle) + b"\n",
-        )
-        rebind_closure_authorization(payload["cutover_authorization"])
+        persist_cutover_bundle(bundle)
         result = subprocess.run(  # nosec B603
             ["systemctl", "start", "chutes-legacy-gpu-cutover.service"],
             check=False,
@@ -1293,6 +1295,17 @@ def gpu_legacy_cutover_retry() -> None:
     if result.returncode != 0:
         _print_cli_error("legacy GPU cutover retry failed")
         raise typer.Exit(1)
+
+
+@l0_app.command("gpu-legacy-cutover-abort")
+def gpu_legacy_cutover_abort() -> None:
+    """Cancel a cutover only while the exact live source is still running."""
+    try:
+        result = abort_legacy_cutover()
+        typer.echo(json.dumps(result, sort_keys=True))
+    except LegacyCutoverError as exc:
+        _print_cli_error(str(exc))
+        raise typer.Exit(1) from None
 
 
 @l0_app.command("gpu-legacy-cutover-fence", hidden=True)

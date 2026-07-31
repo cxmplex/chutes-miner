@@ -63,8 +63,12 @@ sudo chutes-miner l0 gpu-legacy-cutover \
 
 The command starts the packaged cutover service. Use
 `gpu-legacy-cutover-retry` if the transfer response is interrupted after the
-mappings close, or `gpu-legacy-recover` to reboot through unchanged legacy key
-release when custody was not transferred.
+mappings close. While K3s and both exact source volumes are still live, use
+`gpu-legacy-cutover-abort` to durably cancel and clear the reboot fence; abort is
+rejected once quiescence starts. Use `gpu-legacy-recover` to reboot through
+unchanged legacy key release when custody was not transferred. A new initiation
+after a completed abort requires one reboot of the live source so the measured
+boot sequence can regenerate and validate its root-only runtime kubeconfig.
 
 `prepare-boot` always writes both the one-use enrollment script and the voucher-free steady-state
 script. Add `--wait` to poll readiness with a finite monotonic deadline; it does not delay either

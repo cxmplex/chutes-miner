@@ -3,6 +3,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from chutes_miner_cli import legacy_cutover
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "ansible/k3s/roles/chutes-miner/files/prepare-legacy-kubeconfig.py"
@@ -24,6 +25,29 @@ def test_normal_boot_copies_before_source_purge(monkeypatch, tmp_path):
     assert runtime.read_text(encoding="ascii") == "apiVersion: v1\nclusters: []\n"
     assert stat.S_IMODE(runtime.stat().st_mode) == 0o600
 
+    # The measured post-start path has intentionally purged the source. A normal
+    # initiation consumes and validates the already-prepared runtime copy; it
+    # must not try to restart the source-based preparation service.
+    observed = []
+    monkeypatch.setattr(
+        legacy_cutover,
+        "CUTOVER_STATE_PATH",
+        str(tmp_path / "missing-state.json"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "CUTOVER_LOCK_PATH",
+        str(tmp_path / "operation.lock"),
+    )
+    monkeypatch.setattr(legacy_cutover, "K3S_ADMIN_KUBECONFIG", str(runtime))
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_verified_postgres_password",
+        lambda path: observed.append(path) or "stable-postgres-password",
+    )
+    legacy_cutover.require_cutover_initiation_access()
+    assert observed == [str(runtime)]
+
     service = (
         ROOT / "ansible/k3s/roles/chutes-miner/files/chutes-legacy-gpu-cutover.service"
     ).read_text(encoding="utf-8")
@@ -41,7 +65,11 @@ def test_normal_boot_copies_before_source_purge(monkeypatch, tmp_path):
     assert "Before=k3s-post-start.service" in prepare_service
     assert "Requires=chutes-legacy-kubeconfig-prepare.service" in drop_in
     assert "KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml" in service
-    assert "ExecStopPost=/usr/bin/rm -f /run/chutes/legacy-k3s-admin.yaml" in service
+    assert "ExecStopPost=" not in service
+    cli_source = (
+        ROOT / "src/chutes-miner-cli/chutes_miner_cli/l0.py"
+    ).read_text(encoding="utf-8")
+    assert "chutes-legacy-kubeconfig-prepare.service" not in cli_source
 
 
 def test_prepare_rejects_missing_source(tmp_path):

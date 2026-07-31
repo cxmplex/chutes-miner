@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import stat
+import threading
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -156,16 +157,24 @@ def _patch_runtime(monkeypatch, tmp_path, state: dict | None = None):
     closure_path = durable_dir / "closure.json"
     authorization_path = durable_dir / "authorization.json"
     source_absence_path = durable_dir / "source-absence.json"
+    lock_path = durable_dir / "operation.lock"
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text("bundle", encoding="ascii")
+    monkeypatch.setattr(legacy_cutover, "BUNDLE_PATH", str(bundle_path))
     monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
     monkeypatch.setattr(
         legacy_cutover,
         "CUTOVER_PENDING_STATE_PATH",
         str(pending_state_path),
     )
+    monkeypatch.setattr(legacy_cutover, "CUTOVER_LOCK_PATH", str(lock_path))
     monkeypatch.setattr(legacy_cutover, "CLOSURE_PATH", str(closure_path))
     monkeypatch.setattr(legacy_cutover, "AUTHORIZATION_PATH", str(authorization_path))
+    monkeypatch.setattr(
+        legacy_cutover,
+        "K3S_ADMIN_KUBECONFIG",
+        str(durable_dir / "admin.yaml"),
+    )
     monkeypatch.setattr(
         legacy_cutover,
         "CUTOVER_SOURCE_ABSENCE_PATH",
@@ -193,6 +202,11 @@ def _patch_runtime(monkeypatch, tmp_path, state: dict | None = None):
     )
     monkeypatch.setattr(legacy_cutover, "_require_k3s_quiesced", lambda: None)
     monkeypatch.setattr(legacy_cutover, "_require_filesystems_unmounted", lambda: None)
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_generation",
+        lambda root: 4 if root == "/cache/storage" else 9,
+    )
     monkeypatch.setattr(legacy_cutover, "_require_mappers_closed", lambda: None)
     if state is not None:
         legacy_cutover._write_private_json(str(state_path), state)
@@ -891,6 +905,150 @@ def test_rebind_persists_one_canonical_authorization_envelope(monkeypatch, tmp_p
     }
 
 
+def test_persist_cutover_bundle_rebinds_under_one_operation_lock(
+    monkeypatch,
+    tmp_path,
+):
+    _state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    bundle = _bundle() | {"cutover_authorization": "replacement-token"}
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_bundle",
+        lambda path: json.loads(Path(path).read_text(encoding="ascii")),
+    )
+
+    legacy_cutover.persist_cutover_bundle(bundle)
+
+    assert json.loads(bundle_path.read_text(encoding="ascii")) == bundle
+    envelope = json.loads(
+        Path(legacy_cutover.AUTHORIZATION_PATH).read_text(encoding="ascii")
+    )
+    assert envelope["cutover_authorization"] == "replacement-token"
+
+
+def test_authorization_rebind_waits_for_state_transition_barrier(
+    monkeypatch,
+    tmp_path,
+):
+    state = _source_state("prepared")
+    state_path, _closure_path, _bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        state,
+    )
+    pending_written = threading.Event()
+    allow_transition = threading.Event()
+    rebind_finished = threading.Event()
+    errors = []
+    real_write = legacy_cutover._write_private_json
+
+    def barrier_write(path, document):
+        real_write(path, document)
+        if (
+            path == legacy_cutover.CUTOVER_PENDING_STATE_PATH
+            and document.get("phase") == "k3s_quiesced"
+        ):
+            pending_written.set()
+            if not allow_transition.wait(5):
+                raise AssertionError("state transition barrier timed out")
+
+    monkeypatch.setattr(legacy_cutover, "_write_private_json", barrier_write)
+
+    def transition_worker():
+        try:
+            with legacy_cutover._cutover_lock():
+                updated = dict(state)
+                updated["phase"] = "k3s_quiesced"
+                legacy_cutover._persist_state_transition(state, updated)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def rebind_worker():
+        try:
+            legacy_cutover.rebind_closure_authorization("replacement-token")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            rebind_finished.set()
+
+    transition_thread = threading.Thread(target=transition_worker)
+    rebind_thread = threading.Thread(target=rebind_worker)
+    transition_thread.start()
+    assert pending_written.wait(5)
+    rebind_thread.start()
+    assert not rebind_finished.wait(0.2)
+    assert Path(legacy_cutover.CUTOVER_PENDING_STATE_PATH).exists()
+
+    allow_transition.set()
+    transition_thread.join(5)
+    rebind_thread.join(5)
+    assert not transition_thread.is_alive()
+    assert not rebind_thread.is_alive()
+    assert errors == []
+    assert json.loads(state_path.read_text(encoding="ascii"))["phase"] == (
+        "k3s_quiesced"
+    )
+    marker = json.loads(
+        Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).read_text(encoding="ascii")
+    )
+    assert marker["pending_state_sha256"] is None
+    assert not Path(legacy_cutover.CUTOVER_PENDING_STATE_PATH).exists()
+    envelope = json.loads(
+        Path(legacy_cutover.AUTHORIZATION_PATH).read_text(encoding="ascii")
+    )
+    assert envelope["cutover_authorization"] == "replacement-token"
+
+
+def test_durable_cutover_reauthorization_does_not_require_live_kubeconfig(
+    monkeypatch,
+    tmp_path,
+):
+    _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("mappers_closed"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_verified_postgres_password",
+        lambda _path: pytest.fail("durable reauthorization touched kubeconfig"),
+    )
+
+    legacy_cutover.require_cutover_initiation_access()
+
+
+def test_new_cutover_after_terminal_abort_requires_reboot_for_runtime_kubeconfig(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, _closure_path, _bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    state_path.unlink()
+    Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).unlink()
+
+    def unavailable(_path):
+        raise legacy_cutover.LegacyCutoverError("runtime copy is absent")
+
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_verified_postgres_password",
+        unavailable,
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="reboot the live source",
+    ):
+        legacy_cutover.require_cutover_initiation_access()
+
+
 def test_acknowledged_state_rejects_noncontract_api_receipt_fields(monkeypatch):
     state = _acknowledged_state()
     state["api_result"]["unexpected"] = "must-not-persist"
@@ -1214,6 +1372,8 @@ def test_cutover_service_and_dependencies_are_exactly_pinned():
     assert "PrivateTmp=yes" in service
     assert "ProtectSystem=strict" in service
     assert "RequiresMountsFor=/var/lib/chutes/legacy-gpu-cutover" in service
+    assert "ExecStopPost=" not in service
+    assert "_has_durable_cutover_progress()" in source
     assert "ConditionPathExists=|/var/lib/chutes/legacy-gpu-cutover/state.json" in service
     assert "ConditionPathExists=|/etc/chutes/legacy-gpu-cutover/fence.json" in service
     assert "/etc/chutes/legacy-gpu-cutover" in service
@@ -1296,6 +1456,11 @@ async def test_missing_admin_kubeconfig_fails_before_quiesce(monkeypatch, tmp_pa
     bundle_path = tmp_path / "bundle"
     bundle_path.write_text("bundle", encoding="ascii")
     monkeypatch.setattr(legacy_cutover, "CUTOVER_STATE_PATH", str(state_path))
+    monkeypatch.setattr(
+        legacy_cutover,
+        "CUTOVER_LOCK_PATH",
+        str(tmp_path / "operation.lock"),
+    )
     _patch_fence(monkeypatch, tmp_path)
     monkeypatch.setattr(legacy_cutover, "CLOSURE_PATH", str(closure_path))
     monkeypatch.setattr(
@@ -1321,3 +1486,344 @@ async def test_missing_admin_kubeconfig_fails_before_quiesce(monkeypatch, tmp_pa
     assert not state_path.exists()
     assert not Path(legacy_cutover.AUTHORIZATION_PATH).exists()
     assert [legacy_cutover.K3S_SHUTDOWN_HELPER] not in calls
+
+
+@pytest.mark.asyncio
+async def test_volume_generations_are_rechecked_before_any_unmount(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("k3s_quiesced"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_generation",
+        lambda root: 5 if root == "/cache/storage" else 9,
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_unmount",
+        lambda _path: pytest.fail("stale generation reached unmount"),
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="volume generation changed before unmount",
+    ):
+        await legacy_cutover.run_cutover(str(bundle_path))
+
+    persisted = json.loads(state_path.read_text(encoding="ascii"))
+    assert persisted["phase"] == "k3s_quiesced"
+
+
+def _patch_live_prequiescence_source(monkeypatch, state, *, identity_change=None):
+    commands = []
+    identities = {
+        ("cryptsetup", "luksUUID", "/dev/disk/by-label/storage"): state[
+            "storage_luks_uuid"
+        ],
+        ("blkid", "-o", "value", "-s", "UUID", "/dev/mapper/storage"): state[
+            "storage_filesystem_uuid"
+        ],
+        ("cryptsetup", "luksUUID", "/dev/disk/by-label/tdx-cache"): state[
+            "cache_luks_uuid"
+        ],
+        ("blkid", "-o", "value", "-s", "UUID", "/dev/mapper/tdx-cache"): state[
+            "cache_filesystem_uuid"
+        ],
+        ("blkid", "-o", "value", "-s", "TYPE", "/dev/mapper/tdx-cache"): state[
+            "cache_filesystem_type"
+        ],
+    }
+    if identity_change is not None:
+        identities[identity_change] = "changed"
+
+    def run(argv):
+        commands.append(tuple(argv))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def output(argv, _label, *, lower=True):
+        value = identities[tuple(argv)]
+        return value.lower() if lower else value
+
+    monkeypatch.setattr(legacy_cutover, "_run", run)
+    monkeypatch.setattr(legacy_cutover, "_mountpoint", lambda _path: True)
+    monkeypatch.setattr(legacy_cutover.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(legacy_cutover, "_output", output)
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_generation",
+        lambda root: (
+            state["storage_generation"]
+            if root == "/cache/storage"
+            else state["cache_generation"]
+        ),
+    )
+    return commands
+
+
+def test_prequiescence_abort_revalidates_exact_live_source(monkeypatch):
+    state = _source_state("prepared")
+    commands = _patch_live_prequiescence_source(monkeypatch, state)
+
+    legacy_cutover._require_prequiescence_source(state)
+
+    assert commands == [
+        ("systemctl", "is-active", "--quiet", "k3s.service"),
+        ("cryptsetup", "status", "storage"),
+        ("cryptsetup", "status", "tdx-cache"),
+    ]
+
+
+def test_prequiescence_abort_rejects_inactive_k3s(monkeypatch):
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_run",
+        lambda _argv: SimpleNamespace(returncode=3, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_mountpoint",
+        lambda _path: pytest.fail("inactive K3s reached mount checks"),
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="cannot abort after K3s quiescence",
+    ):
+        legacy_cutover._require_prequiescence_source(_source_state("prepared"))
+
+
+def test_prequiescence_abort_rejects_source_identity_drift(monkeypatch):
+    state = _source_state("prepared")
+    _patch_live_prequiescence_source(
+        monkeypatch,
+        state,
+        identity_change=(
+            "blkid",
+            "-o",
+            "value",
+            "-s",
+            "UUID",
+            "/dev/mapper/tdx-cache",
+        ),
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="legacy source identity changed: cache_filesystem_uuid",
+    ):
+        legacy_cutover._require_prequiescence_source(state)
+
+
+def test_prequiescence_abort_clears_fence_and_sensitive_state(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_require_prequiescence_source",
+        lambda _state: None,
+    )
+    kubeconfig = Path(legacy_cutover.K3S_ADMIN_KUBECONFIG)
+    kubeconfig.write_text("credential", encoding="ascii")
+
+    result = legacy_cutover.abort_legacy_cutover(str(bundle_path))
+
+    assert result == {
+        "schema": "chutes.legacy-gpu-cutover-aborted",
+        "version": 1,
+        "status": "aborted",
+    }
+    assert not state_path.exists()
+    assert not closure_path.exists()
+    assert not Path(legacy_cutover.AUTHORIZATION_PATH).exists()
+    assert not Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).exists()
+    assert not bundle_path.exists()
+    assert not kubeconfig.exists()
+
+
+def test_prequiescence_abort_repairs_missing_initial_fence(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).unlink()
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_require_prequiescence_source",
+        lambda _state: None,
+    )
+
+    result = legacy_cutover.abort_legacy_cutover(str(bundle_path))
+
+    assert result["status"] == "aborted"
+    assert not state_path.exists()
+    assert not Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).exists()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["k3s_quiesced", "filesystems_unmounted", "mappers_closed", "transfer_acknowledged"],
+)
+def test_abort_is_rejected_after_quiescence(
+    monkeypatch,
+    tmp_path,
+    phase,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state(phase) if phase != "transfer_acknowledged" else _acknowledged_state(),
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="cannot abort after quiescence",
+    ):
+        legacy_cutover.abort_legacy_cutover(str(bundle_path))
+
+    assert state_path.exists()
+    assert Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).exists()
+
+
+def test_prepared_phase_cannot_abort_after_physical_quiescence(
+    monkeypatch,
+    tmp_path,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_require_prequiescence_source",
+        lambda _state: (_ for _ in ()).throw(
+            legacy_cutover.LegacyCutoverError(
+                "legacy cutover cannot abort after K3s quiescence has begun"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        legacy_cutover.LegacyCutoverError,
+        match="cannot abort after K3s quiescence",
+    ):
+        legacy_cutover.abort_legacy_cutover(str(bundle_path))
+
+    assert json.loads(state_path.read_text(encoding="ascii"))["phase"] == "prepared"
+    assert Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).exists()
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_abort_recovers_crash_at_root_fence_clear(
+    monkeypatch,
+    tmp_path,
+    side,
+):
+    state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_require_prequiescence_source",
+        lambda _state: None,
+    )
+    real_unlink = legacy_cutover._unlink_private
+    crashed = False
+
+    def crash_fence(path):
+        nonlocal crashed
+        if path != legacy_cutover.CUTOVER_FENCE_MARKER_PATH or crashed:
+            return real_unlink(path)
+        crashed = True
+        if side == "before":
+            raise RuntimeError("crash before abort fence clear")
+        real_unlink(path)
+        raise RuntimeError("crash after abort fence clear")
+
+    monkeypatch.setattr(legacy_cutover, "_unlink_private", crash_fence)
+    with pytest.raises(RuntimeError, match="crash .* abort fence clear"):
+        legacy_cutover.abort_legacy_cutover(str(bundle_path))
+    assert crashed
+    assert json.loads(state_path.read_text(encoding="ascii"))["phase"] == (
+        "abort_requested"
+    )
+
+    monkeypatch.setattr(legacy_cutover, "_unlink_private", real_unlink)
+    result = legacy_cutover.abort_legacy_cutover(str(bundle_path))
+    assert result["status"] == "aborted"
+    assert not state_path.exists()
+    assert not Path(legacy_cutover.CUTOVER_FENCE_MARKER_PATH).exists()
+
+
+def test_runtime_kubeconfig_survives_failure_before_durable_progress(
+    monkeypatch,
+    tmp_path,
+):
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("bundle", encoding="ascii")
+    kubeconfig = tmp_path / "admin.yaml"
+    kubeconfig.write_text("credential", encoding="ascii")
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_bundle",
+        lambda _path: {"kubeconfig_path": str(kubeconfig)},
+    )
+    monkeypatch.setattr(
+        legacy_cutover,
+        "CUTOVER_STATE_PATH",
+        str(tmp_path / "missing-state.json"),
+    )
+    monkeypatch.setattr(legacy_cutover, "run_cutover", lambda _path: object())
+
+    def fail_before_progress(_value):
+        raise legacy_cutover.LegacyCutoverError("capture failed")
+
+    monkeypatch.setattr(legacy_cutover.asyncio, "run", fail_before_progress)
+
+    with pytest.raises(legacy_cutover.LegacyCutoverError, match="capture failed"):
+        legacy_cutover.run(str(bundle_path))
+    assert kubeconfig.exists()
+
+
+def test_runtime_kubeconfig_is_removed_after_durable_prepared_state(
+    monkeypatch,
+    tmp_path,
+):
+    _state_path, _closure_path, bundle_path = _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        _source_state("prepared"),
+    )
+    kubeconfig = tmp_path / "admin.yaml"
+    kubeconfig.write_text("credential", encoding="ascii")
+    monkeypatch.setattr(
+        legacy_cutover,
+        "_load_bundle",
+        lambda _path: {"kubeconfig_path": str(kubeconfig)},
+    )
+    monkeypatch.setattr(legacy_cutover, "run_cutover", lambda _path: object())
+    monkeypatch.setattr(
+        legacy_cutover.asyncio,
+        "run",
+        lambda _value: {"status": "still_prepared"},
+    )
+
+    assert legacy_cutover.run(str(bundle_path))["status"] == "still_prepared"
+    assert not kubeconfig.exists()
