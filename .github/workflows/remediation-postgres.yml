@@ -41,6 +41,7 @@ jobs:
         run: >-
           poetry run pytest -q
           tests/chutes-miner/*_postgres.py
+          tests/chutes-miner/test_migration_hash_manifest.py
           tests/chutes-miner/test_legacy_chute_source_migration.py
           --junitxml=miner-postgres.xml
       - name: Reject skipped real-PostgreSQL tests
