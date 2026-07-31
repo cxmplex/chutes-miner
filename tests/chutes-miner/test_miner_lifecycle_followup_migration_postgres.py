@@ -273,14 +273,35 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
                   'launch_create_results_sha256', 'resource_discovery',
                   'resource_discovery_sha256', 'resource_discovered_at'
               );
+            SELECT to_regclass('registry_scope_intents') IS NOT NULL;
+            SELECT COUNT(*)
+            FROM pg_constraint AS constraint_row
+            JOIN pg_class AS table_row
+              ON table_row.oid = constraint_row.conrelid
+            JOIN pg_namespace AS namespace_row
+              ON namespace_row.oid = table_row.relnamespace
+            WHERE namespace_row.nspname = current_schema()
+              AND table_row.relname = 'registry_scope_intents'
+              AND constraint_row.conname =
+                  'registry_scope_intents_launch_intent_id_fkey';
             """,
             schema=schema,
             tuples_only=True,
         )
         _assert_ok(inspected)
         assert [
-            line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["t", "7", "2", "10", "7"]
+            line.strip()
+            for line in inspected.stdout.decode().splitlines()
+            if line.strip()
+        ] == [
+            "t",
+            "7",
+            "2",
+            "10",
+            "7",
+            "t" if baseline == "metadata" else "f",
+            "1" if baseline == "metadata" else "0",
+        ]
 
         _assert_ok(_psql(f"BEGIN;\n{FOLLOWUP_DOWN}\nCOMMIT;", schema=schema))
         restored = _psql(
@@ -305,14 +326,31 @@ def test_followup_applies_and_downs_on_both_supported_starting_schemas(baseline:
                   'launch_create_results_sha256', 'resource_discovery',
                   'resource_discovery_sha256', 'resource_discovered_at'
               );
+            SELECT to_regclass('registry_scope_intents') IS NOT NULL;
+            SELECT COUNT(*)
+            FROM pg_constraint AS constraint_row
+            JOIN pg_class AS table_row
+              ON table_row.oid = constraint_row.conrelid
+            JOIN pg_namespace AS namespace_row
+              ON namespace_row.oid = table_row.relnamespace
+            WHERE namespace_row.nspname = current_schema()
+              AND table_row.relname = 'registry_scope_intents'
+              AND constraint_row.conname =
+                  'registry_scope_intents_launch_intent_id_fkey';
             """,
             schema=schema,
             tuples_only=True,
         )
         _assert_ok(restored)
-        assert [line.strip() for line in restored.stdout.decode().splitlines() if line.strip()] == [
+        assert [
+            line.strip()
+            for line in restored.stdout.decode().splitlines()
+            if line.strip()
+        ] == [
             "t",
             "0",
+            "0",
+            "t" if baseline == "metadata" else "f",
             "0",
         ]
     finally:
@@ -358,7 +396,9 @@ def test_followup_failed_down_preserves_catalog_and_history():
         )
         _assert_ok(preserved)
         assert [
-            line.strip() for line in preserved.stdout.decode().splitlines() if line.strip()
+            line.strip()
+            for line in preserved.stdout.decode().splitlines()
+            if line.strip()
         ] == ["1", "1"]
     finally:
         _assert_ok(_psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'))

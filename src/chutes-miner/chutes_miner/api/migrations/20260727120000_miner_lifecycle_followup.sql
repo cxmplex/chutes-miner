@@ -1288,4 +1288,9 @@ ALTER TABLE deployment_launch_operations
     DROP COLUMN IF EXISTS cluster_context,
     DROP COLUMN IF EXISTS launch_intent_id;
 
+-- Metadata-created validation schemas can already contain this later migration's
+-- table. Remove only its exact dependency; never cascade away registry history.
+ALTER TABLE IF EXISTS registry_scope_intents
+    DROP CONSTRAINT IF EXISTS registry_scope_intents_launch_intent_id_fkey;
+
 DROP TABLE IF EXISTS miner_launch_intents;
