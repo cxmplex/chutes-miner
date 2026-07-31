@@ -58,15 +58,23 @@
         dest: ~/.kube/config
         mode: "0600"
 
-- name: Disable audit exporter
+- name: Remove unsupported legacy audit exporter from MicroK8s
+  when: inventory_hostname in groups['microk8s']
   kubernetes.core.k8s:
-    state: patched
+    context: default
+    state: absent
     kind: CronJob
-    name: "{{ cronjob_name | default('audit-exporter') }}"
+    name: audit-exporter
     namespace: "{{ chutes_namespace | default('chutes') }}"
-    definition:
-      spec:
-        suspend: true
+
+- name: Remove unsupported legacy audit exporter from k3s
+  when: inventory_hostname in groups['control']
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    state: absent
+    kind: CronJob
+    name: audit-exporter
+    namespace: "{{ chutes_namespace | default('chutes') }}"
 
 - name: Remove retired gepetto source override from MicroK8s
   when: inventory_hostname in groups['microk8s']

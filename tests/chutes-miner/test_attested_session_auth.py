@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -354,6 +357,62 @@ def test_dev_helpers_use_public_owner_without_wallet_material():
         root / "src/chutes-miner/chutes_miner/api/server/verification.py"
     ).read_text()
     assert "miner_" + "keypair" not in verification
+    for source_root in (
+        root / "src/chutes-miner",
+        root / "src/chutes-common",
+    ):
+        for path in source_root.rglob("*.py"):
+            assert "settings." + "miner_keypair" not in path.read_text()
+
+
+def test_merged_dev_compose_contains_only_public_owner_identity():
+    docker = shutil.which("docker")
+    if docker is None or subprocess.run(
+        [docker, "compose", "version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).returncode:
+        pytest.skip("Docker Compose is unavailable")
+
+    root = Path(__file__).resolve().parents[2]
+    compose_dir = root / "docker/chutes-miner"
+    environment = {
+        **os.environ,
+        "PROJECT": "hardening-test",
+        "BRANCH_NAME": "review",
+        "BUILD_NUMBER": "1",
+    }
+    resolved = subprocess.run(
+        [
+            docker,
+            "compose",
+            "-f",
+            "docker-compose.yaml",
+            "-f",
+            "docker-compose.override.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=compose_dir,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    document = json.loads(resolved.stdout)
+    api_environment = document["services"]["api"]["environment"]
+    assert {
+        key: value
+        for key, value in api_environment.items()
+        if key.startswith("MINER_")
+    } == {
+        "MINER_OWNER_SS58": "5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj"
+    }
+    serialized = json.dumps(document, sort_keys=True)
+    assert "MINER_SS58" not in serialized
+    assert "MINER_SEED" not in serialized
 
 
 def test_seedless_workload_cache_redis_and_registry_scopes_are_ephemeral():

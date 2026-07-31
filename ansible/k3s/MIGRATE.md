@@ -158,7 +158,7 @@ ansible-playbook -i ~/chutes/inventory.yml playbooks/migrate.yml --tags migrate-
 **What happens:**
 - Verifies `chutes-miner-cli` installation
 - Checks Chutes components readiness
-    * Disables the audit exporter cronjob
+    * Removes the unsupported legacy audit exporter CronJob
     * Overwrites the gepetto configmap to avoid reconciliation loops overriding each other
     * Ensure miner credentials exist in the k3s control plane
 - Gathers node information (costs, GPU types)

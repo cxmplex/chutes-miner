@@ -1,3 +1,4 @@
+import base64
 import json
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ from cross_repo_tests import repository_root
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_LABEL = {"chutes/seedless-control-plane": "true"}
 STACK_IMAGE = f"chutes.local/seedless-stack@sha256:{'a' * 64}"
+OWNER_SS58 = "5PublicOwnerIdentity"
 
 
 def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
@@ -19,8 +21,7 @@ def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
     sek8s_fixture = sek8s_root / "tests/fixtures/legacy_gpu_cutover_state_v1.json"
     assert miner_fixture.read_bytes() == sek8s_fixture.read_bytes()
     setup_storage = (
-        sek8s_root
-        / "ansible/guest/roles/luks/files/initramfs/setup_storage"
+        sek8s_root / "ansible/guest/roles/luks/files/initramfs/setup_storage"
     ).read_text(encoding="utf-8")
     fence_call = '"$CUTOVER_FENCE_HELPER" "$cutover_fence" 0'
     assert 'CUTOVER_FENCE_RELATIVE="/etc/chutes/legacy-gpu-cutover/fence.json"' in (
@@ -35,7 +36,9 @@ def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
         "setup_cache",
         "stage_volume_generation",
     ):
-        assert setup_storage.index(fence_call) < setup_storage.index(f"if ! {operation}")
+        assert setup_storage.index(fence_call) < setup_storage.index(
+            f"if ! {operation}"
+        )
 
 
 def test_legacy_cutover_fence_contract_is_byte_exact_across_guest_and_miner():
@@ -76,6 +79,8 @@ def _render(chart: str) -> list[dict]:
             str(ROOT / f"charts/{chart}/values.yaml"),
             "--set-string",
             f"seedlessStack.image={STACK_IMAGE}",
+            "--set-string",
+            f"minerCredentials.ownerSs58={OWNER_SS58}",
         ]
     elif shutil.which("docker") is not None and (
         subprocess.run(
@@ -101,6 +106,8 @@ def _render(chart: str) -> list[dict]:
             f"charts/{chart}/values.yaml",
             "--set-string",
             f"seedlessStack.image={STACK_IMAGE}",
+            "--set-string",
+            f"minerCredentials.ownerSs58={OWNER_SS58}",
         ]
     else:
         pytest.skip("neither Helm nor the local alpine/helm image is available")
@@ -180,6 +187,65 @@ def test_rendered_registry_has_one_attested_certificate_binding():
     ]
 
 
+@pytest.mark.parametrize("chart", ["chutes-miner", "chutes-miner-gpu"])
+def test_rendered_charts_use_only_public_owner_identity(chart):
+    documents = _render(chart)
+    rendered = json.dumps(documents, sort_keys=True)
+    for forbidden in (
+        "MINER_SS58",
+        "MINER_SEED",
+        "minerCredentials.ss58Address",
+        "minerCredentials.secretSeed",
+        "secretSeed",
+    ):
+        assert forbidden not in rendered
+    assert not any(
+        item.get("metadata", {}).get("name") == "audit-exporter" for item in documents
+    )
+
+    owner_bindings = []
+    for document in documents:
+        if document.get("kind") not in {
+            "Deployment",
+            "DaemonSet",
+            "StatefulSet",
+            "CronJob",
+        }:
+            continue
+        if document["kind"] == "CronJob":
+            pod_spec = document["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+        else:
+            pod_spec = document["spec"]["template"]["spec"]
+        for container in [
+            *pod_spec.get("initContainers", []),
+            *pod_spec.get("containers", []),
+        ]:
+            owner_bindings.extend(
+                entry
+                for entry in container.get("env", [])
+                if entry.get("name") == "MINER_OWNER_SS58"
+            )
+
+    assert owner_bindings
+    assert all(
+        entry.get("valueFrom", {}).get("secretKeyRef")
+        == {"name": "miner-credentials", "key": "owner"}
+        for entry in owner_bindings
+    )
+
+    if chart == "chutes-miner":
+        credentials = next(
+            item
+            for item in documents
+            if item.get("kind") == "Secret"
+            and item.get("metadata", {}).get("name") == "miner-credentials"
+        )
+        assert set(credentials["data"]) == {"owner"}
+        assert (
+            base64.b64decode(credentials["data"]["owner"]).decode("ascii") == OWNER_SS58
+        )
+
+
 def test_fleet_uses_public_owner_chart_value_without_seed_material():
     parse_credentials = (
         ROOT / "ansible/k3s/tasks/charts/parse_credentials.yml"
@@ -187,13 +253,44 @@ def test_fleet_uses_public_owner_chart_value_without_seed_material():
     assert "owner_ss58" in parse_credentials
     assert "secretSeed" not in parse_credentials
     assert "miner_secret_seed" not in parse_credentials
+    assert "miner_ss58_address" not in parse_credentials
+    assert "miner_owner_ss58" in parse_credentials
     for name in ("deploy_miner.yml", "deploy_miner_gpu.yml"):
-        deployment = (
-            ROOT / "ansible/k3s/tasks/charts" / name
-        ).read_text(encoding="utf-8")
+        deployment = (ROOT / "ansible/k3s/tasks/charts" / name).read_text(
+            encoding="utf-8"
+        )
         assert "minerCredentials.ownerSs58" in deployment
         assert "minerCredentials.ss58Address" not in deployment
         assert "minerCredentials.secretSeed" not in deployment
+        assert "miner_owner_ss58" in deployment
+        assert "miner_ss58_address" not in deployment
+
+    migration = yaml.safe_load(
+        (ROOT / "ansible/k3s/tasks/migration/verify-chutes.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    cleanup_by_name = {task["name"]: task for task in migration}
+    microk8s_cleanup = cleanup_by_name[
+        "Remove unsupported legacy audit exporter from MicroK8s"
+    ]
+    assert microk8s_cleanup["when"] == "inventory_hostname in groups['microk8s']"
+    assert microk8s_cleanup["kubernetes.core.k8s"] == {
+        "context": "default",
+        "state": "absent",
+        "kind": "CronJob",
+        "name": "audit-exporter",
+        "namespace": "{{ chutes_namespace | default('chutes') }}",
+    }
+    k3s_cleanup = cleanup_by_name["Remove unsupported legacy audit exporter from k3s"]
+    assert k3s_cleanup["when"] == "inventory_hostname in groups['control']"
+    assert k3s_cleanup["kubernetes.core.k8s"] == {
+        "kubeconfig": "/etc/rancher/k3s/k3s.yaml",
+        "state": "absent",
+        "kind": "CronJob",
+        "name": "audit-exporter",
+        "namespace": "{{ chutes_namespace | default('chutes') }}",
+    }
 
 
 def test_migrated_install_reconstructs_measured_releases():

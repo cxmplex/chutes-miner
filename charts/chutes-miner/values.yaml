@@ -151,8 +151,6 @@ monitor:
     chutes/seedless-control-plane: "true"
   affinity: {}
 
-# Miner credentials - These are provided via Ansible deployment
-# These values are automatically injected during deployment and should not be set manually
-# as they are sensitive values
+# Public miner owner identity, injected by Ansible during deployment.
 minerCredentials:
-  ownerSs58: "REPLACE_WITH_ATTESTED_OWNER_SS58"
+  ownerSs58: ""

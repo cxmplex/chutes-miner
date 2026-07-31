@@ -21,7 +21,7 @@
     --kubeconfig {{ k3s_kubeconfig_path }}
     --create-namespace
     -f /tmp/chutes-miner-gpu.yaml
-    --set-string minerCredentials.ownerSs58="{{ miner_ss58_address }}"
+    --set-string minerCredentials.ownerSs58="{{ miner_owner_ss58 }}"
     {{ ('--version ' + miner_gpu_charts_version) if miner_gpu_charts_version is defined else '' }}
   register: miner_deployment
   changed_when: miner_deployment.rc == 0
