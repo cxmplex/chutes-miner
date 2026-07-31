@@ -66,9 +66,7 @@ def test_normal_boot_copies_before_source_purge(monkeypatch, tmp_path):
     assert "Requires=chutes-legacy-kubeconfig-prepare.service" in drop_in
     assert "KUBECONFIG=/run/chutes/legacy-k3s-admin.yaml" in service
     assert "ExecStopPost=" not in service
-    cli_source = (
-        ROOT / "src/chutes-miner-cli/chutes_miner_cli/l0.py"
-    ).read_text(encoding="utf-8")
+    cli_source = (ROOT / "src/chutes-miner-cli/chutes_miner_cli/l0.py").read_text(encoding="utf-8")
     assert "chutes-legacy-kubeconfig-prepare.service" not in cli_source
 
 

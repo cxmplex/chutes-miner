@@ -93,9 +93,7 @@ async def ensure_registry_scope_registration_in_session(
         )
     }
     if observed != expected or row.desired_state != "active":
-        raise DeploymentFailure(
-            "registry scope authority conflicts with durable launch"
-        )
+        raise DeploymentFailure("registry scope authority conflicts with durable launch")
     return row
 
 
@@ -299,9 +297,7 @@ async def registry_scope_work_items(
                         ),
                     )
                 )
-                .order_by(
-                    RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id
-                )
+                .order_by(RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id)
             )
         ).scalars()
         return [

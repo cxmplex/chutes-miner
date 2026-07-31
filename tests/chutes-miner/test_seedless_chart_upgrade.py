@@ -233,9 +233,7 @@ def _server_upgrade_render(
                     "clusters": [
                         {
                             "name": "lookup-test",
-                            "cluster": {
-                                "server": f"http://127.0.0.1:{server.server_port}"
-                            },
+                            "cluster": {"server": f"http://127.0.0.1:{server.server_port}"},
                         }
                     ],
                     "contexts": [
@@ -305,9 +303,7 @@ def _server_upgrade_render(
             ]
         )
         if configured_owner is not None:
-            command.extend(
-                ["--set-string", f"minerCredentials.ownerSs58={configured_owner}"]
-            )
+            command.extend(["--set-string", f"minerCredentials.ownerSs58={configured_owner}"])
         upgrade_output = subprocess.run(
             command,
             check=True,
@@ -316,9 +312,7 @@ def _server_upgrade_render(
         ).stdout
         release = json.loads(upgrade_output)
         documents = [
-            item
-            for item in yaml.safe_load_all(release["manifest"])
-            if isinstance(item, dict)
+            item for item in yaml.safe_load_all(release["manifest"]) if isinstance(item, dict)
         ]
         return documents, requested_paths
     finally:
@@ -346,9 +340,7 @@ def test_server_side_upgrade_removes_legacy_keys_and_keeps_nonempty_owner(
         "seed": base64.b64encode(b"legacy-secret-seed").decode("ascii"),
     }
     if existing_owner is not None:
-        existing_data["owner"] = base64.b64encode(
-            existing_owner.encode("ascii")
-        ).decode("ascii")
+        existing_data["owner"] = base64.b64encode(existing_owner.encode("ascii")).decode("ascii")
 
     documents, requested_paths = _server_upgrade_render(
         tmp_path,

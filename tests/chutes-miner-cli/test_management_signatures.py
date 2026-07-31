@@ -46,8 +46,7 @@ def _assert_signature(headers, keypair, method, path, body_sha256=""):
     assert int(timestamp) > 0
     assert re.fullmatch(r"[0-9a-f]{16}", random_suffix)
     message = (
-        f"v2:{keypair.ss58_address}:{keypair.ss58_address}:"
-        f"{method}:{path}:{nonce}:{body_sha256}"
+        f"v2:{keypair.ss58_address}:{keypair.ss58_address}:{method}:{path}:{nonce}:{body_sha256}"
     )
     assert keypair.verify(message, bytes.fromhex(headers[SIGNATURE_HEADER]))
 
@@ -127,15 +126,13 @@ def test_state_changing_cli_producers_use_only_v2_management_signer(
     method,
 ):
     source_path = (
-        Path(__file__).resolve().parents[2]
-        / "src/chutes-miner-cli/chutes_miner_cli/cli.py"
+        Path(__file__).resolve().parents[2] / "src/chutes-miner-cli/chutes_miner_cli/cli.py"
     )
     tree = ast.parse(source_path.read_text())
     function = next(
         node
         for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == function_name
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
     )
     signer_calls = [
         node
@@ -210,8 +207,7 @@ def test_maintenance_lock_producer_uses_exact_v2_management_signer():
         for node in ast.walk(tree)
         if isinstance(node, ast.Assign)
         and any(
-            isinstance(target, ast.Name) and target.id == "lock_target"
-            for target in node.targets
+            isinstance(target, ast.Name) and target.id == "lock_target" for target in node.targets
         )
     )
     assert ast.unparse(target_assignment.value) == "f'/servers/{name}/lock'"

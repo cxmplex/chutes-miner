@@ -157,8 +157,7 @@ def test_external_node_labels_are_after_locked_adoption_preconditions():
 def test_retirement_history_has_no_foreign_keys_and_database_immutability_guard():
     assert not GPUAdoptionRetirement.__table__.foreign_keys
     migration = (
-        Path(__file__).resolve().parents[2]
-        / "src/chutes-miner/chutes_miner/api/migrations/"
+        Path(__file__).resolve().parents[2] / "src/chutes-miner/chutes_miner/api/migrations/"
         "20260730160000_gpu_adoption_retirement.sql"
     ).read_text(encoding="utf-8")
     up_sql = migration.split("-- migrate:down", 1)[0]

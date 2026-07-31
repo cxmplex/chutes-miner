@@ -129,6 +129,7 @@ def _load_scopes_unchecked() -> None:
     if len(_scopes) != len(loaded):
         _persist_scopes()
 
+
 def _quarantine_corrupt_scope_cache(path: Path, exc: Exception) -> None:
     quarantine = path.with_name(f"{path.name}.corrupt-{time.time_ns()}-{os.getpid()}")
     try:
@@ -154,6 +155,7 @@ def _load_scopes() -> None:
         _quarantine_corrupt_scope_cache(path, exc)
         _scopes.clear()
         _scopes_loaded = True
+
 
 def _garbage_collect_scopes(now: datetime) -> bool:
     removed = [

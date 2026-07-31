@@ -167,9 +167,7 @@ def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
     records: list[dict[str, Any]] = []
     expected_count = 0
     for group, containers, statuses in groups:
-        expected_names = [
-            str(getattr(container, "name", "") or "") for container in containers
-        ]
+        expected_names = [str(getattr(container, "name", "") or "") for container in containers]
         if any(not name for name in expected_names) or len(set(expected_names)) != len(
             expected_names
         ):
@@ -186,9 +184,9 @@ def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
             state = getattr(container_status, "state", None) if container_status else None
             terminated = getattr(state, "terminated", None) if state else None
             running = getattr(state, "running", None) if state else None
-            container_id = str(
-                getattr(container_status, "container_id", "") or ""
-            ) if container_status else ""
+            container_id = (
+                str(getattr(container_status, "container_id", "") or "") if container_status else ""
+            )
             if terminated is not None:
                 finished_at = _timestamp_text(getattr(terminated, "finished_at", None))
                 if not container_id or not finished_at:
@@ -202,9 +200,7 @@ def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
                         "exit_code": int(getattr(terminated, "exit_code", 0)),
                         "signal": int(getattr(terminated, "signal", 0) or 0),
                         "reason": str(getattr(terminated, "reason", "") or ""),
-                        "started_at": _timestamp_text(
-                            getattr(terminated, "started_at", None)
-                        ),
+                        "started_at": _timestamp_text(getattr(terminated, "started_at", None)),
                         "finished_at": finished_at,
                     }
                 )
@@ -212,9 +208,9 @@ def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
             if running is not None or container_id:
                 return None
             waiting = getattr(state, "waiting", None) if state else None
-            restart_count = int(
-                getattr(container_status, "restart_count", 0) or 0
-            ) if container_status else 0
+            restart_count = (
+                int(getattr(container_status, "restart_count", 0) or 0) if container_status else 0
+            )
             last_state = getattr(container_status, "last_state", None) if container_status else None
             if (
                 restart_count != 0
@@ -234,9 +230,7 @@ def _pod_termination_evidence(resource: Any) -> dict[str, Any] | None:
                     "group": group,
                     "name": name,
                     "outcome": "never_started",
-                    "waiting_reason": str(
-                        getattr(waiting, "reason", "") or "status_absent"
-                    ),
+                    "waiting_reason": str(getattr(waiting, "reason", "") or "status_absent"),
                     "restart_count": restart_count,
                 }
             )
@@ -499,17 +493,14 @@ def _launch_definitively_pre_kubernetes_mutation(operation: Any) -> bool:
     return bool(getattr(operation, "launch_operation_id", None)) and (
         getattr(operation, "launch_phase_at_request", None) == "reserved"
         and getattr(operation, "launch_kubernetes_mutation_possible", None) is False
-        and getattr(operation, "launch_create_results_sha256", None)
-        == canonical_sha256({})
+        and getattr(operation, "launch_create_results_sha256", None) == canonical_sha256({})
     )
 
 
 def _requires_pod_termination_evidence(operation: Any) -> bool:
     """GPU ownership requires an exact Pod closure unless launch never started."""
     hardware_uuids = getattr(operation, "gpu_hardware_uuids", None)
-    return bool(hardware_uuids) and not _launch_definitively_pre_kubernetes_mutation(
-        operation
-    )
+    return bool(hardware_uuids) and not _launch_definitively_pre_kubernetes_mutation(operation)
 
 
 def _launch_frontier_document(launch: DeploymentLaunchOperation) -> dict[str, Any]:
@@ -520,9 +511,7 @@ def _launch_frontier_document(launch: DeploymentLaunchOperation) -> dict[str, An
         "deployment_id": launch.deployment_id,
         "phase": launch.phase,
         "cluster_context": launch.cluster_context,
-        "canonical_workload_spec_sha256": getattr(
-            launch, "canonical_workload_spec_sha256", None
-        ),
+        "canonical_workload_spec_sha256": getattr(launch, "canonical_workload_spec_sha256", None),
         "service": {"name": launch.service_name, "uid": launch.service_uid},
         "secret": {"name": launch.secret_name, "uid": launch.secret_uid},
         "job": {"name": launch.job_name, "uid": launch.job_uid},
@@ -565,8 +554,7 @@ def _verified_launch_frontier(operation: Any) -> dict[str, Any] | None:
             for kind in ("service", "secret", "job")
         )
         or not isinstance(frontier.get("create_results"), dict)
-        or frontier.get("create_results_sha256")
-        != canonical_sha256(frontier.get("create_results"))
+        or frontier.get("create_results_sha256") != canonical_sha256(frontier.get("create_results"))
         or frontier.get("create_results_sha256")
         != getattr(operation, "launch_create_results_sha256", None)
         or canonical_sha256(frontier) != digest
@@ -610,14 +598,8 @@ def _verified_pod_lifecycle_evidence(operation: Any) -> dict[str, Any] | None:
         or evidence.get("job_uid") != frontier["job"]["uid"]
         or evidence.get("controllers_absent") is not True
         or evidence.get("selector_absent") is not True
-        or (
-            evidence.get("outcome") == "never_started"
-            and frontier["job"]["uid"] is not None
-        )
-        or (
-            evidence.get("outcome") == "no_pod_observed"
-            and frontier["job"]["uid"] is None
-        )
+        or (evidence.get("outcome") == "never_started" and frontier["job"]["uid"] is not None)
+        or (evidence.get("outcome") == "no_pod_observed" and frontier["job"]["uid"] is None)
         or canonical_sha256(evidence) != digest
     ):
         raise LineageConflict("durable no-Pod lifecycle evidence is invalid")
@@ -640,9 +622,7 @@ def _parent_allocation_release_document(operation: Any) -> dict[str, Any]:
         "operation_id": operation.operation_id,
         "server_id": operation.parent_id,
         "snapshot_allocation_group_id": snapshot.get("allocation_group_id"),
-        "snapshot_allocation_group_generation": snapshot.get(
-            "allocation_group_generation"
-        ),
+        "snapshot_allocation_group_generation": snapshot.get("allocation_group_generation"),
         "server_allocation_released": True,
         "gpu_allocation_generations_owned": [],
     }
@@ -673,9 +653,7 @@ def _assert_parent_allocation_released(
         or server.gpu_allocation_group_generation is not None
         or owned
     ):
-        raise DeploymentFailure(
-            "server parent deletion is held by allocation-group ownership"
-        )
+        raise DeploymentFailure("server parent deletion is held by allocation-group ownership")
     evidence = getattr(operation, "allocation_release_evidence", None)
     digest = getattr(operation, "allocation_release_evidence_sha256", None)
     verified_at = getattr(operation, "allocation_release_verified_at", None)
@@ -733,9 +711,7 @@ def _resource_discovery_document(
         "launch_kubernetes_mutation_possible": (
             getattr(operation, "launch_kubernetes_mutation_possible", None)
         ),
-        "launch_create_results_sha256": getattr(
-            operation, "launch_create_results_sha256", None
-        ),
+        "launch_create_results_sha256": getattr(operation, "launch_create_results_sha256", None),
         "resources": identities,
     }
 
@@ -944,12 +920,9 @@ def _identity(kind: str, resource: Any) -> ResourceIdentity:
         owner_name=owner_name,
         owner_uid=owner_uid,
         node_name=str(node_name) if node_name else None,
-        pod_termination_evidence=(
-            _pod_termination_evidence(resource) if kind == "Pod" else None
-        ),
+        pod_termination_evidence=(_pod_termination_evidence(resource) if kind == "Pod" else None),
         pod_already_terminating=bool(
-            kind == "Pod"
-            and getattr(metadata, "deletion_timestamp", None) is not None
+            kind == "Pod" and getattr(metadata, "deletion_timestamp", None) is not None
         ),
     )
 
@@ -1003,9 +976,7 @@ def replacement_matches(
         raise LineageConflict(f"{resource.kind} owner UID is missing")
     accepted = accepted_owners.get(resource.owner_uid)
     if accepted is None:
-        raise UnresolvedOwnerLineage(
-            f"{resource.kind} owner {resource.owner_uid} was not observed"
-        )
+        raise UnresolvedOwnerLineage(f"{resource.kind} owner {resource.owner_uid} was not observed")
     if accepted != (
         resource.owner_api_version,
         resource.owner_kind,
@@ -1015,9 +986,7 @@ def replacement_matches(
     return True
 
 
-def _accept_owner(
-    accepted: dict[str, tuple[str, str, str]], resource: ResourceIdentity
-) -> None:
+def _accept_owner(accepted: dict[str, tuple[str, str, str]], resource: ResourceIdentity) -> None:
     accepted[resource.uid] = (resource.api_version, resource.kind, resource.name)
 
 
@@ -1200,9 +1169,7 @@ class DirectKubernetesClosure:
             return "present"
         resource_version = str(getattr(metadata, "resource_version", "") or "")
         if not resource_version:
-            raise DeploymentFailure(
-                "Pod resourceVersion is missing before finalizer attach"
-            )
+            raise DeploymentFailure("Pod resourceVersion is missing before finalizer attach")
         try:
             patched = core.patch_namespaced_pod(
                 name=name,
@@ -1226,9 +1193,7 @@ class DirectKubernetesClosure:
         if str(patched.metadata.uid) != uid or POD_TEARDOWN_FINALIZER not in {
             str(value) for value in (patched.metadata.finalizers or [])
         }:
-            raise DeploymentFailure(
-                "Pod teardown finalizer attach was not acknowledged"
-            )
+            raise DeploymentFailure("Pod teardown finalizer attach was not acknowledged")
         return "attached"
 
     def remove_pod_teardown_finalizer(
@@ -1262,9 +1227,7 @@ class DirectKubernetesClosure:
             return "removed"
         resource_version = str(getattr(metadata, "resource_version", "") or "")
         if not resource_version:
-            raise DeploymentFailure(
-                "Pod resourceVersion is missing before finalizer removal"
-            )
+            raise DeploymentFailure("Pod resourceVersion is missing before finalizer removal")
         try:
             patched = core.patch_namespaced_pod(
                 name=name,
@@ -1274,9 +1237,7 @@ class DirectKubernetesClosure:
                         "uid": uid,
                         "resourceVersion": resource_version,
                         "finalizers": [
-                            value
-                            for value in finalizers
-                            if value != POD_TEARDOWN_FINALIZER
+                            value for value in finalizers if value != POD_TEARDOWN_FINALIZER
                         ],
                     }
                 },
@@ -1291,12 +1252,8 @@ class DirectKubernetesClosure:
             raise
         if str(patched.metadata.uid) != uid:
             return "uid_changed"
-        if POD_TEARDOWN_FINALIZER in {
-            str(value) for value in (patched.metadata.finalizers or [])
-        }:
-            raise DeploymentFailure(
-                "Pod teardown finalizer removal was not acknowledged"
-            )
+        if POD_TEARDOWN_FINALIZER in {str(value) for value in (patched.metadata.finalizers or [])}:
+            raise DeploymentFailure("Pod teardown finalizer removal was not acknowledged")
         return "removed"
 
     def delete_resource(
@@ -1322,9 +1279,7 @@ class DirectKubernetesClosure:
             preconditions=V1Preconditions(uid=uid),
             propagation_policy="Foreground",
             grace_period_seconds=(
-                _teardown_grace_period_seconds()
-                if kind in CONTROLLER_KINDS or kind == "Pod"
-                else 0
+                _teardown_grace_period_seconds() if kind in CONTROLLER_KINDS or kind == "Pod" else 0
             ),
         )
         try:
@@ -1461,8 +1416,7 @@ class DeploymentTeardownCoordinator:
                 await session.execute(
                     select(DeploymentTeardownOperation)
                     .where(
-                        DeploymentTeardownOperation.deployment_id
-                        == deployment.deployment_id,
+                        DeploymentTeardownOperation.deployment_id == deployment.deployment_id,
                         DeploymentTeardownOperation.phase != "completed",
                     )
                     .with_for_update()
@@ -1506,8 +1460,7 @@ class DeploymentTeardownCoordinator:
                     select(ServerNodeIdentity)
                     .where(
                         ServerNodeIdentity.server_id == deployment.server_id,
-                        ServerNodeIdentity.generation
-                        == lineage["kubernetes_node_generation"],
+                        ServerNodeIdentity.generation == lineage["kubernetes_node_generation"],
                     )
                     .with_for_update()
                 )
@@ -1516,8 +1469,7 @@ class DeploymentTeardownCoordinator:
                 predecessor is None
                 or predecessor.kubernetes_node_uid != lineage["kubernetes_node_uid"]
                 or not predecessor.registration_attestation_id
-                or server.kubernetes_node_generation
-                < lineage["kubernetes_node_generation"]
+                or server.kubernetes_node_generation < lineage["kubernetes_node_generation"]
                 or (
                     server.kubernetes_node_generation == lineage["kubernetes_node_generation"]
                     and predecessor.retired_at is not None
@@ -1568,9 +1520,7 @@ class DeploymentTeardownCoordinator:
             registration_attestation_id=snapshot_lineage.registration_attestation_id,
             gpu_allocation_group_id=snapshot_lineage.gpu_allocation_group_id,
             gpu_allocation_group_generation=snapshot_lineage.gpu_allocation_group_generation,
-            gpu_hardware_uuids=sorted(
-                str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
-            ),
+            gpu_hardware_uuids=sorted(str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows),
             immutable_labels=self._operation_labels(deployment),
             launch_operation_id=launch.operation_id if launch else None,
             launch_phase_at_request=launch_phase_at_request,
@@ -1872,10 +1822,7 @@ class DeploymentTeardownCoordinator:
                     .with_for_update()
                 )
             ).scalar_one()
-            if (
-                operation.retry_lease_owner != self.worker_id
-                or operation.phase != "discovering"
-            ):
+            if operation.retry_lease_owner != self.worker_id or operation.phase != "discovering":
                 raise DeploymentFailure("teardown lease changed during discovery")
             known = {
                 (resource.kind, resource.uid)
@@ -1889,9 +1836,7 @@ class DeploymentTeardownCoordinator:
             }
             for resource in resources:
                 if resource.namespace != operation.namespace:
-                    raise LineageConflict(
-                        "Kubernetes resource namespace changed during discovery"
-                    )
+                    raise LineageConflict("Kubernetes resource namespace changed during discovery")
                 if (resource.kind, resource.uid) in known:
                     continue
                 session.add(
@@ -1953,9 +1898,7 @@ class DeploymentTeardownCoordinator:
                         select(DeploymentTeardownK8sResource).where(
                             DeploymentTeardownK8sResource.operation_id == operation_id,
                             DeploymentTeardownK8sResource.kind == "Pod",
-                            DeploymentTeardownK8sResource.state.notin_(
-                                ("absent", "replaced")
-                            ),
+                            DeploymentTeardownK8sResource.state.notin_(("absent", "replaced")),
                             DeploymentTeardownK8sResource.pod_teardown_finalizer_attached_at.is_(
                                 None
                             ),
@@ -1991,17 +1934,13 @@ class DeploymentTeardownCoordinator:
                     or current.operation_id != operation_id
                     or current.uid != resource.uid
                 ):
-                    raise DeploymentFailure(
-                        "teardown changed during Pod finalizer attachment"
-                    )
+                    raise DeploymentFailure("teardown changed during Pod finalizer attachment")
                 if outcome == "retryable":
                     raise DeploymentFailure(
                         f"Pod finalizer attach raced a Kubernetes update: {resource.uid}"
                     )
                 if outcome == "absent":
-                    operation.retry_lease_expires_at = utc_now() + timedelta(
-                        seconds=LEASE_SECONDS
-                    )
+                    operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                     await session.commit()
                     continue
                 if outcome not in {"attached", "present"}:
@@ -2011,9 +1950,7 @@ class DeploymentTeardownCoordinator:
                 current.pod_teardown_finalizer_attached_at = (
                     current.pod_teardown_finalizer_attached_at or utc_now()
                 )
-                operation.retry_lease_expires_at = utc_now() + timedelta(
-                    seconds=LEASE_SECONDS
-                )
+                operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                 await session.commit()
 
     async def _close_operation_pod(
@@ -2074,9 +2011,7 @@ class DeploymentTeardownCoordinator:
             current.pod_teardown_finalizer_removal_requested_at = (
                 current.pod_teardown_finalizer_removal_requested_at or utc_now()
             )
-            current_operation.retry_lease_expires_at = utc_now() + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current_operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
 
         outcome = await asyncio.to_thread(
@@ -2110,13 +2045,9 @@ class DeploymentTeardownCoordinator:
             ):
                 raise DeploymentFailure("teardown changed during Pod finalizer removal")
             if outcome == "uid_changed":
-                raise LineageConflict(
-                    "same-name Pod replaced during teardown finalizer removal"
-                )
+                raise LineageConflict("same-name Pod replaced during teardown finalizer removal")
             if outcome == "retryable":
-                raise DeploymentFailure(
-                    "Pod finalizer removal raced a Kubernetes update"
-                )
+                raise DeploymentFailure("Pod finalizer removal raced a Kubernetes update")
             current.pod_teardown_finalizer_removed_at = (
                 current.pod_teardown_finalizer_removed_at or utc_now()
             )
@@ -2125,16 +2056,12 @@ class DeploymentTeardownCoordinator:
             resource.pod_teardown_finalizer_removal_requested_at = (
                 current.pod_teardown_finalizer_removal_requested_at
             )
-            resource.pod_teardown_finalizer_removed_at = (
-                current.pod_teardown_finalizer_removed_at
-            )
+            resource.pod_teardown_finalizer_removed_at = current.pod_teardown_finalizer_removed_at
             if outcome == "absent":
                 current.state = "absent"
                 current.absent_at = current.absent_at or utc_now()
                 resource.state = "absent"
-            current_operation.retry_lease_expires_at = utc_now() + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current_operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
         return outcome
 
@@ -2159,9 +2086,7 @@ class DeploymentTeardownCoordinator:
             ):
                 raise DeploymentFailure("teardown changed during replacement adoption")
             if live.namespace != operation.namespace:
-                raise LineageConflict(
-                    "replacement Kubernetes resource changed namespace"
-                )
+                raise LineageConflict("replacement Kubernetes resource changed namespace")
             successor = (
                 await session.execute(
                     select(DeploymentTeardownK8sResource)
@@ -2202,12 +2127,10 @@ class DeploymentTeardownCoordinator:
                 )
                 if predecessor is None or predecessor.operation_id != operation_id:
                     raise DeploymentFailure("replacement predecessor binding changed")
-                if getattr(
-                    predecessor, "kind", None
-                ) == "Pod" and not _pod_absence_proven(predecessor):
-                    raise LineageConflict(
-                        "same-name Pod replaced before exact termination closure"
-                    )
+                if getattr(predecessor, "kind", None) == "Pod" and not _pod_absence_proven(
+                    predecessor
+                ):
+                    raise LineageConflict("same-name Pod replaced before exact termination closure")
                 predecessor.state = "replaced"
                 predecessor.replaced_by_resource_id = successor.resource_id
             operation.phase = "deleting"
@@ -2272,9 +2195,7 @@ class DeploymentTeardownCoordinator:
             identities = ", ".join(
                 f"{resource.kind}/{resource.name}:{resource.uid}" for resource in pending
             )
-            raise UnresolvedOwnerLineage(
-                f"Kubernetes owner lineage was not observed: {identities}"
-            )
+            raise UnresolvedOwnerLineage(f"Kubernetes owner lineage was not observed: {identities}")
         await self._record_resources(operation.operation_id, resources)
         await self._ensure_operation_pod_finalizers(
             operation.operation_id,
@@ -2561,18 +2482,11 @@ class DeploymentTeardownCoordinator:
                         operation.operation_id,
                         with_for_update=True,
                     )
-                    if (
-                        current.retry_lease_owner != self.worker_id
-                        or current.phase != "revoking"
-                    ):
-                        raise DeploymentFailure(
-                            "teardown changed during registry revocation"
-                        )
+                    if current.retry_lease_owner != self.worker_id or current.phase != "revoking":
+                        raise DeploymentFailure("teardown changed during registry revocation")
                     current.registry_revocation_ack = ack
                     current.registry_revoked_at = utc_now()
-                    current.retry_lease_expires_at = utc_now() + timedelta(
-                        seconds=LEASE_SECONDS
-                    )
+                    current.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                     await session.commit()
                 operation = await self._load(operation.operation_id)
         if operation.job_id and operation.validator_job_release_ack is None:
@@ -2587,9 +2501,7 @@ class DeploymentTeardownCoordinator:
                     raise DeploymentFailure("teardown changed during validator job release")
                 current.validator_job_release_ack = ack
                 current.validator_job_released_at = utc_now()
-                current.retry_lease_expires_at = utc_now() + timedelta(
-                    seconds=LEASE_SECONDS
-                )
+                current.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                 await session.commit()
             operation = await self._load(operation.operation_id)
         if operation.instance_id and operation.validator_instance_deletion_ack is None:
@@ -2604,9 +2516,7 @@ class DeploymentTeardownCoordinator:
                     raise DeploymentFailure("teardown changed during validator deletion")
                 current.validator_instance_deletion_ack = ack
                 current.validator_instance_deleted_at = utc_now()
-                current.retry_lease_expires_at = utc_now() + timedelta(
-                    seconds=LEASE_SECONDS
-                )
+                current.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                 await session.commit()
         await self._advance(
             operation.operation_id,
@@ -2631,9 +2541,7 @@ class DeploymentTeardownCoordinator:
                 or operation.retry_lease_owner != self.worker_id
                 or operation.phase != "verifying"
             ):
-                raise DeploymentFailure(
-                    "teardown changed before registry-only recovery"
-                )
+                raise DeploymentFailure("teardown changed before registry-only recovery")
             for key, value in values.items():
                 setattr(operation, key, value)
             operation.phase = "awaiting_registry"
@@ -2669,16 +2577,12 @@ class DeploymentTeardownCoordinator:
                 or current.retry_lease_owner != self.worker_id
                 or current.phase != "awaiting_registry"
             ):
-                raise DeploymentFailure(
-                    "teardown changed during registry-only recovery"
-                )
+                raise DeploymentFailure("teardown changed during registry-only recovery")
             current.registry_revocation_ack = ack
             current.registry_revoked_at = current.registry_revoked_at or utc_now()
             current.phase = "finalizing"
             current.last_failure = None
-            current.retry_lease_expires_at = utc_now() + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
 
     async def _delete_resources(self, operation: DeploymentTeardownOperation) -> None:
@@ -2786,14 +2690,10 @@ class DeploymentTeardownCoordinator:
             now = utc_now()
             current.pod_uid_absence_evidence = evidence
             current.pod_uid_absence_evidence_sha256 = digest
-            current.pod_uid_absence_observed_at = (
-                current.pod_uid_absence_observed_at or now
-            )
+            current.pod_uid_absence_observed_at = current.pod_uid_absence_observed_at or now
             current.state = "absent"
             current.absent_at = current.absent_at or now
-            current_operation.retry_lease_expires_at = now + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current_operation.retry_lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
         resource.pod_uid_absence_evidence = evidence
         resource.pod_uid_absence_evidence_sha256 = digest
@@ -2811,9 +2711,7 @@ class DeploymentTeardownCoordinator:
             raise LineageConflict("GPU-owned zero-Pod teardown lacks a launch frontier")
         evidence = {
             "schema": POD_LIFECYCLE_EVIDENCE_SCHEMA,
-            "outcome": (
-                "never_started" if frontier["job"]["uid"] is None else "no_pod_observed"
-            ),
+            "outcome": ("never_started" if frontier["job"]["uid"] is None else "no_pod_observed"),
             "operation_id": operation.operation_id,
             "deployment_id": operation.deployment_id,
             "launch_frontier_sha256": operation.launch_frontier_sha256,
@@ -2834,8 +2732,7 @@ class DeploymentTeardownCoordinator:
                 or current.retry_lease_owner != self.worker_id
                 or current.phase != "verifying"
                 or current.launch_frontier_sha256 != operation.launch_frontier_sha256
-                or current.resource_discovery_sha256
-                != operation.resource_discovery_sha256
+                or current.resource_discovery_sha256 != operation.resource_discovery_sha256
             ):
                 raise DeploymentFailure("teardown changed before zero-Pod witness")
             if current.pod_lifecycle_evidence is not None and (
@@ -3006,8 +2903,7 @@ class DeploymentTeardownCoordinator:
             and operation.pod_lifecycle_evidence is None
         ):
             if any(
-                resource.kind in CONTROLLER_KINDS
-                and resource.state not in {"absent", "replaced"}
+                resource.kind in CONTROLLER_KINDS and resource.state not in {"absent", "replaced"}
                 for resource in operation.resources
             ):
                 await self._pause_for_retry(
@@ -3091,17 +2987,12 @@ class DeploymentTeardownCoordinator:
                 and (not current.job_id or current.validator_job_release_ack)
                 and (not current.instance_id or current.validator_instance_deletion_ack)
             ):
-                raise DeploymentFailure(
-                    "teardown finalization lacks persisted acknowledgements"
-                )
+                raise DeploymentFailure("teardown finalization lacks persisted acknowledgements")
             resources = list(
                 (
                     await session.execute(
                         select(DeploymentTeardownK8sResource)
-                        .where(
-                            DeploymentTeardownK8sResource.operation_id
-                            == current.operation_id
-                        )
+                        .where(DeploymentTeardownK8sResource.operation_id == current.operation_id)
                         .with_for_update()
                     )
                 ).scalars()
@@ -3114,20 +3005,14 @@ class DeploymentTeardownCoordinator:
                 or (
                     resource.kind == "Pod"
                     and resource.pod_uid_absence_evidence is not None
-                    and resource.pod_uid_absence_evidence.get(
-                        "resource_discovery_sha256"
-                    )
+                    and resource.pod_uid_absence_evidence.get("resource_discovery_sha256")
                     != current.resource_discovery_sha256
                 )
                 for resource in resources
             ):
-                raise DeploymentFailure(
-                    "teardown finalization lacks exact Kubernetes UID closure"
-                )
+                raise DeploymentFailure("teardown finalization lacks exact Kubernetes UID closure")
             if not _gpu_pod_lifecycle_closed(current, resources):
-                raise DeploymentFailure(
-                    "GPU-owned teardown lacks exact Pod lifecycle evidence"
-                )
+                raise DeploymentFailure("GPU-owned teardown lacks exact Pod lifecycle evidence")
             latest_handoff = (
                 await session.execute(
                     select(DeploymentTeardownNodeIncarnationHandoff)
@@ -3154,10 +3039,10 @@ class DeploymentTeardownCoordinator:
             gpu_rows = (
                 (
                     await session.execute(
-                    select(GPU)
-                    .where(GPU.deployment_id == current.deployment_id)
-                    .order_by(GPU.gpu_id)
-                    .with_for_update(of=GPU)
+                        select(GPU)
+                        .where(GPU.deployment_id == current.deployment_id)
+                        .order_by(GPU.gpu_id)
+                        .with_for_update(of=GPU)
                     )
                 )
                 .unique()
@@ -3193,9 +3078,7 @@ class DeploymentTeardownCoordinator:
                 )
                 if actual_deployment != expected_deployment:
                     lineage_errors.append("Deployment lineage changed")
-            actual_gpu_uuids = sorted(
-                str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows
-            )
+            actual_gpu_uuids = sorted(str(gpu.hardware_uuid or gpu.gpu_id) for gpu in gpu_rows)
             if actual_gpu_uuids != list(current.gpu_hardware_uuids):
                 lineage_errors.append("assigned GPU UUID closure changed")
             if any(
@@ -3383,10 +3266,7 @@ class DeploymentTeardownCoordinator:
                             DelayedValidatorInstanceCleanup.phase != "completed",
                             (
                                 DelayedValidatorInstanceCleanup.retry_lease_expires_at.is_(None)
-                                | (
-                                    DelayedValidatorInstanceCleanup.retry_lease_expires_at
-                                    <= now
-                                )
+                                | (DelayedValidatorInstanceCleanup.retry_lease_expires_at <= now)
                             ),
                         )
                     )
@@ -3406,10 +3286,7 @@ class DeploymentTeardownCoordinator:
                                 ),
                                 (
                                     (DeploymentLaunchOperation.phase == "creating")
-                                    & (
-                                        DeploymentLaunchOperation.lease_expires_at
-                                        <= now
-                                    )
+                                    & (DeploymentLaunchOperation.lease_expires_at <= now)
                                 ),
                                 DeploymentLaunchOperation.phase == "failed",
                             )
@@ -3486,18 +3363,20 @@ class DeploymentTeardownCoordinator:
                     .unique()
                     .scalar_one_or_none()
                 )
-                snapshot = {
-                    "name": parent.name,
-                    "agent_api": parent.agent_api,
-                    "node_uid": parent.kubernetes_node_uid,
-                    "node_generation": parent.kubernetes_node_generation,
-                    "allocation_group_id": getattr(
-                        parent, "gpu_allocation_group_id", None
-                    ),
-                    "allocation_group_generation": (
-                        getattr(parent, "gpu_allocation_group_generation", None)
-                    ),
-                } if parent else None
+                snapshot = (
+                    {
+                        "name": parent.name,
+                        "agent_api": parent.agent_api,
+                        "node_uid": parent.kubernetes_node_uid,
+                        "node_generation": parent.kubernetes_node_generation,
+                        "allocation_group_id": getattr(parent, "gpu_allocation_group_id", None),
+                        "allocation_group_generation": (
+                            getattr(parent, "gpu_allocation_group_generation", None)
+                        ),
+                    }
+                    if parent
+                    else None
+                )
             else:
                 deployments = (
                     (
@@ -3515,9 +3394,7 @@ class DeploymentTeardownCoordinator:
                 )
                 parent = (
                     await session.execute(
-                        select(Chute)
-                        .where(Chute.chute_id == parent_id)
-                        .with_for_update(of=Chute)
+                        select(Chute).where(Chute.chute_id == parent_id).with_for_update(of=Chute)
                     )
                 ).scalar_one_or_none()
                 snapshot = {"version": parent.version, "name": parent.name} if parent else None
@@ -3646,9 +3523,7 @@ class DeploymentTeardownCoordinator:
                 or operation.retry_lease_owner != self.worker_id
                 or operation.parent_type != "server"
             ):
-                raise DeploymentFailure(
-                    "parent deletion changed before allocation release audit"
-                )
+                raise DeploymentFailure("parent deletion changed before allocation release audit")
             server = (
                 (
                     await session.execute(
@@ -3692,9 +3567,7 @@ class DeploymentTeardownCoordinator:
                 operation.allocation_release_evidence != evidence
                 or operation.allocation_release_evidence_sha256 != digest
             ):
-                raise DeploymentFailure(
-                    "server allocation release evidence changed during replay"
-                )
+                raise DeploymentFailure("server allocation release evidence changed during replay")
             now = utc_now()
             operation.allocation_release_evidence = evidence
             operation.allocation_release_evidence_sha256 = digest
@@ -3760,9 +3633,7 @@ class DeploymentTeardownCoordinator:
                 )
                 if incomplete:
                     raise DeploymentFailure("parent deletion still has incomplete children")
-                operation.retry_lease_expires_at = utc_now() + timedelta(
-                    seconds=LEASE_SECONDS
-                )
+                operation.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
                 await session.commit()
             if operation.parent_type == "server":
                 await self._record_parent_allocation_release(operation_id)
@@ -3776,9 +3647,7 @@ class DeploymentTeardownCoordinator:
                     agent_api = snapshot.get("agent_api")
                     if agent_api:
                         try:
-                            await asyncio.wait_for(
-                                stop_server_monitoring(agent_api), timeout=30
-                            )
+                            await asyncio.wait_for(stop_server_monitoring(agent_api), timeout=30)
                             monitor_ack = {"status": "stopped", "agent_api": agent_api}
                         except AgentError as exc:
                             try:
@@ -3809,9 +3678,7 @@ class DeploymentTeardownCoordinator:
                                 f"server monitor stop was not acknowledged: {exc}"
                             ) from exc
                     else:
-                        await asyncio.wait_for(
-                            clear_server_cache(snapshot["name"]), timeout=30
-                        )
+                        await asyncio.wait_for(clear_server_cache(snapshot["name"]), timeout=30)
                         monitor_ack = {
                             "status": "monitor_not_configured",
                             "agent_api": None,
@@ -3881,8 +3748,7 @@ class DeploymentTeardownCoordinator:
                             parent.validator != current.validator
                             or parent.name != snapshot.get("name")
                             or parent.kubernetes_node_uid != snapshot.get("node_uid")
-                            or parent.kubernetes_node_generation
-                            != snapshot.get("node_generation")
+                            or parent.kubernetes_node_generation != snapshot.get("node_generation")
                         ):
                             raise DeploymentFailure("server parent lineage changed")
                     parent_gpu_rows = (
@@ -4011,8 +3877,7 @@ class DeploymentTeardownCoordinator:
                 (
                     await session.execute(
                         select(KubernetesOrphanTombstoneResource).where(
-                            KubernetesOrphanTombstoneResource.tombstone_id
-                            == tombstone_id,
+                            KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id,
                             KubernetesOrphanTombstoneResource.kind == "Pod",
                             KubernetesOrphanTombstoneResource.state != "absent",
                             KubernetesOrphanTombstoneResource.pod_teardown_finalizer_attached_at.is_(
@@ -4052,9 +3917,7 @@ class DeploymentTeardownCoordinator:
                     or current.tombstone_id != tombstone_id
                     or current.uid != resource.uid
                 ):
-                    raise DeploymentFailure(
-                        "orphan changed during Pod finalizer attachment"
-                    )
+                    raise DeploymentFailure("orphan changed during Pod finalizer attachment")
                 if outcome == "retryable":
                     raise DeploymentFailure(
                         f"orphan Pod finalizer attach raced a Kubernetes update: {resource.uid}"
@@ -4122,9 +3985,7 @@ class DeploymentTeardownCoordinator:
             current.pod_teardown_finalizer_removal_requested_at = (
                 current.pod_teardown_finalizer_removal_requested_at or utc_now()
             )
-            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
 
         outcome = await asyncio.to_thread(
@@ -4158,13 +4019,9 @@ class DeploymentTeardownCoordinator:
             ):
                 raise DeploymentFailure("orphan changed during Pod finalizer removal")
             if outcome == "uid_changed":
-                raise LineageConflict(
-                    "same-name orphan Pod replaced during finalizer removal"
-                )
+                raise LineageConflict("same-name orphan Pod replaced during finalizer removal")
             if outcome == "retryable":
-                raise DeploymentFailure(
-                    "orphan Pod finalizer removal raced a Kubernetes update"
-                )
+                raise DeploymentFailure("orphan Pod finalizer removal raced a Kubernetes update")
             current.pod_teardown_finalizer_removed_at = (
                 current.pod_teardown_finalizer_removed_at or utc_now()
             )
@@ -4173,16 +4030,12 @@ class DeploymentTeardownCoordinator:
             resource.pod_teardown_finalizer_removal_requested_at = (
                 current.pod_teardown_finalizer_removal_requested_at
             )
-            resource.pod_teardown_finalizer_removed_at = (
-                current.pod_teardown_finalizer_removed_at
-            )
+            resource.pod_teardown_finalizer_removed_at = current.pod_teardown_finalizer_removed_at
             if outcome == "absent":
                 current.state = "absent"
                 current.absent_at = current.absent_at or utc_now()
                 resource.state = "absent"
-            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(
-                seconds=LEASE_SECONDS
-            )
+            current_tombstone.retry_lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
             await session.commit()
         return outcome
 
@@ -4242,9 +4095,9 @@ class DeploymentTeardownCoordinator:
                 )
                 if predecessor is None or predecessor.tombstone_id != tombstone_id:
                     raise DeploymentFailure("orphan replacement predecessor changed")
-                if getattr(
-                    predecessor, "kind", None
-                ) == "Pod" and not _pod_absence_proven(predecessor):
+                if getattr(predecessor, "kind", None) == "Pod" and not _pod_absence_proven(
+                    predecessor
+                ):
                     raise LineageConflict(
                         "same-name orphan Pod replaced before exact termination closure"
                     )
@@ -4349,8 +4202,7 @@ class DeploymentTeardownCoordinator:
                         for item in (
                             await session.execute(
                                 select(KubernetesOrphanTombstoneResource).where(
-                                    KubernetesOrphanTombstoneResource.tombstone_id
-                                    == tombstone_id
+                                    KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id
                                 )
                             )
                         ).scalars()
@@ -4383,13 +4235,8 @@ class DeploymentTeardownCoordinator:
                         tombstone_id,
                         with_for_update=True,
                     )
-                    if (
-                        current.retry_lease_owner != self.worker_id
-                        or current.phase != "recorded"
-                    ):
-                        raise DeploymentFailure(
-                            "orphan changed after Pod finalizer attachment"
-                        )
+                    if current.retry_lease_owner != self.worker_id or current.phase != "recorded":
+                        raise DeploymentFailure("orphan changed after Pod finalizer attachment")
                     current.phase = "deleting"
                     await session.commit()
                 return await self._run_orphan_claimed(tombstone_id)
@@ -4399,8 +4246,7 @@ class DeploymentTeardownCoordinator:
                     (
                         await session.execute(
                             select(KubernetesOrphanTombstoneResource).where(
-                                KubernetesOrphanTombstoneResource.tombstone_id
-                                == tombstone_id,
+                                KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id,
                             )
                         )
                     ).scalars()
@@ -4508,9 +4354,7 @@ class DeploymentTeardownCoordinator:
                             if resource.state != "absent":
                                 absence_pending = True
                             continue
-                    if resource.state == "observed" and _resource_delete_ready(
-                        resource, resources
-                    ):
+                    if resource.state == "observed" and _resource_delete_ready(resource, resources):
                         delete_needed = True
                     else:
                         absence_pending = True
@@ -4590,10 +4434,7 @@ class DeploymentTeardownCoordinator:
                     (
                         await session.execute(
                             select(KubernetesOrphanTombstoneResource)
-                            .where(
-                                KubernetesOrphanTombstoneResource.tombstone_id
-                                == tombstone_id
-                            )
+                            .where(KubernetesOrphanTombstoneResource.tombstone_id == tombstone_id)
                             .with_for_update()
                         )
                     ).scalars()
@@ -4603,9 +4444,7 @@ class DeploymentTeardownCoordinator:
                     or (resource.kind == "Pod" and not _pod_absence_proven(resource))
                     for resource in all_resources
                 ):
-                    raise DeploymentFailure(
-                        "orphan completion lacks exact Kubernetes UID closure"
-                    )
+                    raise DeploymentFailure("orphan completion lacks exact Kubernetes UID closure")
                 current.phase = "completed"
                 current.completed_at = utc_now()
                 current.retry_lease_owner = None

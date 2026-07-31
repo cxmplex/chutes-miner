@@ -36,9 +36,7 @@ async def _watch_leader_connection(
         try:
             heartbeat = await connection.scalar(GEPETTO_LEADER_HEARTBEAT)
         except Exception as exc:
-            raise GepettoLeaderConnectionLost(
-                "dedicated Gepetto leader connection failed"
-            ) from exc
+            raise GepettoLeaderConnectionLost("dedicated Gepetto leader connection failed") from exc
         if heartbeat != 1:
             raise GepettoLeaderConnectionLost(
                 "dedicated Gepetto leader connection returned an invalid heartbeat"

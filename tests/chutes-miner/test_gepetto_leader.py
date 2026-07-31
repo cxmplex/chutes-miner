@@ -80,9 +80,7 @@ async def test_two_replicas_only_the_dedicated_lock_holder_runs():
     async def blocked_sleep(_delay):
         await retry_block.wait()
 
-    first = asyncio.create_task(
-        run_gepetto_leader_loop(engine, first_worker, sleep=blocked_sleep)
-    )
+    first = asyncio.create_task(run_gepetto_leader_loop(engine, first_worker, sleep=blocked_sleep))
     await first_started.wait()
     second = asyncio.create_task(
         run_gepetto_leader_loop(engine, second_worker, sleep=blocked_sleep)

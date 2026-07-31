@@ -24,9 +24,7 @@ pytestmark = pytest.mark.skipif(
 )
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = (
-    ROOT
-    / "src/chutes-miner/chutes_miner/api/migrations/"
-    "20260730160000_gpu_adoption_retirement.sql"
+    ROOT / "src/chutes-miner/chutes_miner/api/migrations/20260730160000_gpu_adoption_retirement.sql"
 )
 UP_SQL, DOWN_SQL = MIGRATION.read_text(encoding="utf-8").split("-- migrate:down", 1)
 
@@ -73,9 +71,7 @@ def _metadata_ddl() -> str:
     table = GPUAdoptionRetirement.__table__
     dialect = postgresql.dialect()
     statements = [str(CreateTable(table).compile(dialect=dialect))]
-    statements.extend(
-        str(CreateIndex(index).compile(dialect=dialect)) for index in table.indexes
-    )
+    statements.extend(str(CreateIndex(index).compile(dialect=dialect)) for index in table.indexes)
     return ";\n".join(statements) + ";"
 
 
@@ -145,9 +141,7 @@ def test_retirement_audit_has_no_fks_and_rejects_update_or_delete(baseline: str)
         )
         _assert_ok(inspected)
         assert [
-            line.strip()
-            for line in inspected.stdout.decode().splitlines()
-            if line.strip()
+            line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
         ] == ["0", "t|registrar_assignment_shrink"]
 
         for mutation in (

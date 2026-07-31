@@ -9,18 +9,15 @@ from sqlalchemy.orm import configure_mappers
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = (
-    ROOT
-    / "src/chutes-miner/chutes_miner/api/migrations/"
+    ROOT / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260726120000_durable_deployment_teardown.sql"
 )
 FOLLOWUP_MIGRATION = (
-    ROOT
-    / "src/chutes-miner/chutes_miner/api/migrations/"
+    ROOT / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260727120000_miner_lifecycle_followup.sql"
 )
 FRONTIER_MIGRATION = (
-    ROOT
-    / "src/chutes-miner/chutes_miner/api/migrations/"
+    ROOT / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260730140000_teardown_frontier_parent_hold.sql"
 )
 
@@ -96,9 +93,7 @@ def test_teardown_operation_outlives_deployment_and_has_normalized_closures():
         for constraint in resource.constraints
         if constraint.name == "deployment_teardown_resource_uid_key"
     }
-    assert unique_columns == {
-        ("operation_id", "cluster_context", "namespace", "kind", "uid")
-    }
+    assert unique_columns == {("operation_id", "cluster_context", "namespace", "kind", "uid")}
     handoff = Base.metadata.tables["deployment_teardown_node_incarnation_handoffs"]
     assert _ondelete("deployment_teardown_node_incarnation_handoffs", "operation_id") == "RESTRICT"
     assert {
@@ -143,9 +138,10 @@ def test_launch_fence_and_delayed_instance_cleanup_outlive_deployment():
         "launch_intent_id",
     }.issubset(launch.c.keys())
     cleanup = Base.metadata.tables["delayed_validator_instance_cleanups"]
-    assert _ondelete(
-        "delayed_validator_instance_cleanups", "source_teardown_operation_id"
-    ) == "RESTRICT"
+    assert (
+        _ondelete("delayed_validator_instance_cleanups", "source_teardown_operation_id")
+        == "RESTRICT"
+    )
     assert {"validator", "chute_id", "config_id", "instance_id", "deletion_ack"}.issubset(
         cleanup.c.keys()
     )
@@ -177,9 +173,7 @@ def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
         "completed_at",
     }.issubset(intent.c.keys())
     active_index = next(
-        index
-        for index in intent.indexes
-        if index.name == "miner_launch_intent_active_lineage_key"
+        index for index in intent.indexes if index.name == "miner_launch_intent_active_lineage_key"
     )
     assert active_index.unique
     assert "phase NOT IN ('completed', 'failed')" in str(
@@ -220,14 +214,8 @@ def test_orphan_tombstone_binds_cluster_and_node_lineage():
         "pod_teardown_finalizer_removal_requested_at",
         "pod_teardown_finalizer_removed_at",
     }.issubset(resource.c.keys())
-    assert (
-        "lineage_conflict_at"
-        not in Base.metadata.tables["parent_deletion_operations"].c
-    )
-    assert (
-        "owner_api_version"
-        in Base.metadata.tables["kubernetes_orphan_tombstone_resources"].c
-    )
+    assert "lineage_conflict_at" not in Base.metadata.tables["parent_deletion_operations"].c
+    assert "owner_api_version" in Base.metadata.tables["kubernetes_orphan_tombstone_resources"].c
 
 
 def test_followup_migration_has_specific_locked_down_guard():

@@ -12,9 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 REQUIRED_SCHEMA_VERSION = "20260730160000"
-_SCHEMA_MIGRATIONS_PRESENT = text(
-    "SELECT to_regclass('schema_migrations') IS NOT NULL"
-)
+_SCHEMA_MIGRATIONS_PRESENT = text("SELECT to_regclass('schema_migrations') IS NOT NULL")
 _REQUIRED_SCHEMA_VERSION_PRESENT = text(
     """
     SELECT EXISTS (
@@ -188,8 +186,7 @@ async def wait_for_seedless_adoption(
         if blockers != announced_state:
             if blockers:
                 summary = ", ".join(
-                    f"gpu={gpu_id} deployment={deployment_id}"
-                    for gpu_id, deployment_id in blockers
+                    f"gpu={gpu_id} deployment={deployment_id}" for gpu_id, deployment_id in blockers
                 )
                 logger.warning(
                     "seedless GPU adoption readiness is blocked by "

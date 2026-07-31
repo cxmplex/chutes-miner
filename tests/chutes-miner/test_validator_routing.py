@@ -194,9 +194,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "config_id": "config-1",
     }
 
-    assert await gepetto.get_launch_token(
-        _chute(), _server(), deployment_id=DEPLOYMENT_ID
-    ) == {
+    assert await gepetto.get_launch_token(_chute(), _server(), deployment_id=DEPLOYMENT_ID) == {
         "token": "launch-token",
         "config_id": "config-1",
         "_miner_launch_request_id": "request-1",
@@ -258,9 +256,7 @@ async def test_launch_token_replay_uses_persisted_request_id(
         "config_id": "config-1",
     }
 
-    await gepetto.get_launch_token(
-        _chute(), _server(), job_id="job-1", deployment_id=DEPLOYMENT_ID
-    )
+    await gepetto.get_launch_token(_chute(), _server(), job_id="job-1", deployment_id=DEPLOYMENT_ID)
 
     request = mock_aiohttp_client_session.return_value.get
     assert request.call_args.kwargs["params"] == {
@@ -589,9 +585,7 @@ async def test_preemption_job_propagates_version_job_identity_and_exact_disk(mon
             new=AsyncMock(return_value=(deployment, object())),
         ) as deploy,
     ):
-        assert await gepetto.preempting_deploy(
-            chute, job_id="job-1", disk_gb=11
-        )
+        assert await gepetto.preempting_deploy(chute, job_id="job-1", disk_gb=11)
 
     disk_check.assert_awaited_once_with(server.name, 48)
     assert deploy.await_args.kwargs["vm_version"] == "1.8.0"
@@ -633,9 +627,7 @@ async def test_preemption_rejects_cross_validator_candidate_before_token_fetch()
 async def test_preemption_skips_nonpositive_hourly_cost_candidate():
     gepetto = _gepetto()
     chute = _chute()
-    gepetto.remote_chutes[VALIDATOR][chute.chute_id] = {
-        "effective_compute_multiplier": 2.0
-    }
+    gepetto.remote_chutes[VALIDATOR][chute.chute_id] = {"effective_compute_multiplier": 2.0}
     invalid = _server(hourly_cost=0.0)
     with (
         patch.object(

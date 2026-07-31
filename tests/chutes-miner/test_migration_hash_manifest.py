@@ -5,13 +5,9 @@ from hashlib import sha256
 from pathlib import Path
 
 
-MIGRATIONS = (
-    Path(__file__).resolve().parents[2] / "src/chutes-miner/chutes_miner/api/migrations"
-)
+MIGRATIONS = Path(__file__).resolve().parents[2] / "src/chutes-miner/chutes_miner/api/migrations"
 MANIFEST = MIGRATIONS / "SHA256SUMS"
-MANIFEST_LINE = re.compile(
-    r"^(?P<digest>[0-9a-f]{64})  (?P<filename>[0-9]{14}_[a-z0-9_]+\.sql)$"
-)
+MANIFEST_LINE = re.compile(r"^(?P<digest>[0-9a-f]{64})  (?P<filename>[0-9]{14}_[a-z0-9_]+\.sql)$")
 
 
 def _frozen_hashes() -> dict[str, str]:

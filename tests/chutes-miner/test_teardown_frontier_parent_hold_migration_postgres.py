@@ -169,9 +169,7 @@ def test_frontier_backfill_and_parent_allocation_fence_are_enforced():
             tuples_only=True,
         )
         _assert_ok(inspected)
-        assert inspected.stdout.decode().strip() == (
-            "chutes.miner-launch-frontier.v1|launch-1|t|t"
-        )
+        assert inspected.stdout.decode().strip() == ("chutes.miner-launch-frontier.v1|launch-1|t|t")
 
         _assert_ok(
             _psql(

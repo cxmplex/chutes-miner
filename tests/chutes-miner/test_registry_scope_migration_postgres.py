@@ -178,9 +178,7 @@ def test_scope_migration_transforms_history_without_reset_or_deletion():
             tuples_only=True,
         )
         _assert_ok(inspected)
-        lines = [
-            line for line in inspected.stdout.decode().splitlines() if line.strip()
-        ]
+        lines = [line for line in inspected.stdout.decode().splitlines() if line.strip()]
         request_text, request_hash, lineage_hash, deployment_id = lines[0].split("|", 3)
         transformed_request = json.loads(request_text)
         assert deployment_id == "11111111-1111-4111-8111-111111111111"

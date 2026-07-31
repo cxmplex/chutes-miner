@@ -13,9 +13,7 @@ from chutes_miner.api.server import seedless_adoption
 
 
 def _seedless_node(*, capacity_gpu: str = "2", allocatable_gpu: str | None = "1"):
-    allocatable = (
-        None if allocatable_gpu is None else {"nvidia.com/gpu": allocatable_gpu}
-    )
+    allocatable = None if allocatable_gpu is None else {"nvidia.com/gpu": allocatable_gpu}
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name="k3s-node",
@@ -126,9 +124,7 @@ async def test_seedless_adoption_rejects_cardinality_before_label_or_database_mu
     monkeypatch.setattr(seedless_adoption, "k8s_core_client", lambda: core)
 
     def unexpected_session():
-        raise AssertionError(
-            "database adoption must not start after a capacity mismatch"
-        )
+        raise AssertionError("database adoption must not start after a capacity mismatch")
 
     monkeypatch.setattr(seedless_adoption, "get_session", unexpected_session)
 

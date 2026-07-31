@@ -67,15 +67,9 @@ async def test_two_legitimate_deployments_get_distinct_authority_and_exact_repla
     coordinator = object.__new__(Gepetto)
     chute, server = _chute_and_server()
 
-    first_intent = await coordinator._begin_launch_intent(
-        chute, server, None, DEPLOYMENT_ONE
-    )
-    second_intent = await coordinator._begin_launch_intent(
-        chute, server, None, DEPLOYMENT_TWO
-    )
-    replayed_intent = await coordinator._begin_launch_intent(
-        chute, server, None, DEPLOYMENT_ONE
-    )
+    first_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_ONE)
+    second_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_TWO)
+    replayed_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_ONE)
 
     assert first_intent != second_intent
     assert replayed_intent == first_intent
@@ -127,9 +121,7 @@ def test_replay_swapping_only_the_deployment_uuid_fails_closed():
     swapped = deepcopy(intent)
     swapped.request_payload["lineage"]["deployment_id"] = DEPLOYMENT_TWO
     swapped.request_sha256 = canonical_miner_launch_sha256(swapped.request_payload)
-    swapped.lineage_sha256 = canonical_miner_launch_sha256(
-        swapped.request_payload["lineage"]
-    )
+    swapped.lineage_sha256 = canonical_miner_launch_sha256(swapped.request_payload["lineage"])
     with pytest.raises(DeploymentFailure, match="deployment identity changed"):
         coordinator._validated_launch_intent(swapped)
 

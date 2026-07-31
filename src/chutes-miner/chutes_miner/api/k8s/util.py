@@ -36,9 +36,7 @@ from kubernetes.client import (
 _VERSION_PREFIX_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
 MIN_SUPPORTED_CHUTES_VERSION = "0.3.61"
 POD_TEARDOWN_FINALIZER = "chutes.ai/gpu-teardown-v1"
-MINER_LAUNCH_REQUEST_FIELDS = frozenset(
-    {"schema", "miner_launch_request_id", "lineage"}
-)
+MINER_LAUNCH_REQUEST_FIELDS = frozenset({"schema", "miner_launch_request_id", "lineage"})
 MINER_LAUNCH_LINEAGE_FIELDS = frozenset(
     {
         "schema",
@@ -78,9 +76,7 @@ def validated_miner_launch_lineage(
     lineage = request.get("lineage") if isinstance(request, dict) else None
     job_cleanup_only = bool(getattr(intent, "job_cleanup_only", False))
     expected_request_schema = (
-        "chutes.miner-job-release.v1"
-        if job_cleanup_only
-        else "chutes.miner-launch-request.v1"
+        "chutes.miner-job-release.v1" if job_cleanup_only else "chutes.miner-launch-request.v1"
     )
     if (
         not isinstance(request, dict)
@@ -91,10 +87,8 @@ def validated_miner_launch_lineage(
         or set(lineage) != MINER_LAUNCH_LINEAGE_FIELDS
         or lineage.get("schema") != "chutes.miner-launch-lineage"
         or lineage.get("version") != 1
-        or getattr(intent, "request_sha256", None)
-        != canonical_miner_launch_sha256(request)
-        or getattr(intent, "lineage_sha256", None)
-        != canonical_miner_launch_sha256(lineage)
+        or getattr(intent, "request_sha256", None) != canonical_miner_launch_sha256(request)
+        or getattr(intent, "lineage_sha256", None) != canonical_miner_launch_sha256(lineage)
     ):
         raise DeploymentFailure("durable miner launch lineage is invalid")
     expected_deployment_id = getattr(intent, "deployment_id", None)
@@ -105,9 +99,7 @@ def validated_miner_launch_lineage(
         try:
             canonical_deployment_id = str(UUID(expected_deployment_id))
         except (AttributeError, TypeError, ValueError) as exc:
-            raise DeploymentFailure(
-                "durable miner deployment identity is invalid"
-            ) from exc
+            raise DeploymentFailure("durable miner deployment identity is invalid") from exc
         if (
             canonical_deployment_id != expected_deployment_id
             or lineage.get("deployment_id") != expected_deployment_id
@@ -133,10 +125,7 @@ def validated_miner_launch_lineage(
     ):
         raise DeploymentFailure("durable miner launch lineage changed")
     if require_gpu_lineage:
-        if any(
-            not lineage.get(key)
-            for key in ("kubernetes_node_uid", "gpu_allocation_group_id")
-        ):
+        if any(not lineage.get(key) for key in ("kubernetes_node_uid", "gpu_allocation_group_id")):
             raise DeploymentFailure("durable miner launch lineage changed")
         if any(
             type(lineage.get(key)) is not int or lineage[key] <= 0
@@ -352,9 +341,7 @@ def build_chute_job(
             template=V1PodTemplateSpec(
                 metadata=V1ObjectMeta(
                     labels=deployment_labels,
-                    finalizers=(
-                        [POD_TEARDOWN_FINALIZER] if settings.gpu_tee_only else None
-                    ),
+                    finalizers=([POD_TEARDOWN_FINALIZER] if settings.gpu_tee_only else None),
                     annotations={
                         "prometheus.io/scrape": "true",
                         "prometheus.io/path": "/_metrics",

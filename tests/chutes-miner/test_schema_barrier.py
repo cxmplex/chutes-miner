@@ -184,9 +184,7 @@ async def test_migration_leader_retries_only_deployment_owned_adoption_blockers(
 
     adoption = AsyncMock(
         side_effect=[
-            SeedlessAdoptionBlocked(
-                "gpu=stale-gpu deployment=deployment-live"
-            ),
+            SeedlessAdoptionBlocked("gpu=stale-gpu deployment=deployment-live"),
             "logical-server",
         ]
     )
@@ -228,10 +226,13 @@ async def test_blocked_adoption_keeps_health_live_and_all_other_routes_unready()
     assert b"seedless_adoption_blocked" in health_response.body
 
     ping_next = AsyncMock(return_value="pong")
-    assert await main.readiness_barrier(
-        SimpleNamespace(app=application, url=SimpleNamespace(path="/ping")),
-        ping_next,
-    ) == "pong"
+    assert (
+        await main.readiness_barrier(
+            SimpleNamespace(app=application, url=SimpleNamespace(path="/ping")),
+            ping_next,
+        )
+        == "pong"
+    )
     ping_next.assert_awaited_once()
 
 
@@ -298,9 +299,7 @@ def test_all_api_workers_and_gepetto_wait_before_work():
 
     lifespan_source = inspect.getsource(main.lifespan)
     nonleader = lifespan_source.index("if not is_migration_process:")
-    nonleader_schema = lifespan_source.index(
-        "await wait_for_required_schema(engine)", nonleader
-    )
+    nonleader_schema = lifespan_source.index("await wait_for_required_schema(engine)", nonleader)
     nonleader_background = lifespan_source.index(
         "_complete_follower_readiness(application)", nonleader_schema
     )
@@ -313,9 +312,7 @@ def test_all_api_workers_and_gepetto_wait_before_work():
     direct_adoption = lifespan_source.index(
         "server_id = await adopt_seedless_gpu_server()", leader_schema
     )
-    typed_blocker = lifespan_source.index(
-        "except SeedlessAdoptionBlocked as exc:", direct_adoption
-    )
+    typed_blocker = lifespan_source.index("except SeedlessAdoptionBlocked as exc:", direct_adoption)
     blocked_background = lifespan_source.index(
         "_complete_blocked_leader_readiness(application)", typed_blocker
     )
@@ -393,15 +390,12 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     coordinator.resume_launch_intents.assert_awaited_once()
     assert coordinator.teardown.resume_pending.await_count == 2
     coordinator.reconcile.assert_awaited_once()
-    coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(
-        reconstruct_active=True
-    )
+    coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(reconstruct_active=True)
 
 
 def test_api_chart_keeps_liveness_open_and_readiness_schema_gated():
     chart = (
-        Path(__file__).resolve().parents[2]
-        / "charts/chutes-miner/templates/api-deployment.yaml"
+        Path(__file__).resolve().parents[2] / "charts/chutes-miner/templates/api-deployment.yaml"
     ).read_text(encoding="utf-8")
     assert "livenessProbe:" in chart
     assert "path: /ping" in chart

@@ -55,15 +55,11 @@ def sign_request(
         raise ValueError("method and path must be supplied together")
     use_management_v2 = method is not None
     if use_management_v2 and (remote or not management):
-        raise ValueError(
-            "V2 method/path signing is only supported for management requests"
-        )
+        raise ValueError("V2 method/path signing is only supported for management requests")
 
     hotkey_data = json.loads(open(hotkey).read())
     nonce = (
-        f"{int(time.time())}.{secrets.token_hex(8)}"
-        if use_management_v2
-        else str(int(time.time()))
+        f"{int(time.time())}.{secrets.token_hex(8)}" if use_management_v2 else str(int(time.time()))
     )
     headers = {
         MINER_HEADER: hotkey_data["ss58Address"],
@@ -83,15 +79,9 @@ def sign_request(
 
     if use_management_v2:
         payload_bytes = (
-            payload_string.encode()
-            if isinstance(payload_string, str)
-            else payload_string
+            payload_string.encode() if isinstance(payload_string, str) else payload_string
         )
-        body_sha256 = (
-            hashlib.sha256(payload_bytes).hexdigest()
-            if payload_bytes is not None
-            else ""
-        )
+        body_sha256 = hashlib.sha256(payload_bytes).hexdigest() if payload_bytes is not None else ""
         signature_string = (
             f"v2:{hotkey_data['ss58Address']}:{hotkey_data['ss58Address']}:"
             f"{method.upper()}:{path}:{nonce}:{body_sha256}"

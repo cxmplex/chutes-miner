@@ -24,9 +24,7 @@ def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
         sek8s_root / "ansible/guest/roles/luks/files/initramfs/setup_storage"
     ).read_text(encoding="utf-8")
     fence_call = '"$CUTOVER_FENCE_HELPER" "$cutover_fence" 0'
-    assert 'CUTOVER_FENCE_RELATIVE="/etc/chutes/legacy-gpu-cutover/fence.json"' in (
-        setup_storage
-    )
+    assert 'CUTOVER_FENCE_RELATIVE="/etc/chutes/legacy-gpu-cutover/fence.json"' in (setup_storage)
     assert setup_storage.index(fence_call) < setup_storage.index("if ! load_vm_data")
     for operation in (
         "detect_storage_device",
@@ -36,9 +34,7 @@ def test_legacy_cutover_state_contract_is_byte_exact_across_guest_and_miner():
         "setup_cache",
         "stage_volume_generation",
     ):
-        assert setup_storage.index(fence_call) < setup_storage.index(
-            f"if ! {operation}"
-        )
+        assert setup_storage.index(fence_call) < setup_storage.index(f"if ! {operation}")
 
 
 def test_legacy_cutover_fence_contract_is_byte_exact_across_guest_and_miner():
@@ -50,8 +46,7 @@ def test_legacy_cutover_fence_contract_is_byte_exact_across_guest_and_miner():
 
 def test_runtime_purposes_use_the_cross_repo_contract():
     fixture = (
-        repository_root("api", start=Path(__file__))
-        / "tests/fixtures/gpu_runtime_purposes_v1.json"
+        repository_root("api", start=Path(__file__)) / "tests/fixtures/gpu_runtime_purposes_v1.json"
     )
     document = json.loads(fixture.read_text(encoding="ascii"))
     assert document["miner"] == GPU_MINER_RUNTIME_PURPOSES
@@ -59,9 +54,9 @@ def test_runtime_purposes_use_the_cross_repo_contract():
 
 
 def test_fresh_and_migrated_gepetto_cannot_mount_stale_source_configmap():
-    deployment = (
-        ROOT / "charts/chutes-miner/templates/gepetto-deployment.yaml"
-    ).read_text(encoding="utf-8")
+    deployment = (ROOT / "charts/chutes-miner/templates/gepetto-deployment.yaml").read_text(
+        encoding="utf-8"
+    )
     assert "gepetto-code" not in deployment
     assert "subPath: gepetto.py" not in deployment
     assert 'image: "{{ .Values.seedlessStack.image }}"' in deployment
@@ -136,9 +131,7 @@ def test_fresh_install_render_uses_exact_single_node_placement(chart):
         else:
             spec = document["spec"]["template"]["spec"]
         assert spec.get("nodeSelector") == CONTROL_LABEL
-    assert not any(
-        item.get("metadata", {}).get("name") == "monitor" for item in documents
-    )
+    assert not any(item.get("metadata", {}).get("name") == "monitor" for item in documents)
     rendered = json.dumps(documents, sort_keys=True)
     assert "REPLACE_WITH" not in rendered
     images = []
@@ -171,17 +164,14 @@ def test_rendered_registry_has_one_attested_certificate_binding():
     registry = next(
         item
         for item in documents
-        if item.get("kind") == "DaemonSet"
-        and item.get("metadata", {}).get("name") == "registry"
+        if item.get("kind") == "DaemonSet" and item.get("metadata", {}).get("name") == "registry"
     )
     auth = next(
         container
         for container in registry["spec"]["template"]["spec"]["initContainers"]
         if container["name"] == "auth"
     )
-    cert_entries = [
-        entry for entry in auth["env"] if entry["name"] == "CHUTES_ATTESTED_CERT_FILE"
-    ]
+    cert_entries = [entry for entry in auth["env"] if entry["name"] == "CHUTES_ATTESTED_CERT_FILE"]
     assert cert_entries == [
         {"name": "CHUTES_ATTESTED_CERT_FILE", "value": "/run/chutes-tls/server.crt"}
     ]
@@ -199,9 +189,7 @@ def test_rendered_charts_use_only_public_owner_identity(chart):
         "secretSeed",
     ):
         assert forbidden not in rendered
-    assert not any(
-        item.get("metadata", {}).get("name") == "audit-exporter" for item in documents
-    )
+    assert not any(item.get("metadata", {}).get("name") == "audit-exporter" for item in documents)
 
     owner_bindings = []
     for document in documents:
@@ -241,24 +229,20 @@ def test_rendered_charts_use_only_public_owner_identity(chart):
             and item.get("metadata", {}).get("name") == "miner-credentials"
         )
         assert set(credentials["data"]) == {"owner"}
-        assert (
-            base64.b64decode(credentials["data"]["owner"]).decode("ascii") == OWNER_SS58
-        )
+        assert base64.b64decode(credentials["data"]["owner"]).decode("ascii") == OWNER_SS58
 
 
 def test_fleet_uses_public_owner_chart_value_without_seed_material():
-    parse_credentials = (
-        ROOT / "ansible/k3s/tasks/charts/parse_credentials.yml"
-    ).read_text(encoding="utf-8")
+    parse_credentials = (ROOT / "ansible/k3s/tasks/charts/parse_credentials.yml").read_text(
+        encoding="utf-8"
+    )
     assert "owner_ss58" in parse_credentials
     assert "secretSeed" not in parse_credentials
     assert "miner_secret_seed" not in parse_credentials
     assert "miner_ss58_address" not in parse_credentials
     assert "miner_owner_ss58" in parse_credentials
     for name in ("deploy_miner.yml", "deploy_miner_gpu.yml"):
-        deployment = (ROOT / "ansible/k3s/tasks/charts" / name).read_text(
-            encoding="utf-8"
-        )
+        deployment = (ROOT / "ansible/k3s/tasks/charts" / name).read_text(encoding="utf-8")
         assert "minerCredentials.ownerSs58" in deployment
         assert "minerCredentials.ss58Address" not in deployment
         assert "minerCredentials.secretSeed" not in deployment
@@ -266,14 +250,10 @@ def test_fleet_uses_public_owner_chart_value_without_seed_material():
         assert "miner_ss58_address" not in deployment
 
     migration = yaml.safe_load(
-        (ROOT / "ansible/k3s/tasks/migration/verify-chutes.yml").read_text(
-            encoding="utf-8"
-        )
+        (ROOT / "ansible/k3s/tasks/migration/verify-chutes.yml").read_text(encoding="utf-8")
     )
     cleanup_by_name = {task["name"]: task for task in migration}
-    microk8s_cleanup = cleanup_by_name[
-        "Remove unsupported legacy audit exporter from MicroK8s"
-    ]
+    microk8s_cleanup = cleanup_by_name["Remove unsupported legacy audit exporter from MicroK8s"]
     assert microk8s_cleanup["when"] == "inventory_hostname in groups['microk8s']"
     assert microk8s_cleanup["kubernetes.core.k8s"] == {
         "context": "default",

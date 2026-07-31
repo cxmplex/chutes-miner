@@ -109,9 +109,7 @@ async def lifespan(application: FastAPI):
         await wait_for_required_schema(engine)
         if settings.gpu_tee_only:
             application.state.readiness_reason = "seedless_adoption_pending"
-            readiness_task = asyncio.create_task(
-                _complete_follower_readiness(application)
-            )
+            readiness_task = asyncio.create_task(_complete_follower_readiness(application))
         else:
             application.state.readiness_reason = None
             application.state.schema_ready = True
@@ -171,12 +169,8 @@ async def lifespan(application: FastAPI):
                     _complete_blocked_leader_readiness(application)
                 )
             else:
-                logger.success(
-                    f"adopted registrar-created logical GPU server {server_id}"
-                )
-                await wait_for_seedless_adoption(
-                    engine, settings.seedless_gpu_identity
-                )
+                logger.success(f"adopted registrar-created logical GPU server {server_id}")
+                await wait_for_seedless_adoption(engine, settings.seedless_gpu_identity)
                 application.state.socket_tasks = _start_socket_clients()
                 application.state.readiness_reason = None
                 application.state.schema_ready = True

@@ -142,8 +142,7 @@ def _v1_headers(keypair, purpose="management", body=b""):
 def _v2_headers(keypair, nonce, *, method="DELETE", target="/servers/node-a", body=b""):
     body_sha256 = hashlib.sha256(body).hexdigest() if body else ""
     message = (
-        f"v2:{keypair.ss58_address}:{keypair.ss58_address}:"
-        f"{method}:{target}:{nonce}:{body_sha256}"
+        f"v2:{keypair.ss58_address}:{keypair.ss58_address}:{method}:{target}:{nonce}:{body_sha256}"
     )
     return {
         MINER_HEADER: keypair.ss58_address,
@@ -204,17 +203,14 @@ def _unprotected_state_changing_routes(application):
     return [
         (method, path)
         for method, path, route in _runtime_state_changing_routes(application)
-        if destructive_management_authorization
-        not in set(_dependency_calls(route.dependant))
+        if destructive_management_authorization not in set(_dependency_calls(route.dependant))
     ]
 
 
 def test_assembled_app_state_changing_route_inventory_is_complete_and_protected():
     routes = _runtime_state_changing_routes(assembled_miner_app)
 
-    assert {(method, path) for method, path, _ in routes} == set(
-        _EXPECTED_STATE_CHANGING_ROUTES
-    )
+    assert {(method, path) for method, path, _ in routes} == set(_EXPECTED_STATE_CHANGING_ROUTES)
     assert _unprotected_state_changing_routes(assembled_miner_app) == []
 
 
@@ -298,9 +294,7 @@ def test_chart_renders_explicit_management_v2_cutover(value):
     result = _render_management_v2_setting(value)
     assert result.returncode == 0, result.stderr
     documents = [
-        document
-        for document in yaml.safe_load_all(result.stdout)
-        if isinstance(document, dict)
+        document for document in yaml.safe_load_all(result.stdout) if isinstance(document, dict)
     ]
     deployment = next(
         document
@@ -358,11 +352,14 @@ def test_v2_replay_ttl_covers_entire_remaining_acceptance_window(
     monkeypatch.setattr(auth_module.time, "time", lambda: now)
     monkeypatch.setattr(auth_module, "_consume_v2_nonce", consumed)
 
-    assert _authorize(
-        _v2_headers(keypair, nonce),
-        method="DELETE",
-        target="/servers/node-a",
-    ) is None
+    assert (
+        _authorize(
+            _v2_headers(keypair, nonce),
+            method="DELETE",
+            target="/servers/node-a",
+        )
+        is None
+    )
     consumed.assert_called_once_with(
         keypair.ss58_address,
         nonce,
@@ -551,6 +548,7 @@ def test_every_state_changing_management_route_rejects_v1(
 
     assert response.status_code == 401
 
+
 @pytest.mark.parametrize(
     ("method", "path", "expected_status"),
     (
@@ -634,6 +632,7 @@ def test_every_state_changing_management_route_accepts_v2(
 
     assert response.status_code == expected_status
 
+
 @pytest.mark.parametrize(
     ("method", "target", "payload_kind", "expected_status"),
     (
@@ -711,6 +710,7 @@ def test_pre_cutover_accepts_and_observes_v1_but_rejects_bearer(
         method,
         target,
     )
+
 
 @pytest.mark.parametrize(
     ("value", "expected"),

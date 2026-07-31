@@ -105,9 +105,7 @@ def _canonical_intent(
     }
     request = {
         "schema": (
-            "chutes.miner-job-release.v1"
-            if job_cleanup_only
-            else "chutes.miner-launch-request.v1"
+            "chutes.miner-job-release.v1" if job_cleanup_only else "chutes.miner-launch-request.v1"
         ),
         "miner_launch_request_id": intent_id,
         "lineage": lineage,
@@ -155,9 +153,7 @@ def test_every_gepetto_launch_intent_cas_uses_canonical_validator():
 def test_gepetto_kubernetes_awaits_are_outside_database_session_scopes():
     for method in (Gepetto.optimal_scale_up_server, Gepetto.reconcile):
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-        for context in (
-            node for node in ast.walk(tree) if isinstance(node, ast.AsyncWith)
-        ):
+        for context in (node for node in ast.walk(tree) if isinstance(node, ast.AsyncWith)):
             opens_database_session = any(
                 isinstance(item.context_expr, ast.Call)
                 and isinstance(item.context_expr.func, ast.Name)
@@ -168,9 +164,7 @@ def test_gepetto_kubernetes_awaits_are_outside_database_session_scopes():
                 continue
             forbidden = []
             for node in ast.walk(context):
-                if not isinstance(node, ast.Await) or not isinstance(
-                    node.value, ast.Call
-                ):
+                if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
                     continue
                 function = node.value.func
                 if (
@@ -247,9 +241,7 @@ def _job(token: str = "launch-token-1") -> V1Job:
                                 requests={"cpu": "2", "memory": "8Gi"},
                                 limits={"cpu": "2", "memory": "8Gi"},
                             ),
-                            volume_mounts=[
-                                V1VolumeMount(name="cache", mount_path="/cache")
-                            ],
+                            volume_mounts=[V1VolumeMount(name="cache", mount_path="/cache")],
                             security_context=V1SecurityContext(
                                 allow_privilege_escalation=False,
                                 capabilities={"add": ["IPC_LOCK"]},
@@ -315,9 +307,7 @@ def test_canonical_job_accepts_only_known_api_defaults_and_fresh_launch_token():
             "value",
             "GPU-b",
         ),
-        lambda job: setattr(
-            job.spec.template.spec.image_pull_secrets[0], "name", "other-secret"
-        ),
+        lambda job: setattr(job.spec.template.spec.image_pull_secrets[0], "name", "other-secret"),
         lambda job: job.spec.template.spec.containers[0].command.append("--unsafe"),
         lambda job: setattr(
             job.spec.template.spec.containers[0].security_context,
@@ -376,30 +366,30 @@ def test_canonical_service_ignores_allocated_node_port_but_not_selector_or_targe
     readback.spec.internal_traffic_policy = "Cluster"
     readback.spec.publish_not_ready_addresses = False
     readback.spec.ports[0].node_port = 32001
-    assert canonical_workload_resource(
-        "Service", readback
-    ) == canonical_workload_resource("Service", intended)
+    assert canonical_workload_resource("Service", readback) == canonical_workload_resource(
+        "Service", intended
+    )
 
     readback.spec.selector = {"chutes/deployment-id": "other"}
-    assert canonical_workload_resource(
-        "Service", readback
-    ) != canonical_workload_resource("Service", intended)
+    assert canonical_workload_resource("Service", readback) != canonical_workload_resource(
+        "Service", intended
+    )
     readback.spec.selector = intended.spec.selector
     readback.spec.ports[0].target_port = 9000
-    assert canonical_workload_resource(
-        "Service", readback
-    ) != canonical_workload_resource("Service", intended)
+    assert canonical_workload_resource("Service", readback) != canonical_workload_resource(
+        "Service", intended
+    )
 
     readback = deepcopy(intended)
     readback.spec.publish_not_ready_addresses = True
-    assert canonical_workload_resource(
-        "Service", readback
-    ) != canonical_workload_resource("Service", intended)
+    assert canonical_workload_resource("Service", readback) != canonical_workload_resource(
+        "Service", intended
+    )
     readback = deepcopy(intended)
     readback.spec.internal_traffic_policy = "Local"
-    assert canonical_workload_resource(
-        "Service", readback
-    ) != canonical_workload_resource("Service", intended)
+    assert canonical_workload_resource("Service", readback) != canonical_workload_resource(
+        "Service", intended
+    )
 
 
 @pytest.mark.parametrize("state", ["owned", "terminating"])
@@ -417,9 +407,9 @@ def test_canonical_adoption_rejects_foreign_ownership_and_deletion(state):
         ]
     else:
         conflicting.metadata.deletion_timestamp = "2026-07-27T12:00:00Z"
-    assert canonical_workload_resource(
-        "Job", conflicting
-    ) != canonical_workload_resource("Job", intended)
+    assert canonical_workload_resource("Job", conflicting) != canonical_workload_resource(
+        "Job", intended
+    )
 
 
 def test_service_timeout_after_create_adopts_exact_persisted_object(monkeypatch):
@@ -521,9 +511,7 @@ async def test_first_captured_kubernetes_uid_is_immutable(monkeypatch):
         lease_owner="lease-1",
         phase="creating",
         canonical_workload_spec={"service": expected},
-        canonical_workload_spec_sha256=_canonical_document_sha256(
-            {"service": expected}
-        ),
+        canonical_workload_spec_sha256=_canonical_document_sha256({"service": expected}),
         immutable_labels=LABELS,
         server_name="node-1",
         cluster_context="node-1",
@@ -624,9 +612,7 @@ async def test_node_adoption_between_create_and_cas_persists_uid_and_fences(
         lease_expires_at=object(),
         phase="creating",
         canonical_workload_spec={"service": canonical},
-        canonical_workload_spec_sha256=_canonical_document_sha256(
-            {"service": canonical}
-        ),
+        canonical_workload_spec_sha256=_canonical_document_sha256({"service": canonical}),
         immutable_labels=LABELS,
         server_name="node-1",
         cluster_context="node-1",
@@ -811,9 +797,7 @@ async def test_canonical_digest_mismatch_fails_before_uid_capture(monkeypatch):
     launch = SimpleNamespace(
         lease_owner="lease-1",
         phase="creating",
-        canonical_workload_spec={
-            "service": canonical_workload_resource("Service", intended)
-        },
+        canonical_workload_spec={"service": canonical_workload_resource("Service", intended)},
         canonical_workload_spec_sha256="0" * 64,
         immutable_labels=LABELS,
         server_name="node-1",
@@ -951,10 +935,7 @@ async def test_tampered_launch_intent_stops_before_external_replay_or_failure_mu
     gepetto._revoke_registry_scope.assert_not_awaited()
     gepetto._release_job_exact.assert_not_awaited()
     session.commit.assert_not_awaited()
-    assert all(
-        call.kwargs.get("with_for_update") is True
-        for call in session.get.await_args_list
-    )
+    assert all(call.kwargs.get("with_for_update") is True for call in session.get.await_args_list)
 
 
 class _IntentResult:
@@ -1053,9 +1034,7 @@ async def test_pending_launch_recovery_replays_persisted_identity_not_current_ro
 
     gepetto._record_launch_response = AsyncMock(side_effect=record_response)
     gepetto._revoke_registry_scope = AsyncMock()
-    gepetto._release_job_exact = AsyncMock(
-        return_value={"status": "released", "job_id": "job-1"}
-    )
+    gepetto._release_job_exact = AsyncMock(return_value={"status": "released", "job_id": "job-1"})
     gepetto._record_launch_intent_failure = AsyncMock()
 
     await gepetto.resume_launch_intents()
@@ -1093,9 +1072,7 @@ async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
     monkeypatch.setattr(gepetto_module, "get_session", fake_session)
     gepetto = object.__new__(Gepetto)
     gepetto._revoke_registry_scope = AsyncMock()
-    gepetto._release_job_exact = AsyncMock(
-        side_effect=DeploymentFailure("validator unavailable")
-    )
+    gepetto._release_job_exact = AsyncMock(side_effect=DeploymentFailure("validator unavailable"))
 
     async def record_failure(_intent_id, exc):
         intent.last_failure = str(exc)
@@ -1181,9 +1158,7 @@ async def test_job_cleanup_only_intent_releases_without_requesting_launch_config
     gepetto = object.__new__(Gepetto)
     gepetto._fetch_launch_config = AsyncMock()
     gepetto._revoke_registry_scope = AsyncMock()
-    gepetto._release_job_exact = AsyncMock(
-        return_value={"status": "released", "job_id": "job-1"}
-    )
+    gepetto._release_job_exact = AsyncMock(return_value={"status": "released", "job_id": "job-1"})
     gepetto._record_launch_intent_failure = AsyncMock()
 
     await gepetto.resume_aborted_launch_intents()

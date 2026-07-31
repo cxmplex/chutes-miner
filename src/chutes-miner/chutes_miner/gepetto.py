@@ -544,10 +544,7 @@ class Gepetto:
         lineage_sha256 = _canonical_sha256(lineage)
         async with get_session() as session:
             await session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(:lineage_sha256, 0))"
-                ),
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lineage_sha256, 0))"),
                 {"lineage_sha256": lineage_sha256},
             )
             existing = (
@@ -564,9 +561,7 @@ class Gepetto:
                 if self._validated_launch_intent(existing) != lineage:
                     raise DeploymentFailure("durable launch request lineage conflicts")
                 if existing.phase in {"consumed", "cleanup_required"}:
-                    raise DeploymentFailure(
-                        f"durable launch request is already {existing.phase}"
-                    )
+                    raise DeploymentFailure(f"durable launch request is already {existing.phase}")
                 return existing.intent_id
             intent_id = str(uuid.uuid4())
             request_payload = {
@@ -603,10 +598,7 @@ class Gepetto:
         lineage_sha256 = _canonical_sha256(lineage)
         async with get_session() as session:
             await session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(:lineage_sha256, 0))"
-                ),
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lineage_sha256, 0))"),
                 {"lineage_sha256": lineage_sha256},
             )
             existing = (
@@ -657,9 +649,7 @@ class Gepetto:
             "registry": payload.get("registry"),
         }
         async with get_session() as session:
-            intent = await session.get(
-                MinerLaunchIntent, intent_id, with_for_update=True
-            )
+            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
             self._validated_launch_intent(intent)
             if intent is None or intent.phase not in {
                 "pending",
@@ -690,22 +680,15 @@ class Gepetto:
         ack: dict[str, Any],
     ) -> None:
         async with get_session() as session:
-            intent = await session.get(
-                MinerLaunchIntent, intent_id, with_for_update=True
-            )
+            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
             self._validated_launch_intent(intent)
             if intent is None or intent.phase not in {
                 "response_persisted",
                 "registry_acked",
             }:
-                raise DeploymentFailure(
-                    "registry ACK arrived in an invalid launch phase"
-                )
+                raise DeploymentFailure("registry ACK arrived in an invalid launch phase")
             expected_config_id = (intent.response_payload or {}).get("config_id")
-            if (
-                not isinstance(ack, dict)
-                or ack.get("launch_config_id") != expected_config_id
-            ):
+            if not isinstance(ack, dict) or ack.get("launch_config_id") != expected_config_id:
                 raise DeploymentFailure("registry ACK changed the launch config authority")
             if intent.registry_ack is not None and intent.registry_ack != ack:
                 raise DeploymentFailure("registry replay changed the launch ACK")
@@ -723,9 +706,7 @@ class Gepetto:
 
     async def _record_launch_intent_failure(self, intent_id: str, exc: Exception) -> None:
         async with get_session() as session:
-            intent = await session.get(
-                MinerLaunchIntent, intent_id, with_for_update=True
-            )
+            intent = await session.get(MinerLaunchIntent, intent_id, with_for_update=True)
             try:
                 self._validated_launch_intent(intent)
             except DeploymentFailure as validation_error:
@@ -786,9 +767,7 @@ class Gepetto:
                 }
             config_id = stable_response.get("config_id")
             if config_id:
-                await self._revoke_registry_scope(
-                    validator_hotkey, config_id, server_id
-                )
+                await self._revoke_registry_scope(validator_hotkey, config_id, server_id)
             if job_id and job_release_ack is None:
                 job_release_ack = await self._release_job_exact(
                     validator_hotkey,
@@ -821,9 +800,7 @@ class Gepetto:
             return False
         except Exception as exc:
             await self._record_launch_intent_failure(intent_id, exc)
-            logger.warning(
-                f"Durable launch intent {intent_id} cleanup paused for retry: {exc}"
-            )
+            logger.warning(f"Durable launch intent {intent_id} cleanup paused for retry: {exc}")
             return False
 
     async def _launch_intent_ids(self, phases: set[str]) -> list[str]:
@@ -994,9 +971,7 @@ class Gepetto:
         if (validator := validator_by_hotkey(chute.validator)) is None:
             raise DeploymentFailure(f"Validator not found: {chute.validator}")
         deployment_id = deployment_id or str(uuid.uuid4())
-        intent_id = await self._begin_launch_intent(
-            chute, server, job_id, deployment_id
-        )
+        intent_id = await self._begin_launch_intent(chute, server, job_id, deployment_id)
         try:
             payload = await self._fetch_launch_config(
                 validator=validator,
@@ -1168,9 +1143,7 @@ class Gepetto:
         if completed:
             logger.success(f"Durable teardown completed for {deployment_id=}")
         else:
-            logger.warning(
-                f"Durable teardown for {deployment_id=} is retained for retry or review"
-            )
+            logger.warning(f"Durable teardown for {deployment_id=} is retained for retry or review")
         return completed
 
     async def cleanup_kubernetes_orphan(self, resource: dict[str, Any]) -> bool:
@@ -1374,9 +1347,7 @@ class Gepetto:
             if deployment:
                 await self.undeploy(deployment.deployment_id, reason="job_launch_failure")
             elif launch_token:
-                await self.abort_launch_intent(
-                    launch_token["_miner_launch_request_id"]
-                )
+                await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
             elif not token_requested:
                 cleanup_intent_id = await self._begin_job_cleanup_intent(
                     chute,
@@ -1968,9 +1939,7 @@ class Gepetto:
                             reason="rolling_update_launch_failure",
                         )
                     elif launch_token:
-                        await self.abort_launch_intent(
-                            launch_token["_miner_launch_request_id"]
-                        )
+                        await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
                     return
 
     @staticmethod
@@ -2091,9 +2060,7 @@ class Gepetto:
             except DeploymentFailure as exc:
                 logger.error(f"Skipping invalid scale-up candidate: {exc}")
                 continue
-            required_disk_gb = deployment_disk_requirements(
-                server, disk_gb
-            ).ephemeral_storage_gb
+            required_disk_gb = deployment_disk_requirements(server, disk_gb).ephemeral_storage_gb
             if await k8s.check_node_has_disk_available(server.name, required_disk_gb):
                 candidates.append(server)
                 if len(candidates) >= SCALE_UP_CANDIDATE_POOL:
@@ -2226,9 +2193,7 @@ class Gepetto:
             except DeploymentFailure as exc:
                 logger.error(f"Skipping invalid preemption candidate: {exc}")
                 continue
-            required_disk_gb = deployment_disk_requirements(
-                server, disk_gb
-            ).ephemeral_storage_gb
+            required_disk_gb = deployment_disk_requirements(server, disk_gb).ephemeral_storage_gb
             if await k8s.check_node_has_disk_available(server.name, required_disk_gb):
                 eligible_servers.append(server)
         servers = eligible_servers
@@ -2373,9 +2338,7 @@ class Gepetto:
                         )
         except Exception as exc:
             logger.error(f"Unexpected error preempting deployments: {exc}")
-            await self.abort_launch_intent(
-                launch_token["_miner_launch_request_id"]
-            )
+            await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
             return False
 
         # Deploy on our target server.
@@ -2411,9 +2374,7 @@ class Gepetto:
                     reason="preemption_launch_failure",
                 )
             else:
-                await self.abort_launch_intent(
-                    launch_token["_miner_launch_request_id"]
-                )
+                await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
         return False
 
     async def scale_chute(self, chute: Chute, desired_count: int, preempt: bool = False) -> bool:
@@ -2484,9 +2445,7 @@ class Gepetto:
                                 chute.chute_id,
                                 server.server_id,
                                 token=launch_token["token"],
-                                launch_intent_id=launch_token[
-                                    "_miner_launch_request_id"
-                                ],
+                                launch_intent_id=launch_token["_miner_launch_request_id"],
                                 config_id=launch_token["config_id"],
                                 registry_repository=(launch_token.get("registry") or {}).get(
                                     "repository"
@@ -2562,10 +2521,7 @@ class Gepetto:
                     "repository": item.repository,
                     "manifest_digest": item.manifest_digest,
                 }
-                if not all(
-                    body[key]
-                    for key in ("server_id", "repository", "manifest_digest")
-                ):
+                if not all(body[key] for key in ("server_id", "repository", "manifest_digest")):
                     raise DeploymentFailure(
                         "active registry scope lacks exact reconstruction identity"
                     )
@@ -2764,11 +2720,7 @@ class Gepetto:
                     await k8s.get_deployment(deployment_id),
                 )
             except Exception as exc:
-                status = (
-                    "absent"
-                    if "Not Found" in str(exc) or "(404)" in str(exc)
-                    else "unknown"
-                )
+                status = "absent" if "Not Found" in str(exc) or "(404)" in str(exc) else "unknown"
                 runtime_observations[deployment_id] = (status, exc)
 
         nodes = await k8s.get_kubernetes_nodes()
@@ -2850,9 +2802,7 @@ class Gepetto:
                     logger.warning(
                         f"Deployment: {deployment.deployment_id} (instance_id={deployment.instance_id}) on validator {deployment.validator} not found"
                     )
-                    tasks.append(
-                        self.instance_deleted({"instance_id": deployment.instance_id})
-                    )
+                    tasks.append(self.instance_deleted({"instance_id": deployment.instance_id}))
                     # Skip the rest of processing for this deployment since instance is gone
                     continue
 
@@ -3066,9 +3016,7 @@ class Gepetto:
             # Purge k8s deployments that aren't tracked anymore
             # BUT exclude legacy deployments from deletion
             k8s_by_id = {
-                item["deployment_id"]: item
-                for item in k8s_chutes
-                if item.get("deployment_id")
+                item["deployment_id"]: item for item in k8s_chutes if item.get("deployment_id")
             }
             for deployment_id in all_k8s_ids - all_deployments:
                 if deployment_id in k8s_legacy_ids:

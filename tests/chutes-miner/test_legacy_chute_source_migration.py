@@ -10,8 +10,7 @@ import pytest
 
 
 MIGRATION = (
-    Path(__file__).resolve().parents[2]
-    / "src/chutes-miner/chutes_miner/api/migrations/"
+    Path(__file__).resolve().parents[2] / "src/chutes-miner/chutes_miner/api/migrations/"
     "20260717221400_remove_legacy_chute_source.sql"
 )
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -97,9 +96,7 @@ def test_unshipped_legacy_source_migration_preserves_columns_and_rows():
             )
             assert inspected.returncode == 0, inspected.stderr.decode()
             assert [
-                line.strip()
-                for line in inspected.stdout.decode().splitlines()
-                if line.strip()
+                line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
             ] == ["code,filename", "print(42)|entrypoint.py"]
     finally:
         dropped = _psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')

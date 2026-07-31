@@ -54,12 +54,7 @@ def _node_resources(node, *, assigned_gpu_count: int) -> tuple[int, int, int]:
     except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError("seedless GPU Kubernetes capacity is invalid") from exc
     memory = capacity.get("memory", "")
-    if (
-        capacity_gpu_count < 1
-        or gpu_count < 1
-        or gpu_count > capacity_gpu_count
-        or cpu_count < 1
-    ):
+    if capacity_gpu_count < 1 or gpu_count < 1 or gpu_count > capacity_gpu_count or cpu_count < 1:
         raise RuntimeError("seedless GPU Kubernetes capacity is invalid")
     if assigned_gpu_count != gpu_count:
         raise RuntimeError(
@@ -131,8 +126,7 @@ async def _retire_unassigned_tracked_gpus(
 
     if blockers:
         summary = ", ".join(
-            f"gpu={gpu_id} deployment={deployment_id}"
-            for gpu_id, deployment_id in sorted(blockers)
+            f"gpu={gpu_id} deployment={deployment_id}" for gpu_id, deployment_id in sorted(blockers)
         )
         raise SeedlessAdoptionBlocked(
             "seedless GPU adoption is blocked by active/nonterminal deployment "
@@ -156,9 +150,7 @@ async def _retire_unassigned_tracked_gpus(
                 prior_gpu_allocation_group_generation=item.gpu_allocation_group_generation,
                 replacement_registration_attestation_id=identity["attestation_id"],
                 replacement_gpu_allocation_group_id=identity["allocation_group_id"],
-                replacement_gpu_allocation_group_generation=identity[
-                    "allocation_group_generation"
-                ],
+                replacement_gpu_allocation_group_generation=identity["allocation_group_generation"],
             )
         )
         await session.delete(item)
@@ -333,9 +325,7 @@ async def adopt_seedless_gpu_server() -> str:
         tracked = (
             (
                 await session.execute(
-                    select(GPU)
-                    .where(GPU.server_id == logical_server_id)
-                    .with_for_update(of=GPU)
+                    select(GPU).where(GPU.server_id == logical_server_id).with_for_update(of=GPU)
                 )
             )
             .unique()

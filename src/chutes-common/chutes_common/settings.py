@@ -196,31 +196,23 @@ class MinerSettings(BaseSettings):
             or registration["allocation_group_generation"] < 1
             or not isinstance(registration.get("gpu_uuids"), list)
             or not registration["gpu_uuids"]
-            or any(
-                not isinstance(value, str) or not value
-                for value in registration["gpu_uuids"]
-            )
+            or any(not isinstance(value, str) or not value for value in registration["gpu_uuids"])
             or not isinstance(registration.get("gpu_identifiers"), list)
             or not registration["gpu_identifiers"]
             or any(
-                not isinstance(value, str) or not value
-                for value in registration["gpu_identifiers"]
+                not isinstance(value, str) or not value for value in registration["gpu_identifiers"]
             )
             or len(registration["gpu_uuids"]) != len(registration["gpu_identifiers"])
         ):
             raise ValueError("seedless GPU Registration V2 document is invalid")
-        identity = {
-            field: registration[field]
-            for field in GPU_REGISTRATION_IDENTITY_FIELDS
-        }
+        identity = {field: registration[field] for field in GPU_REGISTRATION_IDENTITY_FIELDS}
         if (
             registration["server_id"] != runtime["server_id"]
             or registration["owner_hotkey"] != runtime["owner_hotkey"]
             or registration["gpu_uuids"] != runtime["gpu_uuids"]
             or registration["gpu_identifiers"] != runtime["gpu_identifiers"]
             or registration["runtime_session"] != runtime["runtime_session"]
-            or registration["runtime_session_expires_at"]
-            != runtime["runtime_session_expires_at"]
+            or registration["runtime_session_expires_at"] != runtime["runtime_session_expires_at"]
         ):
             raise ValueError("seedless GPU registration and runtime identities do not match")
         return {

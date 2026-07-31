@@ -178,9 +178,7 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
             return Response()
 
     monkeypatch.setattr(registry_broker.ssl, "create_default_context", Context)
-    monkeypatch.setattr(
-        registry_broker.aiohttp, "TCPConnector", lambda **_kwargs: object()
-    )
+    monkeypatch.setattr(registry_broker.aiohttp, "TCPConnector", lambda **_kwargs: object())
     monkeypatch.setattr(registry_broker.aiohttp, "ClientSession", Client)
     registry_broker._scopes.clear()
     registry_broker._scopes["config-1"] = {"launch_config_id": "config-1"}

@@ -263,9 +263,7 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
 
     missing = dict(registration)
     missing.pop("attestation_id")
-    registration_path.write_text(
-        json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n"
-    )
+    registration_path.write_text(json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n")
     with pytest.raises(ValueError, match="Registration V2 document is invalid"):
         MinerSettings(
             miner_ss58="5Owner",
@@ -353,9 +351,7 @@ def test_dev_helpers_use_public_owner_without_wallet_material():
         assert "MINER_" + "SEED" not in source
         assert "MINER_SS58" not in source
 
-    verification = (
-        root / "src/chutes-miner/chutes_miner/api/server/verification.py"
-    ).read_text()
+    verification = (root / "src/chutes-miner/chutes_miner/api/server/verification.py").read_text()
     assert "miner_" + "keypair" not in verification
     for source_root in (
         root / "src/chutes-miner",
@@ -367,12 +363,15 @@ def test_dev_helpers_use_public_owner_without_wallet_material():
 
 def test_merged_dev_compose_contains_only_public_owner_identity():
     docker = shutil.which("docker")
-    if docker is None or subprocess.run(
-        [docker, "compose", "version"],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).returncode:
+    if (
+        docker is None
+        or subprocess.run(
+            [docker, "compose", "version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+    ):
         pytest.skip("Docker Compose is unavailable")
 
     root = Path(__file__).resolve().parents[2]
@@ -403,11 +402,7 @@ def test_merged_dev_compose_contains_only_public_owner_identity():
     )
     document = json.loads(resolved.stdout)
     api_environment = document["services"]["api"]["environment"]
-    assert {
-        key: value
-        for key, value in api_environment.items()
-        if key.startswith("MINER_")
-    } == {
+    assert {key: value for key, value in api_environment.items() if key.startswith("MINER_")} == {
         "MINER_OWNER_SS58": "5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj"
     }
     serialized = json.dumps(document, sort_keys=True)

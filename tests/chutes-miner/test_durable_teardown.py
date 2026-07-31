@@ -42,7 +42,11 @@ def _resource(
 ) -> ResourceIdentity:
     return ResourceIdentity(
         api_version=(
-            "batch/v1" if kind == "Job" else "apps/v1" if kind in {"Deployment", "ReplicaSet"} else "v1"
+            "batch/v1"
+            if kind == "Job"
+            else "apps/v1"
+            if kind in {"Deployment", "ReplicaSet"}
+            else "v1"
         ),
         kind=kind,
         name=f"resource-{kind.lower()}",
@@ -750,11 +754,7 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
             replacement_matches(
                 expected_labels={
                     **EXPECTED_LABELS,
-                    **(
-                        {"chutes/job-id": "job-1"}
-                        if conflict.uid == "wrong-job"
-                        else {}
-                    ),
+                    **({"chutes/job-id": "job-1"} if conflict.uid == "wrong-job" else {}),
                 },
                 expected_node_name="node-a",
                 accepted_owners={},
@@ -802,13 +802,16 @@ def test_direct_delete_uses_kubernetes_uid_precondition(monkeypatch):
     monkeypatch.setattr(teardown, "k8s_batch_client", lambda: batch)
     monkeypatch.setattr(teardown, "k8s_core_client", lambda: core)
     closure = DirectKubernetesClosure(operator=SimpleNamespace())
-    assert closure.delete_resource(
-        cluster_context="node-a",
-        namespace="chutes",
-        kind="Pod",
-        name="pod-a",
-        uid="uid-a",
-    ) == "delete_requested"
+    assert (
+        closure.delete_resource(
+            cluster_context="node-a",
+            namespace="chutes",
+            kind="Pod",
+            name="pod-a",
+            uid="uid-a",
+        )
+        == "delete_requested"
+    )
     assert len(calls) == 1
     assert calls[0]["body"].preconditions.uid == "uid-a"
     assert calls[0]["body"].propagation_policy == "Foreground"
@@ -1196,9 +1199,7 @@ async def test_pod_404_plus_selector_absence_persists_uid_closure(monkeypatch):
     session = SimpleNamespace(
         get=AsyncMock(
             side_effect=lambda model, *_args, **_kwargs: (
-                operation
-                if model.__name__ == "DeploymentTeardownOperation"
-                else pod
+                operation if model.__name__ == "DeploymentTeardownOperation" else pod
             )
         ),
         commit=AsyncMock(),
@@ -1231,9 +1232,7 @@ async def test_registry_outage_does_not_block_local_resource_deletion(monkeypatc
         instance_id=None,
     )
     coordinator = teardown.DeploymentTeardownCoordinator()
-    coordinator._revoke_registry = AsyncMock(
-        side_effect=DeploymentFailure("validator unavailable")
-    )
+    coordinator._revoke_registry = AsyncMock(side_effect=DeploymentFailure("validator unavailable"))
     coordinator._advance = AsyncMock()
     record_failure = AsyncMock()
     monkeypatch.setattr(teardown, "record_registry_scope_failure", record_failure)
@@ -1544,9 +1543,7 @@ async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatc
     session = SimpleNamespace(
         get=AsyncMock(return_value=operation),
         scalar=AsyncMock(return_value=None),
-        execute=AsyncMock(
-            side_effect=[_QueryResult(None), _QueryResult(None)]
-        ),
+        execute=AsyncMock(side_effect=[_QueryResult(None), _QueryResult(None)]),
         flush=AsyncMock(),
         commit=AsyncMock(),
     )
@@ -1817,9 +1814,7 @@ async def test_instance_event_after_local_delete_creates_durable_exact_cleanup(m
 
     added = []
     session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[Result(None), Result(operation), Result(None)]
-        ),
+        execute=AsyncMock(side_effect=[Result(None), Result(operation), Result(None)]),
         add=lambda value: added.append(value),
         commit=AsyncMock(),
     )
@@ -1936,9 +1931,7 @@ async def test_startup_resumes_deployment_parent_and_orphan_operations(monkeypat
     coordinator.run.assert_awaited_once_with("deployment-operation")
     coordinator.run_parent.assert_awaited_once_with("parent-operation")
     coordinator.run_orphan.assert_awaited_once_with("orphan-tombstone")
-    coordinator.run_delayed_instance_cleanup.assert_awaited_once_with(
-        "delayed-instance-cleanup"
-    )
+    coordinator.run_delayed_instance_cleanup.assert_awaited_once_with("delayed-instance-cleanup")
     coordinator.request_and_run.assert_awaited_once_with(
         "stale-launch-deployment", "launch_rollback"
     )
@@ -1946,9 +1939,9 @@ async def test_startup_resumes_deployment_parent_and_orphan_operations(monkeypat
 
 def test_gepetto_has_no_direct_deployment_delete_or_cache_proof_for_gpu_teardown():
     source = (ROOT / "src/chutes-miner/chutes_miner/gepetto.py").read_text(encoding="utf-8")
-    coordinator = (
-        ROOT / "src/chutes-miner/chutes_miner/api/deployment/teardown.py"
-    ).read_text(encoding="utf-8")
+    coordinator = (ROOT / "src/chutes-miner/chutes_miner/api/deployment/teardown.py").read_text(
+        encoding="utf-8"
+    )
     assert "await session.delete(deployment)" not in source
     assert "asyncio.create_task(self.undeploy" not in source
     assert "V1Preconditions(uid=uid)" in coordinator

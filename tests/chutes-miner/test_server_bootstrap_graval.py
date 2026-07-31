@@ -19,24 +19,22 @@ def mock_fetch_devices(mock_gpus):
         _mock.return_value = [{"uuid": gpu.gpu_id, **gpu.device_info} for gpu in mock_gpus]
         yield _mock
 
+
 @pytest.fixture
 def mock_parent_teardown():
     with (
         patch(
-            "chutes_miner.api.deployment.teardown."
-            "DeploymentTeardownCoordinator.request_parent",
+            "chutes_miner.api.deployment.teardown.DeploymentTeardownCoordinator.request_parent",
             new_callable=AsyncMock,
             return_value="parent-operation",
         ) as request_parent,
         patch(
-            "chutes_miner.api.deployment.teardown."
-            "DeploymentTeardownCoordinator.run_parent",
+            "chutes_miner.api.deployment.teardown.DeploymentTeardownCoordinator.run_parent",
             new_callable=AsyncMock,
             return_value=True,
         ) as run_parent,
     ):
         yield request_parent, run_parent
-
 
 
 @pytest.mark.asyncio

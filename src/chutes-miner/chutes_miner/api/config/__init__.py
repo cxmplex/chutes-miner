@@ -110,9 +110,7 @@ class Settings(CommonSettings):
             normalized = value.strip().lower()
             if normalized in {"true", "false"}:
                 return normalized == "true"
-        raise ValueError(
-            "CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES must be exactly true or false"
-        )
+        raise ValueError("CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES must be exactly true or false")
 
     monitor_api: str = str(os.getenv("MONITOR_API", ""))
 

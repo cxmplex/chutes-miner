@@ -149,13 +149,11 @@ class DeploymentTeardownOperation(Base):
             name="ck_deployment_teardown_registry_ack",
         ),
         CheckConstraint(
-            "(validator_instance_deletion_ack IS NULL) = "
-            "(validator_instance_deleted_at IS NULL)",
+            "(validator_instance_deletion_ack IS NULL) = (validator_instance_deleted_at IS NULL)",
             name="ck_deployment_teardown_validator_ack",
         ),
         CheckConstraint(
-            "(validator_job_release_ack IS NULL) = "
-            "(validator_job_released_at IS NULL)",
+            "(validator_job_release_ack IS NULL) = (validator_job_released_at IS NULL)",
             name="ck_deployment_teardown_job_ack",
         ),
         CheckConstraint(
@@ -288,20 +286,12 @@ class DeploymentTeardownK8sResource(Base):
     pod_uid_absence_evidence = Column(JSONB, nullable=True)
     pod_uid_absence_evidence_sha256 = Column(String, nullable=True)
     pod_uid_absence_observed_at = Column(DateTime(timezone=True), nullable=True)
-    pod_already_terminating = Column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
+    pod_already_terminating = Column(Boolean, nullable=False, default=False, server_default="false")
     pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
-    pod_teardown_finalizer_removal_requested_at = Column(
-        DateTime(timezone=True), nullable=True
-    )
+    pod_teardown_finalizer_removal_requested_at = Column(DateTime(timezone=True), nullable=True)
     pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
-    state = Column(
-        String, nullable=False, default="observed", server_default="observed"
-    )
-    observed_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    state = Column(String, nullable=False, default="observed", server_default="observed")
+    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     delete_requested_at = Column(DateTime(timezone=True), nullable=True)
     absent_at = Column(DateTime(timezone=True), nullable=True)
     replaced_by_resource_id = Column(
@@ -431,8 +421,7 @@ class DeploymentLaunchOperation(Base):
             name="ck_deployment_launch_lease",
         ),
         CheckConstraint(
-            "(canonical_workload_spec IS NULL) = "
-            "(canonical_workload_spec_sha256 IS NULL)",
+            "(canonical_workload_spec IS NULL) = (canonical_workload_spec_sha256 IS NULL)",
             name="ck_deployment_launch_canonical_workload",
         ),
         CheckConstraint(
@@ -441,8 +430,7 @@ class DeploymentLaunchOperation(Base):
             name="ck_deployment_launch_canonical_workload_sha256",
         ),
         CheckConstraint(
-            "cluster_context_sha256 IS NULL OR "
-            "cluster_context_sha256 ~ '^[0-9a-f]{64}$'",
+            "cluster_context_sha256 IS NULL OR cluster_context_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_deployment_launch_cluster_context_sha256",
         ),
         CheckConstraint(
@@ -769,8 +757,7 @@ class ParentDeletionOperation(Base):
             name="ck_parent_deletion_monitor_ack",
         ),
         CheckConstraint(
-            "(validator_server_deletion_ack IS NULL) = "
-            "(validator_server_deleted_at IS NULL)",
+            "(validator_server_deletion_ack IS NULL) = (validator_server_deleted_at IS NULL)",
             name="ck_parent_deletion_validator_ack",
         ),
         CheckConstraint(
@@ -880,16 +867,10 @@ class KubernetesOrphanTombstoneResource(Base):
     pod_termination_evidence = Column(JSONB, nullable=True)
     pod_termination_evidence_sha256 = Column(String, nullable=True)
     pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
-    pod_teardown_finalizer_removal_requested_at = Column(
-        DateTime(timezone=True), nullable=True
-    )
+    pod_teardown_finalizer_removal_requested_at = Column(DateTime(timezone=True), nullable=True)
     pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
-    state = Column(
-        String, nullable=False, default="observed", server_default="observed"
-    )
-    observed_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    state = Column(String, nullable=False, default="observed", server_default="observed")
+    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     absent_at = Column(DateTime(timezone=True), nullable=True)
 
     tombstone = relationship("KubernetesOrphanTombstone", back_populates="resources")

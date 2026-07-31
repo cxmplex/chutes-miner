@@ -444,8 +444,7 @@ async def test_wait_for_deletion_with_timeout(
 async def test_undeploy_success(mock_k8s_core_client, mock_k8s_batch_client):
     """microK8s undeploy advances the durable teardown journal."""
     with patch(
-        "chutes_miner.api.deployment.teardown."
-        "DeploymentTeardownCoordinator.request_and_run",
+        "chutes_miner.api.deployment.teardown.DeploymentTeardownCoordinator.request_and_run",
         new_callable=AsyncMock,
         return_value=True,
     ) as request_and_run:
@@ -462,8 +461,7 @@ async def test_undeploy_success(mock_k8s_core_client, mock_k8s_batch_client):
 async def test_undeploy_with_service_error(mock_k8s_core_client, mock_k8s_batch_client):
     """An incomplete microK8s teardown remains journaled and is reported."""
     with patch(
-        "chutes_miner.api.deployment.teardown."
-        "DeploymentTeardownCoordinator.request_and_run",
+        "chutes_miner.api.deployment.teardown.DeploymentTeardownCoordinator.request_and_run",
         new_callable=AsyncMock,
         return_value=False,
     ) as request_and_run:
