@@ -50,3 +50,60 @@ jobs:
           root=E.parse('miner-postgres.xml').getroot();
           skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
           assert skipped == 0, f'{skipped} mandatory miner PostgreSQL tests skipped'"
+
+  miner-chart-render:
+    runs-on: ubuntu-latest
+    env:
+      CHUTES_CROSS_REPO_ROOT: ${{ github.workspace }}/cohort
+    steps:
+      - name: Check out miner under the cohort root
+        uses: actions/checkout@v4
+        with:
+          path: cohort/chutes-miner
+      - name: Check out API contract fixtures
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/chutes-api
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: cohort/chutes-api
+      - name: Check out sek8s contract fixtures
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/sek8s
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: cohort/sek8s
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+      - name: Verify Helm version
+        run: helm version --short
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      - name: Install test dependencies
+        working-directory: cohort/chutes-miner
+        run: poetry install --no-interaction
+      - name: Run required seedless chart render suites
+        working-directory: cohort/chutes-miner
+        run: >-
+          poetry run pytest -q
+          tests/chutes-miner/test_seedless_acceptance.py
+          tests/chutes-miner/test_seedless_chart_upgrade.py
+          --junitxml=miner-chart-render.xml
+      - name: Reject skipped seedless chart render tests
+        working-directory: cohort/chutes-miner
+        run: >-
+          poetry run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('miner-chart-render.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} mandatory seedless chart render tests skipped'"
