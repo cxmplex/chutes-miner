@@ -862,6 +862,7 @@ async def test_lineage_recovery_rejects_changed_live_authority(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_verified_terminal_absence_resolves_normal_conflict(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
     conflict_at = datetime.now(timezone.utc)
     now = datetime.now(timezone.utc)
     registry_ack = {
@@ -998,14 +999,25 @@ async def test_verified_terminal_absence_resolves_normal_conflict(monkeypatch):
         )
 
 
-def test_verified_terminal_absence_policy_is_shared_with_orphans():
+def test_verified_terminal_absence_policy_is_shared_with_orphans(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    now = datetime.now(timezone.utc)
+    registry_ack = {
+        "status": "revoked",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
     tombstone = SimpleNamespace(
         deployment_id="orphan-deployment",
         cluster_context="node-1",
         cluster_context_sha256="a" * 64,
         kubernetes_node_uid="node-uid",
         kubernetes_node_generation=4,
-        immutable_labels={"chutes/deployment-id": "orphan-deployment"},
+        immutable_labels={
+            "chutes/deployment-id": "orphan-deployment",
+            "chutes/config-id": "config-1",
+        },
         resources=[],
     )
     lineage = {
@@ -1021,7 +1033,16 @@ def test_verified_terminal_absence_policy_is_shared_with_orphans():
                 "kubernetes_node_generation": 4,
             },
             "gpus": [],
-            "registry_scope": None,
+            "registry_scope": {
+                "launch_config_id": "config-1",
+                "deployment_id": "orphan-deployment",
+                "validator": "validator-1",
+                "server_id": "server-1",
+                "desired_state": "revoked",
+                "phase": "revoked",
+                "revocation_ack": registry_ack,
+                "revoked_at": now.isoformat(),
+            },
             "kubernetes": {"resources": []},
         },
     }
@@ -1030,6 +1051,22 @@ def test_verified_terminal_absence_policy_is_shared_with_orphans():
         tombstone,
         lineage,
     )
+    lineage["authoritative"]["registry_scope"]["revocation_ack"] = {}
+    with pytest.raises(DeploymentFailure, match="terminal registry revocation"):
+        DeploymentTeardownCoordinator._require_verified_terminal_absence(
+            "orphan",
+            tombstone,
+            lineage,
+        )
+    lineage["authoritative"]["registry_scope"]["revocation_ack"] = registry_ack
+    lineage["authoritative"]["registry_scope"]["phase"] = "active"
+    with pytest.raises(DeploymentFailure, match="terminal registry revocation"):
+        DeploymentTeardownCoordinator._require_verified_terminal_absence(
+            "orphan",
+            tombstone,
+            lineage,
+        )
+    lineage["authoritative"]["registry_scope"]["phase"] = "revoked"
     lineage["authoritative"]["deployment"] = {"deployment_id": "orphan-deployment"}
     with pytest.raises(DeploymentFailure, match="local Deployment"):
         DeploymentTeardownCoordinator._require_verified_terminal_absence(
@@ -1223,6 +1260,46 @@ def test_full_chart_render_is_byte_deterministic(chart):
     second = _render_chart(chart)
     assert first.returncode == second.returncode == 0
     assert first.stdout.encode() == second.stdout.encode()
+
+
+def test_registry_service_requires_the_nodeport_mirror_contract():
+    default_render = _render_chart("chutes-miner-gpu")
+    assert default_render.returncode == 0, default_render.stderr
+    default_service = next(
+        document
+        for document in yaml.safe_load_all(default_render.stdout)
+        if document
+        and document.get("kind") == "Service"
+        and document.get("metadata", {}).get("name", "").startswith("registry-")
+    )
+    assert default_service["spec"]["type"] == "NodePort"
+    assert default_service["spec"]["internalTrafficPolicy"] == "Local"
+    assert default_service["spec"]["externalTrafficPolicy"] == "Local"
+    assert default_service["spec"]["ports"][0]["nodePort"] == 30500
+
+    gpu_values = yaml.safe_load(
+        (ROOT / "charts/chutes-miner-gpu/values.yaml").read_text(encoding="utf-8")
+    )
+    miner_values = yaml.safe_load(
+        (ROOT / "charts/chutes-miner/values.yaml").read_text(encoding="utf-8")
+    )
+    assert "type" not in gpu_values["registry"]["service"]
+    assert (
+        gpu_values["registry"]["service"]["nodePort"]
+        == miner_values["registry"]["service"]["nodePort"]
+        == 30500
+    )
+
+    missing_nodeport = _render_chart(
+        "chutes-miner-gpu",
+        "--set-string",
+        "registry.service.nodePort=",
+    )
+    assert missing_nodeport.returncode != 0
+    assert (
+        "registry.service.nodePort is required for the local registry mirror contract"
+        in missing_nodeport.stderr
+    )
 
 
 @pytest.mark.parametrize(

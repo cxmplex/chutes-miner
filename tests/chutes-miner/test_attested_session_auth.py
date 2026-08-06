@@ -122,27 +122,53 @@ def test_gepetto_generic_gpu_deletion_rejects_reservation_owned_nodes():
     Gepetto.require_generic_gpu_deletion(None)
 
 
-def test_seedless_session_accepts_exactly_one_runtime_validator(tmp_path):
+@pytest.mark.parametrize(
+    ("session_version", "allowed_purposes"),
+    [
+        (
+            1,
+            [
+                "cache",
+                "gpu-infra",
+                "instances",
+                "launch",
+                "miner",
+                "nodes",
+                "registry",
+                "sockets",
+            ],
+        ),
+        (
+            2,
+            [
+                "cache",
+                "gpu-decommission",
+                "gpu-infra",
+                "instances",
+                "launch",
+                "miner",
+                "nodes",
+                "registry",
+                "sockets",
+            ],
+        ),
+    ],
+)
+def test_seedless_session_accepts_exactly_one_runtime_validator(
+    tmp_path,
+    session_version,
+    allowed_purposes,
+):
     session = {
         "schema": "chutes.gpu-miner-session",
-        "version": 1,
+        "version": session_version,
         "server_id": "gpu-server",
         "owner_hotkey": "5Owner",
         "gpu_uuids": ["GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
         "gpu_identifiers": ["h100_sxm"],
         "runtime_session": "scoped",
         "runtime_session_expires_at": "2026-07-24T00:15:00Z",
-        "allowed_purposes": [
-            "cache",
-            "gpu-decommission",
-            "gpu-infra",
-            "instances",
-            "launch",
-            "miner",
-            "nodes",
-            "registry",
-            "sockets",
-        ],
+        "allowed_purposes": allowed_purposes,
         "validator": {
             "hotkey": "5Validator",
             "registry": "registry.validator.example",
@@ -160,6 +186,42 @@ def test_seedless_session_accepts_exactly_one_runtime_validator(tmp_path):
     assert [item.hotkey for item in settings.validators] == ["5Validator"]
     assert settings.attested_session == "scoped"
 
+    session["allowed_purposes"] = (
+        [
+            "cache",
+            "gpu-decommission",
+            "gpu-infra",
+            "instances",
+            "launch",
+            "miner",
+            "nodes",
+            "registry",
+            "sockets",
+        ]
+        if session_version == 1
+        else [
+            "cache",
+            "gpu-infra",
+            "instances",
+            "launch",
+            "miner",
+            "nodes",
+            "registry",
+            "sockets",
+        ]
+    )
+    path.write_text(json.dumps(session, sort_keys=True, separators=(",", ":")) + "\n")
+    with pytest.raises(ValueError, match="validator/session"):
+        settings.validators
+
+    session["version"] = 3
+    session["allowed_purposes"] = []
+    path.write_text(json.dumps(session, sort_keys=True, separators=(",", ":")) + "\n")
+    with pytest.raises(ValueError, match="validator/session"):
+        settings.validators
+
+    session["version"] = session_version
+    session["allowed_purposes"] = allowed_purposes
     session["validators"] = [session.pop("validator"), session["runtime_session"]]
     path.write_text(json.dumps(session, sort_keys=True, separators=(",", ":")) + "\n")
     with pytest.raises(ValueError, match="validator/session"):
@@ -169,7 +231,7 @@ def test_seedless_session_accepts_exactly_one_runtime_validator(tmp_path):
 def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
     runtime = {
         "schema": "chutes.gpu-miner-session",
-        "version": 1,
+        "version": 2,
         "server_id": "logical-gpu-server",
         "owner_hotkey": "5Owner",
         "gpu_uuids": ["GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],

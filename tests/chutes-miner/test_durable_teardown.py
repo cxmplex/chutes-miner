@@ -501,6 +501,651 @@ async def test_orphan_replacement_adoption_is_one_durable_transition(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_orphan_request_persists_exact_registry_revocation_outbox(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    added = []
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=None),
+        execute=AsyncMock(side_effect=[_QueryResult(server), _QueryResult(None)]),
+        add=added.append,
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    persist_revoke = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation_in_session",
+        persist_revoke,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+
+    tombstone_id = await coordinator.request_orphan(
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        immutable_labels=EXPECTED_LABELS,
+    )
+
+    assert tombstone_id == added[0].tombstone_id
+    persist_revoke.assert_awaited_once_with(
+        session,
+        launch_config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="dep-1",
+    )
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_orphan_request_rejects_changed_labels_before_outbox(
+    monkeypatch,
+):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    existing = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        namespace="chutes",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=None),
+        execute=AsyncMock(side_effect=[_QueryResult(server), _QueryResult(existing)]),
+        add=Mock(),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    persist_revoke = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation_in_session",
+        persist_revoke,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+
+    with pytest.raises(LineageConflict, match="changed its immutable authority"):
+        await coordinator.request_orphan(
+            deployment_id="dep-1",
+            cluster_context="node-a",
+            immutable_labels={**EXPECTED_LABELS, "chutes/config-id": "config-2"},
+        )
+
+    persist_revoke.assert_not_awaited()
+    session.add.assert_not_called()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orphan_request_rechecks_deployment_after_server_lock(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    deployment = SimpleNamespace(deployment_id="dep-1")
+    events: list[str] = []
+
+    async def execute(_statement):
+        if "server_locked" not in events:
+            events.append("server_locked")
+            return _QueryResult(server)
+        return _QueryResult(None)
+
+    async def get(_model, _identity, **_kwargs):
+        # This models a placement that commits while the orphan requester is
+        # waiting for the shared Server-row fence.
+        if "server_locked" in events:
+            events.append("deployment_read_after_lock")
+            return deployment
+        events.append("stale_deployment_read_before_lock")
+        return None
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(side_effect=execute),
+        add=Mock(),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    persist_revoke = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation_in_session",
+        persist_revoke,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+
+    assert (
+        await coordinator.request_orphan(
+            deployment_id="dep-1",
+            cluster_context="node-a",
+            immutable_labels=EXPECTED_LABELS,
+        )
+        is None
+    )
+    assert events == ["server_locked", "deployment_read_after_lock"]
+    persist_revoke.assert_not_awaited()
+    session.add.assert_not_called()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_seedless_orphan_without_config_fails_before_outbox(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=None),
+        execute=AsyncMock(side_effect=[_QueryResult(server), _QueryResult(None)]),
+        add=Mock(),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    persist_revoke = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation_in_session",
+        persist_revoke,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator()
+
+    with pytest.raises(
+        DeploymentFailure,
+        match="lacks exact registry config authority",
+    ):
+        await coordinator.request_orphan(
+            deployment_id="dep-1",
+            cluster_context="node-a",
+            immutable_labels={
+                "chutes/deployment-id": "dep-1",
+                "chutes/chute-id": "chute-1",
+            },
+        )
+
+    persist_revoke.assert_not_awaited()
+    session.add.assert_not_called()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orphan_registry_completion_reuses_durable_ack_after_crash(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    tombstone = SimpleNamespace(
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+    )
+    revoked_at = datetime.now(timezone.utc)
+    intent = SimpleNamespace(
+        launch_config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="dep-1",
+        desired_state="revoked",
+        phase="revoked",
+        revocation_ack={
+            "status": "revoked",
+            "revoked": True,
+            "launch_config_id": "config-1",
+            "server_id": "server-1",
+        },
+        revoked_at=revoked_at,
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_QueryResult(server)),
+        get=AsyncMock(return_value=intent),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    coordinator._revoke_registry_identity = AsyncMock()
+
+    ack = await coordinator._ensure_orphan_registry_revoked(tombstone)
+
+    assert ack == intent.revocation_ack
+    coordinator._revoke_registry_identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orphan_retries_already_absent_after_ack_record_crash_before_completion(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    token_file = tmp_path / "registry-workload-token"
+    token_file.write_text("w" * 64, encoding="ascii")
+    monkeypatch.setattr(
+        teardown.settings,
+        "registry_workload_token_file",
+        str(token_file),
+    )
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        hotkey="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    tombstone = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        namespace="chutes",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+        phase="verifying",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        next_retry_at=None,
+        attempt_count=0,
+        lineage_conflict_at=None,
+        last_failure=None,
+        completed_at=None,
+    )
+    intent = SimpleNamespace(
+        launch_config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="dep-1",
+        desired_state="revoked",
+        phase="revoke_pending",
+        revocation_ack=None,
+        revoked_at=None,
+    )
+
+    async def get(model, _identity, **_kwargs):
+        if model is teardown.KubernetesOrphanTombstone:
+            return tombstone
+        if model is teardown.Deployment:
+            return None
+        if model is teardown.RegistryScopeIntent:
+            return intent
+        raise AssertionError(f"unexpected model lookup: {model}")
+
+    class EmptyRows:
+        @staticmethod
+        def scalars():
+            return iter(())
+
+    async def execute(statement):
+        sql = str(statement)
+        if "FROM servers" in sql:
+            return _QueryResult(server)
+        if "FROM kubernetes_orphan_tombstone_resources" in sql:
+            return EmptyRows()
+        raise AssertionError(f"unexpected statement: {sql}")
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(side_effect=execute),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    broker_payloads = [
+        {
+            "status": "revoked",
+            "revoked": True,
+            "launch_config_id": "config-1",
+            "server_id": "server-1",
+        },
+        {
+            "status": "already_absent",
+            "revoked": True,
+            "launch_config_id": "config-1",
+            "server_id": "server-1",
+        },
+    ]
+
+    class Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def delete(self, *_args, **_kwargs):
+            return Response(broker_payloads.pop(0))
+
+    record_attempts = 0
+
+    async def record_revoked(launch_config_id, payload):
+        nonlocal record_attempts
+        record_attempts += 1
+        assert launch_config_id == "config-1"
+        if record_attempts == 1:
+            assert payload["status"] == "revoked"
+            raise RuntimeError("simulated crash before durable registry ACK")
+        assert payload["status"] == "already_absent"
+        intent.phase = "revoked"
+        intent.revocation_ack = {
+            "status": "revoked",
+            "revoked": True,
+            "launch_config_id": "config-1",
+            "server_id": "server-1",
+        }
+        intent.revoked_at = datetime.now(timezone.utc)
+        return intent.revocation_ack
+
+    request_revoke = AsyncMock()
+    record_failure = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(teardown, "validator_by_hotkey", lambda _hotkey: server)
+    monkeypatch.setattr(teardown, "sign_request", lambda **_kwargs: ({}, None))
+    monkeypatch.setattr(teardown.aiohttp, "ClientSession", Client)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation",
+        request_revoke,
+    )
+    monkeypatch.setattr(teardown, "record_registry_scope_revoked", record_revoked)
+    monkeypatch.setattr(teardown, "record_registry_scope_failure", record_failure)
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(list_resources=Mock(return_value=[]))
+    )
+    coordinator._renew_orphan_lease = AsyncMock()
+
+    assert await coordinator.run_orphan("tombstone-1") is False
+    assert tombstone.phase == "verifying"
+    assert tombstone.completed_at is None
+    assert intent.phase == "revoke_pending"
+    assert intent.revocation_ack is None
+    record_failure.assert_awaited_once()
+
+    # Model the durable backoff elapsing. The replay must consume the broker's
+    # authenticated already_absent result and persist the canonical ACK before
+    # the tombstone can cross its completion boundary.
+    tombstone.next_retry_at = None
+    assert await coordinator.run_orphan("tombstone-1") is True
+    assert tombstone.phase == "completed"
+    assert tombstone.completed_at is not None
+    assert intent.phase == "revoked"
+    assert intent.revocation_ack == {
+        "status": "revoked",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
+    assert record_attempts == 2
+    assert request_revoke.await_count == 2
+    assert broker_payloads == []
+
+
+@pytest.mark.asyncio
+async def test_orphan_registry_broker_outage_stays_in_durable_retry_outbox(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    tombstone = SimpleNamespace(
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+    )
+    intent = SimpleNamespace(
+        launch_config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="dep-1",
+        desired_state="revoked",
+        phase="revoke_pending",
+        revocation_ack=None,
+        revoked_at=None,
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_QueryResult(server)),
+        get=AsyncMock(return_value=intent),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    failure = DeploymentFailure("registry broker unavailable")
+    record_failure = AsyncMock()
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    monkeypatch.setattr(teardown, "record_registry_scope_failure", record_failure)
+    coordinator = teardown.DeploymentTeardownCoordinator()
+    coordinator._revoke_registry_identity = AsyncMock(side_effect=failure)
+
+    with pytest.raises(DeploymentFailure, match="registry broker unavailable"):
+        await coordinator._ensure_orphan_registry_revoked(tombstone)
+
+    record_failure.assert_awaited_once_with("config-1", failure)
+
+
+@pytest.mark.asyncio
+async def test_orphan_broker_outage_cannot_terminalize_tombstone(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", True)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(list_resources=Mock(return_value=[]))
+    )
+    tombstone = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        namespace="chutes",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+        phase="verifying",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        next_retry_at=None,
+        attempt_count=0,
+        lineage_conflict_at=None,
+        last_failure=None,
+        completed_at=None,
+    )
+
+    async def get(model, _identity, **_kwargs):
+        if model.__name__ == "Deployment":
+            return None
+        return tombstone
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(server),
+                SimpleNamespace(scalars=lambda: iter(())),
+            ]
+        ),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator._renew_orphan_lease = AsyncMock()
+    coordinator._ensure_orphan_registry_revoked = AsyncMock(
+        side_effect=DeploymentFailure("registry broker unavailable")
+    )
+
+    assert await coordinator.run_orphan("tombstone-1") is False
+    assert tombstone.phase == "verifying"
+    assert tombstone.completed_at is None
+    assert tombstone.retry_lease_owner is None
+    assert tombstone.retry_lease_expires_at is None
+    assert tombstone.next_retry_at is not None
+    assert "registry broker unavailable" in tombstone.last_failure
+
+
+@pytest.mark.asyncio
+async def test_nonseedless_orphan_with_config_completes_without_registry_broker(monkeypatch):
+    monkeypatch.setattr(teardown.settings, "gpu_tee_only", False)
+    server = SimpleNamespace(
+        server_id="server-1",
+        validator="validator-1",
+        name="node-a",
+        kubeconfig="kubeconfig",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+    )
+    coordinator = teardown.DeploymentTeardownCoordinator(
+        kubernetes=SimpleNamespace(list_resources=Mock(return_value=[]))
+    )
+    tombstone = SimpleNamespace(
+        tombstone_id="tombstone-1",
+        deployment_id="dep-1",
+        cluster_context="node-a",
+        cluster_context_sha256=teardown.cluster_context_sha256(server),
+        namespace="chutes",
+        kubernetes_node_uid="node-uid-1",
+        kubernetes_node_generation=3,
+        immutable_labels=EXPECTED_LABELS,
+        phase="verifying",
+        retry_lease_owner=None,
+        retry_lease_expires_at=None,
+        next_retry_at=None,
+        attempt_count=0,
+        lineage_conflict_at=None,
+        last_failure=None,
+        completed_at=None,
+    )
+
+    async def get(model, _identity, **_kwargs):
+        if model.__name__ == "Deployment":
+            return None
+        return tombstone
+
+    def empty_rows():
+        return SimpleNamespace(scalars=lambda: iter(()))
+
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(
+            side_effect=[
+                _QueryResult(server),
+                empty_rows(),
+                _QueryResult(server),
+                empty_rows(),
+            ]
+        ),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(teardown, "get_session", fake_session)
+    coordinator._renew_orphan_lease = AsyncMock()
+    coordinator._revoke_registry_identity = AsyncMock()
+
+    assert await coordinator.run_orphan("tombstone-1") is True
+    assert tombstone.phase == "completed"
+    assert tombstone.completed_at is not None
+    coordinator._revoke_registry_identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
     coordinator = teardown.DeploymentTeardownCoordinator(
         kubernetes=SimpleNamespace(

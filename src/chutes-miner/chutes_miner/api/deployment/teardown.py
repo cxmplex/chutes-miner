@@ -2724,22 +2724,27 @@ class DeploymentTeardownCoordinator:
         )
         await self._advance(operation.operation_id, "discovering", "revoking")
 
-    async def _revoke_registry(
-        self, operation: DeploymentTeardownOperation
+    async def _revoke_registry_identity(
+        self,
+        *,
+        launch_config_id: str,
+        validator_hotkey: str,
+        server_id: str,
+        deployment_id: str,
     ) -> dict[str, Any]:
-        if not operation.config_id or not settings.gpu_tee_only:
-            return {"status": "not_required", "config_id": operation.config_id}
+        """Persist and obtain one exact registry-scope revocation ACK."""
+
         await request_registry_scope_revocation(
-            launch_config_id=operation.config_id,
-            validator=operation.validator,
-            server_id=operation.server_id,
-            deployment_id=operation.deployment_id,
+            launch_config_id=launch_config_id,
+            validator=validator_hotkey,
+            server_id=server_id,
+            deployment_id=deployment_id,
         )
-        validator = validator_by_hotkey(operation.validator)
+        validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
             raise DeploymentFailure("registry scope validator is unavailable")
         headers, _ = sign_request(purpose="registry")
-        headers["X-Chutes-Server-Id"] = operation.server_id
+        headers["X-Chutes-Server-Id"] = server_id
         headers["X-Chutes-Registry-Workload-Token"] = settings.registry_workload_token
         service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
         async with aiohttp.ClientSession(
@@ -2747,7 +2752,7 @@ class DeploymentTeardownCoordinator:
             timeout=EXTERNAL_HTTP_TIMEOUT,
         ) as http:
             async with http.delete(
-                f"http://{service}/registry/scopes/{operation.config_id}",
+                f"http://{service}/registry/scopes/{launch_config_id}",
                 headers=headers,
             ) as response:
                 payload = await response.json()
@@ -2756,8 +2761,8 @@ class DeploymentTeardownCoordinator:
                     if isinstance(payload, dict)
                     else None,
                     "revoked": True,
-                    "launch_config_id": operation.config_id,
-                    "server_id": operation.server_id,
+                    "launch_config_id": launch_config_id,
+                    "server_id": server_id,
                 }
                 if (
                     expected["status"] not in {"revoked", "already_absent"}
@@ -2767,7 +2772,19 @@ class DeploymentTeardownCoordinator:
                     raise DeploymentFailure(
                         "registry scope revocation was not acknowledged"
                     )
-        return await record_registry_scope_revoked(operation.config_id, payload)
+        return await record_registry_scope_revoked(launch_config_id, payload)
+
+    async def _revoke_registry(
+        self, operation: DeploymentTeardownOperation
+    ) -> dict[str, Any]:
+        if not operation.config_id or not settings.gpu_tee_only:
+            return {"status": "not_required", "config_id": operation.config_id}
+        return await self._revoke_registry_identity(
+            launch_config_id=operation.config_id,
+            validator_hotkey=operation.validator,
+            server_id=operation.server_id,
+            deployment_id=operation.deployment_id,
+        )
 
     async def _delete_validator_instance(
         self, operation: DeploymentTeardownOperation
@@ -4342,8 +4359,18 @@ class DeploymentTeardownCoordinator:
             }
             operation_registry_ack = None
             operation_registry_at = None
-        if config_id:
+        if operation_kind == "orphan" and settings.gpu_tee_only and not config_id:
+            raise DeploymentFailure(
+                "verified terminal absence lacks exact registry config authority"
+            )
+        if config_id and settings.gpu_tee_only:
             registry = authoritative["registry_scope"]
+            expected_registry_ack = {
+                "status": "revoked",
+                "revoked": True,
+                "launch_config_id": config_id,
+                "server_id": expected_registry_identity["server_id"],
+            }
             if (
                 registry is None
                 or any(
@@ -4352,7 +4379,7 @@ class DeploymentTeardownCoordinator:
                 )
                 or registry["desired_state"] != "revoked"
                 or registry["phase"] != "revoked"
-                or registry["revocation_ack"] is None
+                or registry["revocation_ack"] != expected_registry_ack
                 or registry["revoked_at"] is None
                 or (
                     operation_kind == "deployment"
@@ -5178,8 +5205,6 @@ class DeploymentTeardownCoordinator:
         immutable_labels: dict[str, str],
     ) -> str | None:
         async with get_session() as session:
-            if await session.get(Deployment, deployment_id) is not None:
-                return None
             server = (
                 (
                     await session.execute(
@@ -5193,6 +5218,12 @@ class DeploymentTeardownCoordinator:
             )
             if server is None:
                 raise DeploymentFailure("orphan cleanup has no stable server lineage")
+            # Placement serializes on this same Server row before inserting a
+            # Deployment. Recheck only after owning that fence so a winning
+            # concurrent launch cannot have its registry authority revoked.
+            if await session.get(Deployment, deployment_id) is not None:
+                return None
+            context_sha256 = cluster_context_sha256(server)
             existing = (
                 await session.execute(
                     select(KubernetesOrphanTombstone)
@@ -5205,12 +5236,44 @@ class DeploymentTeardownCoordinator:
                 )
             ).scalar_one_or_none()
             if existing:
+                if (
+                    existing.namespace != settings.namespace
+                    or existing.cluster_context_sha256 != context_sha256
+                    or existing.kubernetes_node_uid != server.kubernetes_node_uid
+                    or existing.kubernetes_node_generation
+                    != server.kubernetes_node_generation
+                    or existing.immutable_labels != immutable_labels
+                ):
+                    raise LineageConflict(
+                        "duplicate orphan request changed its immutable authority"
+                    )
+                config_id = existing.immutable_labels.get("chutes/config-id")
+            else:
+                config_id = immutable_labels.get("chutes/config-id")
+            if settings.gpu_tee_only and not config_id:
+                raise DeploymentFailure(
+                    "GPU TEE orphan cleanup lacks exact registry config authority"
+                )
+            if config_id and settings.gpu_tee_only:
+                # An orphan is deletion authority too. Fence registry pulls in
+                # the same transaction that creates (or rediscovers) its
+                # durable tombstone so a later lineage conflict cannot strand
+                # an active scope outside the retry outbox.
+                await request_registry_scope_revocation_in_session(
+                    session,
+                    launch_config_id=config_id,
+                    validator=server.validator,
+                    server_id=server.server_id,
+                    deployment_id=deployment_id,
+                )
+            if existing:
+                await session.commit()
                 return existing.tombstone_id
             tombstone = KubernetesOrphanTombstone(
                 tombstone_id=str(uuid.uuid4()),
                 deployment_id=deployment_id,
                 cluster_context=cluster_context,
-                cluster_context_sha256=cluster_context_sha256(server),
+                cluster_context_sha256=context_sha256,
                 namespace=settings.namespace,
                 kubernetes_node_uid=server.kubernetes_node_uid,
                 kubernetes_node_generation=server.kubernetes_node_generation,
@@ -5220,6 +5283,104 @@ class DeploymentTeardownCoordinator:
             session.add(tombstone)
             await session.commit()
             return tombstone.tombstone_id
+
+    @staticmethod
+    def _terminal_orphan_registry_ack(
+        intent: RegistryScopeIntent | None,
+        *,
+        launch_config_id: str,
+        validator: str,
+        server_id: str,
+        deployment_id: str,
+    ) -> dict[str, Any] | None:
+        """Validate exact durable registry closure, returning its stable ACK."""
+
+        if intent is None:
+            return None
+        if any(
+            getattr(intent, field) != value
+            for field, value in {
+                "launch_config_id": launch_config_id,
+                "validator": validator,
+                "server_id": server_id,
+                "deployment_id": deployment_id,
+            }.items()
+        ):
+            raise LineageConflict("orphan registry revocation authority changed")
+        if intent.desired_state != "revoked" or intent.phase != "revoked":
+            return None
+        expected = {
+            "status": "revoked",
+            "revoked": True,
+            "launch_config_id": launch_config_id,
+            "server_id": server_id,
+        }
+        if intent.revocation_ack != expected or intent.revoked_at is None:
+            raise DeploymentFailure("orphan registry revocation ACK is malformed")
+        return expected
+
+    async def _ensure_orphan_registry_revoked(
+        self,
+        tombstone: KubernetesOrphanTombstone,
+    ) -> dict[str, Any] | None:
+        """Replay pending orphan revocation or consume its already durable ACK."""
+
+        launch_config_id = tombstone.immutable_labels.get("chutes/config-id")
+        if not settings.gpu_tee_only:
+            return None
+        if not launch_config_id:
+            raise LineageConflict(
+                "GPU TEE orphan lacks exact registry config authority"
+            )
+        async with get_session() as session:
+            server = (
+                (
+                    await session.execute(
+                        select(Server).where(Server.name == tombstone.cluster_context)
+                    )
+                )
+                .unique()
+                .scalar_one_or_none()
+            )
+            if (
+                server is None
+                or server.kubernetes_node_uid != tombstone.kubernetes_node_uid
+                or server.kubernetes_node_generation
+                != tombstone.kubernetes_node_generation
+                or cluster_context_sha256(server) != tombstone.cluster_context_sha256
+            ):
+                raise LineageConflict(
+                    "orphan cluster/node lineage changed before registry revocation"
+                )
+            validator = server.validator
+            server_id = server.server_id
+            intent = await session.get(RegistryScopeIntent, launch_config_id)
+            durable_ack = self._terminal_orphan_registry_ack(
+                intent,
+                launch_config_id=launch_config_id,
+                validator=validator,
+                server_id=server_id,
+                deployment_id=tombstone.deployment_id,
+            )
+            if durable_ack is not None:
+                return durable_ack
+        try:
+            return await self._revoke_registry_identity(
+                launch_config_id=launch_config_id,
+                validator_hotkey=validator,
+                server_id=server_id,
+                deployment_id=tombstone.deployment_id,
+            )
+        except Exception as exc:
+            try:
+                await record_registry_scope_failure(launch_config_id, exc)
+            except Exception as record_exc:
+                logger.warning(
+                    "Could not annotate orphan registry revocation intent {}: {}",
+                    launch_config_id,
+                    record_exc,
+                )
+            raise
 
     async def _ensure_orphan_pod_finalizers(
         self,
@@ -5814,6 +5975,10 @@ class DeploymentTeardownCoordinator:
                         current.next_retry_at = retry_at(current.attempt_count)
                         await session.commit()
                 return False
+            # Kubernetes absence is not terminal while registry pull authority
+            # remains live. The durable outbox was written with the tombstone;
+            # consume its ACK or replay the exact idempotent revoke now.
+            await self._ensure_orphan_registry_revoked(tombstone)
             async with get_session() as session:
                 current = await session.get(
                     KubernetesOrphanTombstone,
@@ -5822,6 +5987,47 @@ class DeploymentTeardownCoordinator:
                 )
                 if current.retry_lease_owner != self.worker_id:
                     raise DeploymentFailure("orphan lease changed before completion")
+                server = (
+                    (
+                        await session.execute(
+                            select(Server)
+                            .where(Server.name == current.cluster_context)
+                            .with_for_update(of=Server)
+                        )
+                    )
+                    .unique()
+                    .scalar_one_or_none()
+                )
+                if (
+                    server is None
+                    or server.kubernetes_node_uid != current.kubernetes_node_uid
+                    or server.kubernetes_node_generation
+                    != current.kubernetes_node_generation
+                    or cluster_context_sha256(server) != current.cluster_context_sha256
+                ):
+                    raise LineageConflict(
+                        "orphan cluster/node lineage changed before completion"
+                    )
+                config_id = current.immutable_labels.get("chutes/config-id")
+                if config_id and settings.gpu_tee_only:
+                    registry_intent = await session.get(
+                        RegistryScopeIntent,
+                        config_id,
+                        with_for_update=True,
+                    )
+                    if (
+                        self._terminal_orphan_registry_ack(
+                            registry_intent,
+                            launch_config_id=config_id,
+                            validator=server.validator,
+                            server_id=server.server_id,
+                            deployment_id=current.deployment_id,
+                        )
+                        is None
+                    ):
+                        raise DeploymentFailure(
+                            "orphan completion is awaiting registry revocation ACK"
+                        )
                 all_resources = list(
                     (
                         await session.execute(

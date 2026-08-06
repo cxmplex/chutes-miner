@@ -31,10 +31,10 @@ registry:
       cpu: 500m
       memory: 512Mi
   service:
-    type: ClusterIP
     port: 5000
     targetPort: 5000
-    # BE SURE THIS MATCHES registry_port IN ANSIBLE!
+    # Required NodePort contract: must match registry_port in Ansible and the
+    # REGISTRY_PROXY_PORT consumed by miner-produced image references.
     nodePort: 30500
   nodeSelector:
     chutes/seedless-control-plane: "true"

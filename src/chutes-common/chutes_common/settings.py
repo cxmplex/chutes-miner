@@ -7,7 +7,17 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-GPU_MINER_RUNTIME_PURPOSES = [
+GPU_MINER_RUNTIME_PURPOSES_V1 = [
+    "cache",
+    "gpu-infra",
+    "instances",
+    "launch",
+    "miner",
+    "nodes",
+    "registry",
+    "sockets",
+]
+GPU_MINER_RUNTIME_PURPOSES_V2 = [
     "cache",
     "gpu-decommission",
     "gpu-infra",
@@ -18,6 +28,17 @@ GPU_MINER_RUNTIME_PURPOSES = [
     "registry",
     "sockets",
 ]
+GPU_MINER_RUNTIME_PURPOSES = GPU_MINER_RUNTIME_PURPOSES_V2
+
+
+def gpu_runtime_session_purposes(version: int) -> list[str]:
+    if type(version) is not int:
+        raise ValueError("seedless GPU runtime session version is invalid")
+    if version == 1:
+        return list(GPU_MINER_RUNTIME_PURPOSES_V1)
+    if version == 2:
+        return list(GPU_MINER_RUNTIME_PURPOSES_V2)
+    raise ValueError("seedless GPU runtime session version is unsupported")
 
 GPU_REGISTRATION_V2_SCHEMA = "chutes.gpu-registration-response.v2"
 GPU_REGISTRATION_PUBLIC_IDENTITY_FIELDS = (
@@ -127,6 +148,10 @@ class MinerSettings(BaseSettings):
 
     def _validated_runtime_document(self) -> dict:
         document = self._runtime_document()
+        try:
+            expected_purposes = gpu_runtime_session_purposes(document.get("version"))
+        except (AttributeError, ValueError):
+            expected_purposes = None
         if (
             set(document)
             != {
@@ -142,13 +167,13 @@ class MinerSettings(BaseSettings):
                 "validator",
             }
             or document["schema"] != "chutes.gpu-miner-session"
-            or document["version"] != 1
             or document["owner_hotkey"] != self.miner_ss58
             or not isinstance(document["runtime_session"], str)
             or not document["runtime_session"]
             or not isinstance(document["runtime_session_expires_at"], str)
             or not document["runtime_session_expires_at"]
-            or document["allowed_purposes"] != GPU_MINER_RUNTIME_PURPOSES
+            or expected_purposes is None
+            or document["allowed_purposes"] != expected_purposes
             or not isinstance(document["gpu_uuids"], list)
             or not isinstance(document["gpu_identifiers"], list)
             or not document["gpu_uuids"]

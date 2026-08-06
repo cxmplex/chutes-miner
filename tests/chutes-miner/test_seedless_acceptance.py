@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 import yaml
-from chutes_common.settings import GPU_MINER_RUNTIME_PURPOSES
+from chutes_common.settings import (
+    GPU_MINER_RUNTIME_PURPOSES_V1,
+    GPU_MINER_RUNTIME_PURPOSES_V2,
+)
 from cross_repo_tests import repository_root
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,12 +48,20 @@ def test_legacy_cutover_fence_contract_is_byte_exact_across_guest_and_miner():
 
 
 def test_runtime_purposes_use_the_cross_repo_contract():
-    fixture = (
-        repository_root("api", start=Path(__file__)) / "tests/fixtures/gpu_runtime_purposes_v1.json"
+    api_root = repository_root("api", start=Path(__file__))
+    version_one = json.loads(
+        (api_root / "tests/fixtures/gpu_runtime_purposes_v1.json").read_text(
+            encoding="ascii"
+        )
     )
-    document = json.loads(fixture.read_text(encoding="ascii"))
-    assert document["miner"] == GPU_MINER_RUNTIME_PURPOSES
-    assert document["platform"] == ["registry"]
+    version_two = json.loads(
+        (api_root / "tests/fixtures/gpu_runtime_purposes_v2.json").read_text(
+            encoding="ascii"
+        )
+    )
+    assert version_one["miner"] == GPU_MINER_RUNTIME_PURPOSES_V1
+    assert version_two["miner"] == GPU_MINER_RUNTIME_PURPOSES_V2
+    assert version_one["platform"] == version_two["platform"] == ["registry"]
 
 
 def test_fresh_and_migrated_gepetto_cannot_mount_stale_source_configmap():
