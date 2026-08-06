@@ -2740,6 +2740,7 @@ class DeploymentTeardownCoordinator:
             raise DeploymentFailure("registry scope validator is unavailable")
         headers, _ = sign_request(purpose="registry")
         headers["X-Chutes-Server-Id"] = operation.server_id
+        headers["X-Chutes-Registry-Workload-Token"] = settings.registry_workload_token
         service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
         async with aiohttp.ClientSession(
             raise_for_status=False,

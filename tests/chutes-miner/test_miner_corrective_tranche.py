@@ -378,6 +378,144 @@ async def test_private_lan_bearer_without_workload_token_cannot_mutate_broker(
 
 
 @pytest.mark.asyncio
+async def test_teardown_registry_revoke_sends_exact_workload_token(monkeypatch):
+    captured: dict[str, object] = {}
+    operation = SimpleNamespace(
+        config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="deployment-1",
+    )
+    result = {
+        "status": "revoked",
+        "revoked": True,
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+    }
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return result
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def delete(self, url, *, headers):
+            captured["url"] = url
+            captured["headers"] = dict(headers)
+            return Response()
+
+    request_revocation = AsyncMock()
+    record_revoked = AsyncMock(return_value=result)
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation",
+        request_revocation,
+    )
+    monkeypatch.setattr(teardown, "record_registry_scope_revoked", record_revoked)
+    monkeypatch.setattr(
+        teardown,
+        "settings",
+        SimpleNamespace(
+            namespace="chutes",
+            gpu_tee_only=True,
+            registry_workload_token="w" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        teardown,
+        "validator_by_hotkey",
+        lambda _hotkey: SimpleNamespace(hotkey="VALIDATOR"),
+    )
+    monkeypatch.setattr(
+        teardown,
+        "sign_request",
+        lambda **_kwargs: ({"X-Chutes-Attested-Session": "session"}, None),
+    )
+    monkeypatch.setattr(teardown.aiohttp, "ClientSession", Client)
+
+    coordinator = DeploymentTeardownCoordinator(kubernetes=SimpleNamespace())
+    assert await coordinator._revoke_registry(operation) == result
+    assert captured["url"] == (
+        "http://registry-validator.chutes.svc.cluster.local:5000/"
+        "registry/scopes/config-1"
+    )
+    assert captured["headers"] == {
+        "X-Chutes-Attested-Session": "session",
+        "X-Chutes-Server-Id": "server-1",
+        "X-Chutes-Registry-Workload-Token": "w" * 64,
+    }
+    request_revocation.assert_awaited_once_with(
+        launch_config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="deployment-1",
+    )
+    record_revoked.assert_awaited_once_with("config-1", result)
+
+
+@pytest.mark.asyncio
+async def test_teardown_registry_revoke_missing_workload_token_fails_before_http(
+    monkeypatch,
+):
+    operation = SimpleNamespace(
+        config_id="config-1",
+        validator="validator-1",
+        server_id="server-1",
+        deployment_id="deployment-1",
+    )
+
+    class MissingTokenSettings:
+        namespace = "chutes"
+        gpu_tee_only = True
+
+        @property
+        def registry_workload_token(self):
+            raise SeedlessGPUConfigurationError(
+                "registry workload authentication token is unavailable"
+            )
+
+    client = AsyncMock()
+    monkeypatch.setattr(
+        teardown,
+        "request_registry_scope_revocation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(teardown, "settings", MissingTokenSettings())
+    monkeypatch.setattr(
+        teardown,
+        "validator_by_hotkey",
+        lambda _hotkey: SimpleNamespace(hotkey="VALIDATOR"),
+    )
+    monkeypatch.setattr(
+        teardown,
+        "sign_request",
+        lambda **_kwargs: ({"X-Chutes-Attested-Session": "session"}, None),
+    )
+    monkeypatch.setattr(teardown.aiohttp, "ClientSession", client)
+
+    coordinator = DeploymentTeardownCoordinator(kubernetes=SimpleNamespace())
+    with pytest.raises(SeedlessGPUConfigurationError, match="unavailable"):
+        await coordinator._revoke_registry(operation)
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_registry_scope_reconcile_reuses_authority_and_recovers_empty_cache(
     monkeypatch, tmp_path
 ):
