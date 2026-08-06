@@ -22,7 +22,7 @@ from chutes_common.schemas.chute import Chute
 from chutes_common.schemas.deployment import Deployment
 from chutes_common.schemas.gpu import GPU
 from chutes_common.schemas.server import Server
-from chutes_common.schemas.teardown import MinerLaunchIntent
+from chutes_common.schemas.teardown import MinerLaunchIntent, RegistryScopeIntent
 from chutes_common.settings import Validator
 from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.database import engine, get_session
@@ -44,7 +44,6 @@ from chutes_miner.api.k8s.util import (
 from chutes_miner.api.registry_scopes import (
     ensure_registry_scope_registration_in_session,
     record_registry_scope_failure,
-    record_registry_scope_registered,
     record_registry_scope_registered_in_session,
     record_registry_scope_revoked,
     registry_scope_work_items,
@@ -64,6 +63,7 @@ from sqlalchemy import case, func, select, text, update
 # (rather than always the single most-utilized one) to spread load and avoid repeatedly
 # scheduling onto a server that has an issue the disk check doesn't catch.
 SCALE_UP_CANDIDATE_POOL = 2
+REGISTRY_SCOPE_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 def _canonical_sha256(document: Any) -> str:
@@ -480,7 +480,10 @@ class Gepetto:
         headers, serialized = sign_request(payload=body, purpose="registry")
         headers["X-Chutes-Registry-Workload-Token"] = settings.registry_workload_token
         service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            raise_for_status=False,
+            timeout=REGISTRY_SCOPE_HTTP_TIMEOUT,
+        ) as session:
             async with session.post(
                 f"http://{service}/registry/scopes",
                 data=serialized,
@@ -948,7 +951,27 @@ class Gepetto:
         await request_registry_scope_revocation(
             launch_config_id=launch_config_id,
             validator=validator_hotkey,
+            server_id=server_id,
         )
+        result = await self._send_registry_scope_revocation(
+            validator_hotkey,
+            launch_config_id,
+            server_id,
+        )
+        await record_registry_scope_revoked(launch_config_id, result)
+
+    async def _send_registry_scope_revocation(
+        self,
+        validator_hotkey: str,
+        launch_config_id: str,
+        server_id: str,
+    ) -> dict[str, Any]:
+        """Send the exact broker DELETE without changing database authority."""
+
+        if not settings.gpu_tee_only:
+            raise DeploymentFailure("Registry scope revocation is unavailable.")
+        if not isinstance(server_id, str) or not server_id:
+            raise DeploymentFailure("Registry scope server identity is unavailable.")
         validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
             raise DeploymentFailure("Registry scope validator is unavailable.")
@@ -956,7 +979,10 @@ class Gepetto:
         headers["X-Chutes-Server-Id"] = server_id
         headers["X-Chutes-Registry-Workload-Token"] = settings.registry_workload_token
         service = f"registry-{validator.hotkey.lower()}.{settings.namespace}.svc.cluster.local:5000"
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            raise_for_status=False,
+            timeout=REGISTRY_SCOPE_HTTP_TIMEOUT,
+        ) as session:
             async with session.delete(
                 f"http://{service}/registry/scopes/{launch_config_id}",
                 headers=headers,
@@ -978,7 +1004,7 @@ class Gepetto:
                     raise DeploymentFailure(
                         "Registry broker did not revoke exact launch lifecycle."
                     )
-        await record_registry_scope_revoked(launch_config_id, result)
+        return result
 
     async def _fetch_launch_config(
         self,
@@ -2730,20 +2756,95 @@ class Gepetto:
                 item.validator, item.launch_config_id, item.server_id
             )
             return
-        body = {
-            "schema": "chutes.miner-registry-scope",
-            "version": 1,
-            "server_id": item.server_id,
-            "launch_config_id": item.launch_config_id,
-            "repository": item.repository,
-            "manifest_digest": item.manifest_digest,
-        }
-        if not all(body[key] for key in ("server_id", "repository", "manifest_digest")):
-            raise DeploymentFailure(
-                "active registry scope lacks exact reconstruction identity"
+        compensate = False
+        async with get_session() as session:
+            current = await session.get(
+                RegistryScopeIntent,
+                item.launch_config_id,
+                with_for_update=True,
             )
-        ack = await self._send_registry_scope_registration(validator, body)
-        await record_registry_scope_registered(item.launch_config_id, ack)
+            if current is None:
+                raise DeploymentFailure(
+                    "registry scope reconstruction authority disappeared"
+                )
+            if current.desired_state != "active":
+                # Teardown committed first. It owns the external DELETE, and this
+                # stale active snapshot must never issue a POST.
+                compensate = True
+            else:
+                expected = {
+                    "validator": item.validator,
+                    "server_id": item.server_id,
+                    "repository": item.repository,
+                    "manifest_digest": item.manifest_digest,
+                }
+                if (
+                    current.phase not in {"register_pending", "active"}
+                    or any(
+                        getattr(current, key) != value
+                        for key, value in expected.items()
+                    )
+                    or not all(
+                        expected[key]
+                        for key in ("server_id", "repository", "manifest_digest")
+                    )
+                ):
+                    raise DeploymentFailure(
+                        "active registry scope lacks exact reconstruction identity"
+                    )
+                body = {
+                    "schema": "chutes.miner-registry-scope",
+                    "version": 1,
+                    "server_id": current.server_id,
+                    "launch_config_id": current.launch_config_id,
+                    "repository": current.repository,
+                    "manifest_digest": current.manifest_digest,
+                }
+                registration_attempted = False
+                try:
+                    registration_attempted = True
+                    ack = await self._send_registry_scope_registration(validator, body)
+                    persisted = await record_registry_scope_registered_in_session(
+                        session,
+                        current.launch_config_id,
+                        ack,
+                        launch_intent_id=current.launch_intent_id,
+                    )
+                    if (
+                        persisted.desired_state != "active"
+                        or persisted.phase != "active"
+                    ):
+                        raise DeploymentFailure(
+                            "registry scope revocation raced locked reconstruction"
+                        )
+                    await session.commit()
+                except BaseException:
+                    if registration_attempted:
+                        # POST completion is ambiguous after timeout/cancellation.
+                        # The broker serializes this DELETE behind any in-flight
+                        # POST, so do not release the row lock with uncertain live
+                        # authority. The durable row remains active and can remint.
+                        try:
+                            await asyncio.shield(
+                                self._send_registry_scope_revocation(
+                                    item.validator,
+                                    item.launch_config_id,
+                                    item.server_id,
+                                )
+                            )
+                        except BaseException as cleanup_exc:
+                            logger.error(
+                                "Could not compensate ambiguous registry scope POST {}: {}",
+                                item.launch_config_id,
+                                cleanup_exc,
+                            )
+                    raise
+        if compensate:
+            await self._revoke_registry_scope(
+                item.validator,
+                item.launch_config_id,
+                item.server_id,
+            )
 
     async def reconcile(self):
         """

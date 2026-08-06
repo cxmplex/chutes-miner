@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,7 +49,7 @@ def test_corrupt_scope_cache_is_quarantined_for_database_reconstruction(
 
 
 @pytest.mark.asyncio
-async def test_validator_outage_does_not_remove_local_scope_before_ack(
+async def test_validator_outage_keeps_local_scope_fail_closed_before_remote_ack(
     monkeypatch,
     tmp_path,
 ):
@@ -109,7 +111,9 @@ async def test_validator_outage_does_not_remove_local_scope_before_ack(
     registry_broker._scopes.clear()
     registry_broker._scopes["config-1"] = {
         "launch_config_id": "config-1",
+        "server_id": "server-1",
         "token": "scope-token",
+        "expires_at_value": datetime.now(timezone.utc) + timedelta(hours=1),
     }
     registry_broker._scopes_loaded = True
 
@@ -118,10 +122,12 @@ async def test_validator_outage_does_not_remove_local_scope_before_ack(
             "config-1",
             _request(),
             attested_session="attested-session",
+            expected_server_id="server-1",
             workload_token="w" * 64,
         )
 
-    assert registry_broker._scopes["config-1"]["token"] == "scope-token"
+    assert "config-1" not in registry_broker._scopes
+    assert json.loads(path.read_text(encoding="ascii"))["scopes"] == {}
 
 
 @pytest.mark.asyncio
@@ -186,7 +192,11 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
     )
     monkeypatch.setattr(registry_broker.aiohttp, "ClientSession", Client)
     registry_broker._scopes.clear()
-    registry_broker._scopes["config-1"] = {"launch_config_id": "config-1"}
+    registry_broker._scopes["config-1"] = {
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+        "expires_at_value": datetime.now(timezone.utc) + timedelta(hours=1),
+    }
     registry_broker._scopes_loaded = True
 
     result = await registry_broker.revoke_registry_scope(
@@ -203,4 +213,97 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
         "server_id": "server-1",
     }
     assert "config-1" not in registry_broker._scopes
+    assert json.loads(path.read_text(encoding="ascii"))["scopes"] == {}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_local_fence_cannot_restore_cached_scope(
+    monkeypatch,
+    tmp_path,
+):
+    path = tmp_path / "scopes.json"
+    cert = tmp_path / "server.crt"
+    cert.write_text("certificate", encoding="ascii")
+    monkeypatch.setattr(
+        registry_broker,
+        "settings",
+        SimpleNamespace(
+            gpu_tee_only=True,
+            attested_session="attested-session",
+            validators=[SimpleNamespace(api="https://validator.example")],
+            attested_cert_file=str(cert),
+            attested_key_file=str(tmp_path / "server.key"),
+            registry_scopes_file=str(path),
+            registry_workload_token="w" * 64,
+        ),
+    )
+
+    class Context:
+        def load_cert_chain(self, _cert, _key):
+            return None
+
+    outbound_started = asyncio.Event()
+
+    class Response:
+        async def __aenter__(self):
+            outbound_started.set()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def delete(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(registry_broker.ssl, "create_default_context", Context)
+    monkeypatch.setattr(
+        registry_broker.aiohttp,
+        "TCPConnector",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(registry_broker.aiohttp, "ClientSession", Client)
+    original_persist = registry_broker._persist_scopes
+    persisted: list[dict] = []
+
+    def capture_persist():
+        original_persist()
+        persisted.append(json.loads(path.read_text(encoding="ascii")))
+
+    monkeypatch.setattr(registry_broker, "_persist_scopes", capture_persist)
+    registry_broker._scopes.clear()
+    registry_broker._scopes["config-1"] = {
+        "launch_config_id": "config-1",
+        "server_id": "server-1",
+        "token": "scope-token",
+        "expires_at_value": datetime.now(timezone.utc) + timedelta(hours=1),
+    }
+    registry_broker._scopes_loaded = True
+
+    revocation = asyncio.create_task(
+        registry_broker.revoke_registry_scope(
+            "config-1",
+            _request(),
+            attested_session="attested-session",
+            expected_server_id="server-1",
+            workload_token="w" * 64,
+        )
+    )
+    await outbound_started.wait()
+
+    assert persisted[0]["scopes"]["config-1"]["revoked"] is True
+    assert persisted[1]["scopes"] == {}
+    assert "config-1" not in registry_broker._scopes
+    revocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await revocation
     assert json.loads(path.read_text(encoding="ascii"))["scopes"] == {}

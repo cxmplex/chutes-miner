@@ -31,6 +31,7 @@ _scopes: dict[str, dict] = {}
 _scope_lock = asyncio.Lock()
 _scopes_loaded = False
 _SCOPE_REFRESH_MARGIN = timedelta(minutes=5)
+_VALIDATOR_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 def _persist_scopes() -> None:
@@ -415,6 +416,7 @@ async def _mint_registry_scope(
     try:
         async with aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(ssl=context),
+            timeout=_VALIDATOR_HTTP_TIMEOUT,
         ) as client:
             async with client.post(
                 f"{validator.api.rstrip('/')}/registry/sessions",
@@ -606,11 +608,38 @@ async def revoke_registry_scope(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Registry scope revocation requires current attested identity.",
         )
+    if not expected_server_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registry scope revocation requires exact server identity.",
+        )
+    # Fence local pull authority durably before the outbound validator call. A
+    # timeout, cancellation, or process crash after this point must never leave
+    # the cached registry token usable. Persisting a tombstone first closes the
+    # process-crash window before compacting the cache to its final empty form.
+    async with _scope_lock:
+        _load_scopes()
+        now = datetime.now(timezone.utc)
+        changed = _garbage_collect_scopes(now)
+        existing = _scopes.get(launch_config_id)
+        if existing is not None:
+            if existing.get("server_id") != expected_server_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Registry scope revocation server identity changed.",
+                )
+            _scopes[launch_config_id] = {**existing, "revoked": True}
+            _persist_scopes()
+            _scopes.pop(launch_config_id, None)
+            _persist_scopes()
+        elif changed:
+            _persist_scopes()
     validator = settings.validators[0]
     context = ssl.create_default_context()
     context.load_cert_chain(settings.attested_cert_file, settings.attested_key_file)
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(ssl=context),
+        timeout=_VALIDATOR_HTTP_TIMEOUT,
     ) as client:
         async with client.delete(
             f"{validator.api.rstrip('/')}/registry/sessions/{launch_config_id}",
@@ -625,8 +654,7 @@ async def revoke_registry_scope(
                 "server_id": expected_server_id,
             }
             if (
-                not expected_server_id
-                or expected["status"] not in {"revoked", "already_absent"}
+                expected["status"] not in {"revoked", "already_absent"}
                 or response.status != 200
                 or result != expected
             ):
@@ -634,11 +662,6 @@ async def revoke_registry_scope(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Validator rejected exact registry scope revocation.",
                 )
-    async with _scope_lock:
-        _load_scopes()
-        _scopes.pop(launch_config_id, None)
-        _garbage_collect_scopes(datetime.now(timezone.utc))
-        _persist_scopes()
     return result
 
 
