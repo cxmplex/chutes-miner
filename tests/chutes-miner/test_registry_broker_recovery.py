@@ -61,6 +61,7 @@ async def test_validator_outage_does_not_remove_local_scope_before_ack(
         attested_cert_file=str(cert),
         attested_key_file=str(tmp_path / "server.key"),
         registry_scopes_file=str(path),
+        registry_workload_token="w" * 64,
     )
     monkeypatch.setattr(registry_broker, "settings", settings)
 
@@ -117,6 +118,7 @@ async def test_validator_outage_does_not_remove_local_scope_before_ack(
             "config-1",
             _request(),
             attested_session="attested-session",
+            workload_token="w" * 64,
         )
 
     assert registry_broker._scopes["config-1"]["token"] == "scope-token"
@@ -140,6 +142,7 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
             attested_cert_file=str(cert),
             attested_key_file=str(tmp_path / "server.key"),
             registry_scopes_file=str(path),
+            registry_workload_token="w" * 64,
         ),
     )
 
@@ -178,7 +181,9 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
             return Response()
 
     monkeypatch.setattr(registry_broker.ssl, "create_default_context", Context)
-    monkeypatch.setattr(registry_broker.aiohttp, "TCPConnector", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        registry_broker.aiohttp, "TCPConnector", lambda **_kwargs: object()
+    )
     monkeypatch.setattr(registry_broker.aiohttp, "ClientSession", Client)
     registry_broker._scopes.clear()
     registry_broker._scopes["config-1"] = {"launch_config_id": "config-1"}
@@ -189,6 +194,7 @@ async def test_exact_validator_ack_removes_and_persists_local_scope(
         _request(),
         attested_session="attested-session",
         expected_server_id="server-1",
+        workload_token="w" * 64,
     )
     assert result == {
         "status": "already_absent",

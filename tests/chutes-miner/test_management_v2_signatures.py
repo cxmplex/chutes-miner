@@ -54,6 +54,14 @@ _EXPECTED_STATE_CHANGING_ROUTES = frozenset(
         ("DELETE", "/servers/{id_or_name}/deployments"),
         ("DELETE", "/deployments/purge"),
         ("DELETE", "/deployments/{deployment_id}"),
+        (
+            "POST",
+            "/deployments/teardown-conflicts/{operation_kind}/{operation_id}/requeue",
+        ),
+        (
+            "POST",
+            "/deployments/teardown-conflicts/{operation_kind}/{operation_id}/resolve",
+        ),
         ("GET", "/servers/{id_or_name}/lock"),
         ("GET", "/servers/{id_or_name}/unlock"),
     }
@@ -141,9 +149,7 @@ def _v1_headers(keypair, purpose="management", body=b""):
 
 def _v2_headers(keypair, nonce, *, method="DELETE", target="/servers/node-a", body=b""):
     body_sha256 = hashlib.sha256(body).hexdigest() if body else ""
-    message = (
-        f"v2:{keypair.ss58_address}:{keypair.ss58_address}:{method}:{target}:{nonce}:{body_sha256}"
-    )
+    message = f"v2:{keypair.ss58_address}:{keypair.ss58_address}:{method}:{target}:{nonce}:{body_sha256}"
     return {
         MINER_HEADER: keypair.ss58_address,
         VALIDATOR_HEADER: keypair.ss58_address,
@@ -203,14 +209,17 @@ def _unprotected_state_changing_routes(application):
     return [
         (method, path)
         for method, path, route in _runtime_state_changing_routes(application)
-        if destructive_management_authorization not in set(_dependency_calls(route.dependant))
+        if destructive_management_authorization
+        not in set(_dependency_calls(route.dependant))
     ]
 
 
 def test_assembled_app_state_changing_route_inventory_is_complete_and_protected():
     routes = _runtime_state_changing_routes(assembled_miner_app)
 
-    assert {(method, path) for method, path, _ in routes} == set(_EXPECTED_STATE_CHANGING_ROUTES)
+    assert {(method, path) for method, path, _ in routes} == set(
+        _EXPECTED_STATE_CHANGING_ROUTES
+    )
     assert _unprotected_state_changing_routes(assembled_miner_app) == []
 
 
@@ -294,7 +303,9 @@ def test_chart_renders_explicit_management_v2_cutover(value):
     result = _render_management_v2_setting(value)
     assert result.returncode == 0, result.stderr
     documents = [
-        document for document in yaml.safe_load_all(result.stdout) if isinstance(document, dict)
+        document
+        for document in yaml.safe_load_all(result.stdout)
+        if isinstance(document, dict)
     ]
     deployment = next(
         document
@@ -734,7 +745,9 @@ def test_settings_ignores_implicit_management_v2_environment_alias(monkeypatch):
     assert Settings().require_v2_management_signatures is True
 
 
-def test_explicit_management_v2_environment_wins_over_invalid_implicit_alias(monkeypatch):
+def test_explicit_management_v2_environment_wins_over_invalid_implicit_alias(
+    monkeypatch,
+):
     monkeypatch.setenv("CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES", "true")
     monkeypatch.setenv("REQUIRE_V2_MANAGEMENT_SIGNATURES", "off")
 

@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings
 
 GPU_MINER_RUNTIME_PURPOSES = [
     "cache",
+    "gpu-decommission",
     "gpu-infra",
     "instances",
     "launch",
@@ -19,7 +20,7 @@ GPU_MINER_RUNTIME_PURPOSES = [
 ]
 
 GPU_REGISTRATION_V2_SCHEMA = "chutes.gpu-registration-response.v2"
-GPU_REGISTRATION_IDENTITY_FIELDS = (
+GPU_REGISTRATION_PUBLIC_IDENTITY_FIELDS = (
     "server_id",
     "owner_hotkey",
     "reservation_id",
@@ -36,11 +37,17 @@ GPU_REGISTRATION_IDENTITY_FIELDS = (
     "trust_set_fingerprint",
     "attestation_id",
     "verified_at",
-    "runtime_session",
-    "runtime_session_expires_at",
     "status",
 )
-_GPU_REGISTRATION_STRING_FIELDS = frozenset(GPU_REGISTRATION_IDENTITY_FIELDS) - {
+GPU_RUNTIME_SESSION_IDENTITY_FIELDS = (
+    "runtime_session",
+    "runtime_session_expires_at",
+)
+GPU_REGISTRATION_IDENTITY_FIELDS = (
+    *GPU_REGISTRATION_PUBLIC_IDENTITY_FIELDS,
+    *GPU_RUNTIME_SESSION_IDENTITY_FIELDS,
+)
+_GPU_REGISTRATION_STRING_FIELDS = frozenset(GPU_REGISTRATION_PUBLIC_IDENTITY_FIELDS) - {
     "allocation_group_generation",
     "gpu_uuids",
     "gpu_identifiers",
@@ -64,11 +71,11 @@ class MinerSettings(BaseSettings):
     miner_ss58: str = os.environ["MINER_OWNER_SS58"]
     attested_session_file: str = os.getenv(
         "CHUTES_ATTESTED_SESSION_FILE",
-        "/run/chutes-gpu/miner-session.env",
+        "/run/chutes-gpu/credentials/runtime-session.env",
     )
     validators_file: str = os.getenv(
         "CHUTES_VALIDATORS_FILE",
-        "/run/chutes-gpu/miner-session.json",
+        "/run/chutes-gpu/credentials/runtime-session.json",
     )
     gpu_registration_file: str = os.getenv(
         "CHUTES_GPU_REGISTRATION_FILE",
@@ -89,6 +96,10 @@ class MinerSettings(BaseSettings):
     registry_scopes_file: str = os.getenv(
         "CHUTES_REGISTRY_SCOPES_FILE",
         "/var/lib/chutes-registry/scopes.json",
+    )
+    registry_workload_token_file: str = os.getenv(
+        "CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE",
+        "/var/run/secrets/chutes-registry-workload/token",
     )
     validators_json: Optional[str] = os.getenv("VALIDATORS")
     gpu_tee_only: bool = os.getenv("GPU_TEE_ONLY", "false").lower() == "true"
@@ -135,6 +146,8 @@ class MinerSettings(BaseSettings):
             or document["owner_hotkey"] != self.miner_ss58
             or not isinstance(document["runtime_session"], str)
             or not document["runtime_session"]
+            or not isinstance(document["runtime_session_expires_at"], str)
+            or not document["runtime_session_expires_at"]
             or document["allowed_purposes"] != GPU_MINER_RUNTIME_PURPOSES
             or not isinstance(document["gpu_uuids"], list)
             or not isinstance(document["gpu_identifiers"], list)
@@ -163,7 +176,9 @@ class MinerSettings(BaseSettings):
         if self.gpu_tee_only:
             return str(self._validated_runtime_document()["runtime_session"])
         values = {}
-        for line in Path(self.attested_session_file).read_text(encoding="ascii").splitlines():
+        for line in (
+            Path(self.attested_session_file).read_text(encoding="ascii").splitlines()
+        ):
             key, separator, value = line.partition("=")
             if separator:
                 values[key] = value
@@ -173,9 +188,28 @@ class MinerSettings(BaseSettings):
         return token
 
     @property
+    def registry_workload_token(self) -> str:
+        """Read the pod-scoped broker mutation credential from its exact mount."""
+
+        path = Path(self.registry_workload_token_file)
+        try:
+            token = path.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, PermissionError, UnicodeError) as exc:
+            raise SeedlessGPUConfigurationError(
+                "registry workload authentication token is unavailable"
+            ) from exc
+        if len(token) != 64 or not token.isalnum():
+            raise SeedlessGPUConfigurationError(
+                "registry workload authentication token is invalid"
+            )
+        return token
+
+    @property
     def seedless_gpu_identity(self) -> dict:
         if not self.gpu_tee_only:
-            raise ValueError("seedless GPU identity is unavailable outside GPU TEE mode")
+            raise ValueError(
+                "seedless GPU identity is unavailable outside GPU TEE mode"
+            )
         runtime = self._validated_runtime_document()
         registration = self._canonical_document(
             Path(self.gpu_registration_file),
@@ -189,6 +223,9 @@ class MinerSettings(BaseSettings):
             or registration.get("management_mode") != "miner"
             or registration.get("status") != "registered"
             or any(
+                field in registration for field in GPU_RUNTIME_SESSION_IDENTITY_FIELDS
+            )
+            or any(
                 not isinstance(registration.get(field), str) or not registration[field]
                 for field in _GPU_REGISTRATION_STRING_FIELDS
             )
@@ -196,34 +233,44 @@ class MinerSettings(BaseSettings):
             or registration["allocation_group_generation"] < 1
             or not isinstance(registration.get("gpu_uuids"), list)
             or not registration["gpu_uuids"]
-            or any(not isinstance(value, str) or not value for value in registration["gpu_uuids"])
+            or any(
+                not isinstance(value, str) or not value
+                for value in registration["gpu_uuids"]
+            )
             or not isinstance(registration.get("gpu_identifiers"), list)
             or not registration["gpu_identifiers"]
             or any(
-                not isinstance(value, str) or not value for value in registration["gpu_identifiers"]
+                not isinstance(value, str) or not value
+                for value in registration["gpu_identifiers"]
             )
             or len(registration["gpu_uuids"]) != len(registration["gpu_identifiers"])
         ):
             raise ValueError("seedless GPU Registration V2 document is invalid")
-        identity = {field: registration[field] for field in GPU_REGISTRATION_IDENTITY_FIELDS}
+        identity = {
+            field: registration[field]
+            for field in GPU_REGISTRATION_PUBLIC_IDENTITY_FIELDS
+        }
         if (
             registration["server_id"] != runtime["server_id"]
             or registration["owner_hotkey"] != runtime["owner_hotkey"]
             or registration["gpu_uuids"] != runtime["gpu_uuids"]
             or registration["gpu_identifiers"] != runtime["gpu_identifiers"]
-            or registration["runtime_session"] != runtime["runtime_session"]
-            or registration["runtime_session_expires_at"] != runtime["runtime_session_expires_at"]
         ):
-            raise ValueError("seedless GPU registration and runtime identities do not match")
+            raise ValueError(
+                "seedless GPU registration and runtime identities do not match"
+            )
         return {
             **identity,
+            **{field: runtime[field] for field in GPU_RUNTIME_SESSION_IDENTITY_FIELDS},
             "validator": runtime["validator"],
         }
 
     @property
     def miner_hourly_cost(self) -> float:
         if not self.gpu_tee_only:
-            raise ValueError("signed miner hourly cost is available only in GPU TEE mode")
+            raise ValueError(
+                "signed miner hourly cost is available only in GPU TEE mode"
+            )
         values: dict[str, str] = {}
         verified_env_path = Path(self.gpu_verified_env_file)
         try:

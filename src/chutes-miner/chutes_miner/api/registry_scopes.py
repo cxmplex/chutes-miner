@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from chutes_common.schemas.teardown import MinerLaunchIntent, RegistryScopeIntent
@@ -14,6 +14,8 @@ from sqlalchemy import and_, or_, select
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_RETRY_BASE_SECONDS = 5
+_RETRY_MAX_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,12 @@ class RegistryScopeWorkItem:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _retry_at(attempt_count: int) -> datetime:
+    count = max(1, int(attempt_count or 1))
+    seconds = min(_RETRY_MAX_SECONDS, _RETRY_BASE_SECONDS * (2 ** min(count - 1, 20)))
+    return _utc_now() + timedelta(seconds=seconds)
 
 
 def _exact_registration(
@@ -93,7 +101,9 @@ async def ensure_registry_scope_registration_in_session(
         )
     }
     if observed != expected or row.desired_state != "active":
-        raise DeploymentFailure("registry scope authority conflicts with durable launch")
+        raise DeploymentFailure(
+            "registry scope authority conflicts with durable launch"
+        )
     return row
 
 
@@ -141,6 +151,7 @@ async def record_registry_scope_registered_in_session(
         # durable revocation outbox pending again.
         row.phase = "revoke_pending"
     row.last_failure = None
+    row.next_retry_at = None
     return row
 
 
@@ -197,6 +208,7 @@ async def request_registry_scope_revocation_in_session(
     if row.phase != "revoked":
         row.phase = "revoke_pending"
     row.last_failure = None
+    row.next_retry_at = None
     return row
 
 
@@ -241,7 +253,9 @@ async def record_registry_scope_revoked(
             or expected["status"] not in {"revoked", "already_absent"}
             or ack != expected
         ):
-            raise DeploymentFailure("registry broker returned a malformed revocation ACK")
+            raise DeploymentFailure(
+                "registry broker returned a malformed revocation ACK"
+            )
         durable_ack = {
             "status": "revoked",
             "revoked": True,
@@ -254,6 +268,7 @@ async def record_registry_scope_revoked(
         row.revoked_at = row.revoked_at or _utc_now()
         row.phase = "revoked"
         row.last_failure = None
+        row.next_retry_at = None
         await session.commit()
         return durable_ack
 
@@ -269,7 +284,9 @@ async def record_registry_scope_failure(
             with_for_update=True,
         )
         if row is not None and row.phase != "revoked":
+            row.attempt_count += 1
             row.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
+            row.next_retry_at = _retry_at(row.attempt_count)
             await session.commit()
 
 
@@ -282,6 +299,7 @@ async def registry_scope_work_items(
     if reconstruct_active:
         active_phases.add("active")
     async with get_session() as session:
+        now = _utc_now()
         rows = (
             await session.execute(
                 select(RegistryScopeIntent)
@@ -295,9 +313,15 @@ async def registry_scope_work_items(
                             RegistryScopeIntent.desired_state == "revoked",
                             RegistryScopeIntent.phase != "revoked",
                         ),
-                    )
+                    ),
+                    (
+                        RegistryScopeIntent.next_retry_at.is_(None)
+                        | (RegistryScopeIntent.next_retry_at <= now)
+                    ),
                 )
-                .order_by(RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id)
+                .order_by(
+                    RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id
+                )
             )
         ).scalars()
         return [

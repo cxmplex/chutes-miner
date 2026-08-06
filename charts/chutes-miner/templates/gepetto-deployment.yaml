@@ -23,6 +23,11 @@ spec:
         {{- include "gepetto.labels" . | nindent 8 }}
     spec:
       serviceAccountName: chutes
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        supplementalGroups:
+          - 2000
       {{- with .Values.gepetto.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -54,8 +59,6 @@ spec:
                 secretKeyRef:
                   name: miner-credentials
                   key: owner
-            - name: CHUTES_ATTESTED_SESSION_FILE
-              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -74,6 +77,12 @@ spec:
               value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
             - name: CHUTES_GPU_REGISTRATION_FILE
               value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: CHUTES_ATTESTED_CERT_FILE
+              value: {{ required "seedlessStack.attestedCertPath is required" .Values.seedlessStack.attestedCertPath | quote }}
+            - name: CHUTES_ATTESTED_KEY_FILE
+              value: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath | quote }}
+            - name: CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE
+              value: /var/run/secrets/chutes-registry-workload/token
             - name: GPU_TEE_ONLY
               value: "true"
             - name: REGISTRY_PROXY_PORT
@@ -94,11 +103,42 @@ spec:
           resources:
             {{- toYaml .Values.gepetto.resources | nindent 12 }}
           volumeMounts:
-            - name: chutes-gpu-runtime
-              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+            - name: chutes-gpu-session-json
+              mountPath: {{ .Values.seedlessStack.sessionJsonPath }}
+              readOnly: true
+            - name: chutes-gpu-registration
+              mountPath: {{ .Values.seedlessStack.registrationPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-cert
+              mountPath: {{ required "seedlessStack.attestedCertPath is required" .Values.seedlessStack.attestedCertPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-key
+              mountPath: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath }}
+              readOnly: true
+            - name: registry-workload-auth
+              mountPath: /var/run/secrets/chutes-registry-workload
               readOnly: true
       volumes:
-        - name: chutes-gpu-runtime
+        - name: chutes-gpu-session-json
           hostPath:
-            path: {{ .Values.seedlessStack.runtimeHostPath }}
-            type: Directory
+            path: {{ .Values.seedlessStack.sessionJsonPath }}
+            type: File
+        - name: chutes-gpu-registration
+          hostPath:
+            path: {{ .Values.seedlessStack.registrationPath }}
+            type: File
+        - name: chutes-gpu-attested-cert
+          hostPath:
+            path: {{ required "seedlessStack.attestedCertHostPath is required" .Values.seedlessStack.attestedCertHostPath }}
+            type: File
+        - name: chutes-gpu-attested-key
+          hostPath:
+            path: {{ required "seedlessStack.attestedKeyHostPath is required" .Values.seedlessStack.attestedKeyHostPath }}
+            type: File
+        - name: registry-workload-auth
+          secret:
+            secretName: {{ required "registryWorkloadAuth.existingSecret is required" .Values.registryWorkloadAuth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token

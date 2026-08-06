@@ -16,6 +16,9 @@ spec:
         {{- include "monitor.labels" . | nindent 8 }}
     spec:
       serviceAccountName: chutes
+      securityContext:
+        supplementalGroups:
+          - 2000
       {{- with .Values.monitor.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -46,9 +49,6 @@ spec:
               export MONITOR_API="http://${NODE_IP}:32001"
               EOF
           volumeMounts:
-            - name: chutes-gpu-runtime
-              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
-              readOnly: true
             - name: shared-data
               mountPath: /shared
       containers:
@@ -64,14 +64,18 @@ spec:
           volumeMounts:
             - name: shared-data
               mountPath: /shared
+            - name: chutes-gpu-session-json
+              mountPath: {{ .Values.seedlessStack.sessionJsonPath }}
+              readOnly: true
+            - name: chutes-gpu-registration
+              mountPath: {{ .Values.seedlessStack.registrationPath }}
+              readOnly: true
           env:
             - name: MINER_OWNER_SS58
               valueFrom:
                 secretKeyRef:
                   name: miner-credentials
                   key: owner
-            - name: CHUTES_ATTESTED_SESSION_FILE
-              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: CHUTES_VALIDATORS_FILE
               value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
             - name: CHUTES_GPU_REGISTRATION_FILE
@@ -103,10 +107,14 @@ spec:
           resources:
             {{- toYaml .Values.monitor.resources | nindent 12 }}
       volumes:
-        - name: chutes-gpu-runtime
+        - name: chutes-gpu-session-json
           hostPath:
-            path: {{ .Values.seedlessStack.runtimeHostPath }}
-            type: Directory
+            path: {{ .Values.seedlessStack.sessionJsonPath }}
+            type: File
+        - name: chutes-gpu-registration
+          hostPath:
+            path: {{ .Values.seedlessStack.registrationPath }}
+            type: File
         - name: shared-data
           emptyDir: {}
 {{- end }}

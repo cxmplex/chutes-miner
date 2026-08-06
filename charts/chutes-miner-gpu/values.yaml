@@ -1,10 +1,13 @@
 seedlessStack:
   image: ""
   runtimeHostPath: /run/chutes-gpu
-  sessionEnvPath: /run/chutes-gpu/miner-session.env
-  sessionJsonPath: /run/chutes-gpu/miner-session.json
+  sessionEnvPath: /run/chutes-gpu/credentials/runtime-session.env
+  sessionJsonPath: /run/chutes-gpu/credentials/runtime-session.json
   registrationPath: /run/chutes-gpu/registration.json
   attestedCertPath: /run/chutes-tls/server.crt
+  attestedKeyPath: /run/chutes-tls/server.key
+  attestedCertHostPath: /run/chutes-gpu/registry-tls/server.crt
+  attestedKeyHostPath: /run/chutes-gpu/registry-tls/server.key
 
 multiCluster: false
 
@@ -55,6 +58,10 @@ auth:
       cpu: 250m
       memory: 256Mi
   port: 8000
+
+registryWorkloadAuth:
+  # Must name the same pre-provisioned Secret used by the chutes-miner release.
+  existingSecret: registry-workload-auth
 
 agent:
   imagePullPolicy: IfNotPresent

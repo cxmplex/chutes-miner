@@ -33,6 +33,9 @@ spec:
         {{- include "minerApi.labels" . | nindent 8 }}
     spec:
       serviceAccountName: chutes
+      securityContext:
+        supplementalGroups:
+          - 2000
       {{- with .Values.minerApi.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -87,8 +90,6 @@ spec:
                 secretKeyRef:
                   name: miner-credentials
                   key: owner
-            - name: CHUTES_ATTESTED_SESSION_FILE
-              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -107,6 +108,12 @@ spec:
               value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
             - name: CHUTES_GPU_REGISTRATION_FILE
               value: {{ .Values.seedlessStack.registrationPath | quote }}
+            - name: CHUTES_GPU_VERIFIED_ENV_FILE
+              value: {{ .Values.seedlessStack.verifiedEnvPath | quote }}
+            - name: CHUTES_ATTESTED_CERT_FILE
+              value: {{ required "seedlessStack.attestedCertPath is required" .Values.seedlessStack.attestedCertPath | quote }}
+            - name: CHUTES_ATTESTED_KEY_FILE
+              value: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath | quote }}
             - name: GPU_TEE_ONLY
               value: "true"
             - name: CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES
@@ -126,8 +133,20 @@ spec:
               value: "/var/run/secrets/chutes-sa-token/ca.crt"
             {{- end }}
           volumeMounts:
-            - name: chutes-gpu-runtime
-              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+            - name: chutes-gpu-session-json
+              mountPath: {{ .Values.seedlessStack.sessionJsonPath }}
+              readOnly: true
+            - name: chutes-gpu-registration
+              mountPath: {{ .Values.seedlessStack.registrationPath }}
+              readOnly: true
+            - name: chutes-gpu-verified-env
+              mountPath: {{ .Values.seedlessStack.verifiedEnvPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-cert
+              mountPath: {{ required "seedlessStack.attestedCertPath is required" .Values.seedlessStack.attestedCertPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-key
+              mountPath: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath }}
               readOnly: true
           {{ if .Values.multiCluster }}
             - name: shared-data
@@ -164,10 +183,26 @@ spec:
           resources:
             {{- toYaml .Values.minerApi.resources | nindent 12 }}
       volumes:
-        - name: chutes-gpu-runtime
+        - name: chutes-gpu-session-json
           hostPath:
-            path: {{ .Values.seedlessStack.runtimeHostPath }}
-            type: Directory
+            path: {{ .Values.seedlessStack.sessionJsonPath }}
+            type: File
+        - name: chutes-gpu-registration
+          hostPath:
+            path: {{ .Values.seedlessStack.registrationPath }}
+            type: File
+        - name: chutes-gpu-verified-env
+          hostPath:
+            path: {{ .Values.seedlessStack.verifiedEnvPath }}
+            type: File
+        - name: chutes-gpu-attested-cert
+          hostPath:
+            path: {{ required "seedlessStack.attestedCertHostPath is required" .Values.seedlessStack.attestedCertHostPath }}
+            type: File
+        - name: chutes-gpu-attested-key
+          hostPath:
+            path: {{ required "seedlessStack.attestedKeyHostPath is required" .Values.seedlessStack.attestedKeyHostPath }}
+            type: File
       {{ if .Values.multiCluster }}
         - name: shared-data
           emptyDir: {}

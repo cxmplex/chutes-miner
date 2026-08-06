@@ -3,12 +3,23 @@ Miner API entrypoint.
 """
 
 import hashlib
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import ORJSONResponse
+from chutes_common.settings import miner_settings as settings
 from chutes_registry.api.registry.router import router as registry_router
 
 
-app = FastAPI(default_response_class=ORJSONResponse)
+@asynccontextmanager
+async def lifespan(_application: FastAPI):
+    if settings.gpu_tee_only:
+        # Fail startup when the narrow Gepetto workload channel is not mounted.
+        _ = settings.registry_workload_token
+    yield
+
+
+app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
 app.include_router(registry_router, prefix="/registry", tags=["Registry"])
 app.get("/ping")(lambda: {"message": "pong"})
 

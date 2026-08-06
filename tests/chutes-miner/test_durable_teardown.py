@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -62,7 +63,8 @@ def _resource(
             "batch/v1" if owner_kind == "Job" else "apps/v1" if owner_kind else None
         ),
         owner_kind=owner_kind,
-        owner_name=owner_name or (f"resource-{owner_kind.lower()}" if owner_kind else None),
+        owner_name=owner_name
+        or (f"resource-{owner_kind.lower()}" if owner_kind else None),
         owner_uid=owner_uid,
         node_name=node_name,
     )
@@ -501,7 +503,9 @@ async def test_orphan_replacement_adoption_is_one_durable_transition(monkeypatch
 @pytest.mark.asyncio
 async def test_controller_is_directly_absent_before_child_delete(monkeypatch):
     coordinator = teardown.DeploymentTeardownCoordinator(
-        kubernetes=SimpleNamespace(delete_resource=Mock(return_value="delete_requested"))
+        kubernetes=SimpleNamespace(
+            delete_resource=Mock(return_value="delete_requested")
+        )
     )
     job = SimpleNamespace(
         resource_id="job-row",
@@ -754,7 +758,11 @@ def test_matching_controller_replacement_is_captured_but_conflicting_lineage_sto
             replacement_matches(
                 expected_labels={
                     **EXPECTED_LABELS,
-                    **({"chutes/job-id": "job-1"} if conflict.uid == "wrong-job" else {}),
+                    **(
+                        {"chutes/job-id": "job-1"}
+                        if conflict.uid == "wrong-job"
+                        else {}
+                    ),
                 },
                 expected_node_name="node-a",
                 accepted_owners={},
@@ -871,7 +879,9 @@ def test_gpu_pod_evidence_requirement_uses_exact_launch_mutation_frontier():
     assert not teardown._requires_pod_termination_evidence(operation)
 
 
-def test_uid_precondition_conflict_advances_to_direct_replacement_verification(monkeypatch):
+def test_uid_precondition_conflict_advances_to_direct_replacement_verification(
+    monkeypatch,
+):
     class Core:
         @staticmethod
         def delete_namespaced_pod(**kwargs):
@@ -1232,7 +1242,9 @@ async def test_registry_outage_does_not_block_local_resource_deletion(monkeypatc
         instance_id=None,
     )
     coordinator = teardown.DeploymentTeardownCoordinator()
-    coordinator._revoke_registry = AsyncMock(side_effect=DeploymentFailure("validator unavailable"))
+    coordinator._revoke_registry = AsyncMock(
+        side_effect=DeploymentFailure("validator unavailable")
+    )
     coordinator._advance = AsyncMock()
     record_failure = AsyncMock()
     monkeypatch.setattr(teardown, "record_registry_scope_failure", record_failure)
@@ -1403,7 +1415,9 @@ async def test_kubernetes_orphan_without_cluster_lineage_is_not_deleted():
 
 
 @pytest.mark.asyncio
-async def test_parent_deletion_remains_pending_while_child_teardown_is_incomplete(monkeypatch):
+async def test_parent_deletion_remains_pending_while_child_teardown_is_incomplete(
+    monkeypatch,
+):
     operation = SimpleNamespace(
         operation_id="parent-1",
         phase="waiting_for_children",
@@ -1585,6 +1599,7 @@ async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatc
     assert operation.monitor_stop_ack is None
     assert operation.monitor_stopped_at is None
     assert "was not acknowledged" in operation.last_failure
+    operation.next_retry_at = None
     assert await coordinator.run_parent("parent-1") is True
     assert operation.monitor_stop_ack == {
         "status": "already_absent",
@@ -1598,7 +1613,7 @@ async def test_server_monitor_lost_response_replays_409_as_stable_ack(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_parent_allocation_hold_precedes_monitor_and_validator_calls(monkeypatch):
+async def test_parent_allocation_release_follows_terminal_validator_ack(monkeypatch):
     operation = SimpleNamespace(
         operation_id="parent-1",
         parent_type="server",
@@ -1609,6 +1624,18 @@ async def test_parent_allocation_hold_precedes_monitor_and_validator_calls(monke
         attempt_count=0,
         last_failure=None,
         validator="validator-1",
+        snapshot={
+            "agent_api": None,
+            "name": "node-a",
+            "node_uid": None,
+            "node_generation": None,
+            "allocation_group_id": None,
+            "allocation_group_generation": None,
+        },
+        monitor_stop_ack={"status": "already_stopped"},
+        monitor_stopped_at=datetime.now(timezone.utc),
+        validator_server_deletion_ack=None,
+        validator_server_deleted_at=None,
     )
     session = SimpleNamespace(
         get=AsyncMock(return_value=operation),
@@ -1621,8 +1648,6 @@ async def test_parent_allocation_hold_precedes_monitor_and_validator_calls(monke
         yield session
 
     monkeypatch.setattr(teardown, "get_session", fake_session)
-    stop = AsyncMock()
-    monkeypatch.setattr("chutes_miner.api.server.util.stop_server_monitoring", stop)
     coordinator = teardown.DeploymentTeardownCoordinator(
         kubernetes=DirectKubernetesClosure(operator=SimpleNamespace())
     )
@@ -1632,12 +1657,14 @@ async def test_parent_allocation_hold_precedes_monitor_and_validator_calls(monke
             "server parent deletion is held by allocation-group ownership"
         )
     )
-    coordinator._delete_validator_server = AsyncMock()
+    coordinator._delete_validator_server = AsyncMock(
+        return_value={"status": "already_absent", "server_id": "server-1"}
+    )
 
     assert await coordinator.run_parent("parent-1") is False
     assert "held by allocation-group ownership" in operation.last_failure
-    stop.assert_not_awaited()
-    coordinator._delete_validator_server.assert_not_awaited()
+    coordinator._delete_validator_server.assert_awaited_once()
+    coordinator._record_parent_allocation_release.assert_awaited_once_with("parent-1")
 
 
 def test_parent_allocation_release_evidence_rejects_any_owned_generation():
@@ -1793,7 +1820,9 @@ async def test_delayed_instance_event_rewinds_active_teardown_before_finalizatio
 
 
 @pytest.mark.asyncio
-async def test_instance_event_after_local_delete_creates_durable_exact_cleanup(monkeypatch):
+async def test_instance_event_after_local_delete_creates_durable_exact_cleanup(
+    monkeypatch,
+):
     operation = SimpleNamespace(
         operation_id="operation-1",
         phase="completed",
@@ -1834,7 +1863,9 @@ async def test_instance_event_after_local_delete_creates_durable_exact_cleanup(m
 
 
 @pytest.mark.asyncio
-async def test_delayed_instance_cleanup_retries_lost_response_with_same_identity(monkeypatch):
+async def test_delayed_instance_cleanup_retries_lost_response_with_same_identity(
+    monkeypatch,
+):
     cleanup = SimpleNamespace(
         cleanup_id="cleanup-1",
         phase="pending",
@@ -1866,6 +1897,7 @@ async def test_delayed_instance_cleanup_retries_lost_response_with_same_identity
     assert await coordinator.run_delayed_instance_cleanup("cleanup-1") is False
     assert cleanup.phase == "pending"
     assert cleanup.retry_lease_owner is None
+    cleanup.next_retry_at = None
     assert await coordinator.run_delayed_instance_cleanup("cleanup-1") is True
     assert cleanup.phase == "completed"
     assert cleanup.deletion_ack["instance_id"] == "instance-1"
@@ -1931,17 +1963,21 @@ async def test_startup_resumes_deployment_parent_and_orphan_operations(monkeypat
     coordinator.run.assert_awaited_once_with("deployment-operation")
     coordinator.run_parent.assert_awaited_once_with("parent-operation")
     coordinator.run_orphan.assert_awaited_once_with("orphan-tombstone")
-    coordinator.run_delayed_instance_cleanup.assert_awaited_once_with("delayed-instance-cleanup")
+    coordinator.run_delayed_instance_cleanup.assert_awaited_once_with(
+        "delayed-instance-cleanup"
+    )
     coordinator.request_and_run.assert_awaited_once_with(
         "stale-launch-deployment", "launch_rollback"
     )
 
 
 def test_gepetto_has_no_direct_deployment_delete_or_cache_proof_for_gpu_teardown():
-    source = (ROOT / "src/chutes-miner/chutes_miner/gepetto.py").read_text(encoding="utf-8")
-    coordinator = (ROOT / "src/chutes-miner/chutes_miner/api/deployment/teardown.py").read_text(
+    source = (ROOT / "src/chutes-miner/chutes_miner/gepetto.py").read_text(
         encoding="utf-8"
     )
+    coordinator = (
+        ROOT / "src/chutes-miner/chutes_miner/api/deployment/teardown.py"
+    ).read_text(encoding="utf-8")
     assert "await session.delete(deployment)" not in source
     assert "asyncio.create_task(self.undeploy" not in source
     assert "V1Preconditions(uid=uid)" in coordinator

@@ -25,7 +25,9 @@ def _request():
 
 
 def _basic(config_id: str) -> str:
-    value = base64.b64encode(f"{config_id}:chutes-registry-scope".encode("ascii")).decode("ascii")
+    value = base64.b64encode(
+        f"{config_id}:chutes-registry-scope".encode("ascii")
+    ).decode("ascii")
     return f"Basic {value}"
 
 
@@ -124,6 +126,7 @@ async def test_broker_mints_narrow_session_and_denies_cross_digest(
             attested_cert_file=str(cert_path),
             attested_key_file=str(tmp_path / "server.key"),
             registry_scopes_file=str(tmp_path / "scopes.json"),
+            registry_workload_token="w" * 64,
         ),
     )
     monkeypatch.setattr(
@@ -155,10 +158,13 @@ async def test_broker_mints_narrow_session_and_denies_cross_digest(
         scope,
         _request(),
         attested_session="broad-attested-session",
+        workload_token="w" * 64,
     )
     assert registered["launch_config_id"] == "config-1"
     assert captured["body"]["launch_config_id"] == "config-1"
-    assert captured["headers"]["X-Chutes-Attested-Session"] == ("broad-attested-session")
+    assert captured["headers"]["X-Chutes-Attested-Session"] == (
+        "broad-attested-session"
+    )
 
     response = Response()
     authenticated = await registry_broker.registry_auth(

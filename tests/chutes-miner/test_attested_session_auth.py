@@ -57,7 +57,9 @@ def test_seedless_chart_disables_every_legacy_graval_bootstrap_path():
         source = template.read_text()
         assert "GPU_TEE_ONLY" in source
         assert 'value: "true"' in source
-    registry_template = (root / "charts/chutes-miner-gpu/templates/registry-cm.yaml").read_text()
+    registry_template = (
+        root / "charts/chutes-miner-gpu/templates/registry-cm.yaml"
+    ).read_text()
     assert "requires exactly one validator" in registry_template
     bootstrap = (root / "src/chutes-miner/chutes_miner/api/server/util.py").read_text()
     assert "settings.gpu_tee_only" in bootstrap
@@ -67,10 +69,18 @@ def test_seedless_chart_disables_every_legacy_graval_bootstrap_path():
     assert 'proxy_set_header X-Chutes-Attested-Session "";' in registry_template
     assert "X-Chutes-Registry-Uri" in registry_template
     assert "proxy_ssl_certificate /run/chutes-tls/server.crt" in registry_template
-    daemonset = (root / "charts/chutes-miner-gpu/templates/registry-daemonset.yaml").read_text()
-    assert "path: /run/chutes-gpu/registry-tls" in daemonset
+    daemonset = (
+        root / "charts/chutes-miner-gpu/templates/registry-daemonset.yaml"
+    ).read_text()
+    assert "path: {{ .Values.seedlessStack.attestedCertHostPath }}" in daemonset
+    assert "path: {{ .Values.seedlessStack.attestedKeyHostPath }}" in daemonset
+    gpu_values = (root / "charts/chutes-miner-gpu/values.yaml").read_text()
+    assert "attestedCertHostPath: /run/chutes-gpu/registry-tls/server.crt" in gpu_values
+    assert "attestedKeyHostPath: /run/chutes-gpu/registry-tls/server.key" in gpu_values
     assert "runAsUser: 0" not in daemonset
-    socket_client = (root / "src/chutes-miner/chutes_miner/api/socket_client.py").read_text()
+    socket_client = (
+        root / "src/chutes-miner/chutes_miner/api/socket_client.py"
+    ).read_text()
     assert "while True:" in socket_client
     assert "except asyncio.CancelledError:" in socket_client
 
@@ -81,7 +91,9 @@ async def test_seedless_runtime_rejects_legacy_bootstrap_before_side_effects(
 ):
     monkeypatch.setattr(settings, "gpu_tee_only", True)
     stream = bootstrap_server(None, SimpleNamespace(), None)
-    with pytest.raises(UnsupportedRuntime, match="disables legacy server bootstrap") as caught:
+    with pytest.raises(
+        UnsupportedRuntime, match="disables legacy server bootstrap"
+    ) as caught:
         await stream.__anext__()
     assert caught.value.code == "unsupported_runtime"
 
@@ -122,6 +134,7 @@ def test_seedless_session_accepts_exactly_one_runtime_validator(tmp_path):
         "runtime_session_expires_at": "2026-07-24T00:15:00Z",
         "allowed_purposes": [
             "cache",
+            "gpu-decommission",
             "gpu-infra",
             "instances",
             "launch",
@@ -165,6 +178,7 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
         "runtime_session_expires_at": "2026-07-24T13:00:00Z",
         "allowed_purposes": [
             "cache",
+            "gpu-decommission",
             "gpu-infra",
             "instances",
             "launch",
@@ -203,14 +217,14 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
         "registration_id": "registration-1",
         "attestation_id": "attestation-1",
         "verified_at": "2026-07-24T12:45:00Z",
-        "runtime_session": "attested-session",
-        "runtime_session_expires_at": "2026-07-24T13:00:00Z",
         "registration_replay_until": "2026-07-24T13:00:00Z",
         "status": "registered",
     }
     runtime_path = tmp_path / "miner-session.json"
     registration_path = tmp_path / "registration.json"
-    runtime_path.write_text(json.dumps(runtime, sort_keys=True, separators=(",", ":")) + "\n")
+    runtime_path.write_text(
+        json.dumps(runtime, sort_keys=True, separators=(",", ":")) + "\n"
+    )
     registration_path.write_text(
         json.dumps(registration, sort_keys=True, separators=(",", ":")) + "\n"
     )
@@ -223,7 +237,11 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
     assert set(parsed) == {*GPU_REGISTRATION_IDENTITY_FIELDS, "validator"}
     assert parsed["server_id"] == "logical-gpu-server"
     assert parsed["attestation_id"] == "attestation-1"
+    assert parsed["runtime_session"] == "attested-session"
+    assert parsed["runtime_session_expires_at"] == "2026-07-24T13:00:00Z"
     assert parsed["validator"]["hotkey"] == "5Validator"
+    assert "runtime_session" not in registration
+    assert "runtime_session_expires_at" not in registration
     assert "attempt_id" not in parsed
     assert "registration_replay_until" not in parsed
 
@@ -263,7 +281,9 @@ def test_seedless_miner_adopts_exact_registrar_identity(tmp_path):
 
     missing = dict(registration)
     missing.pop("attestation_id")
-    registration_path.write_text(json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n")
+    registration_path.write_text(
+        json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n"
+    )
     with pytest.raises(ValueError, match="Registration V2 document is invalid"):
         MinerSettings(
             miner_ss58="5Owner",
@@ -290,7 +310,9 @@ def test_seedless_hourly_cost_comes_from_verified_claim_environment(tmp_path):
         _ = settings.miner_hourly_cost
 
 
-def test_seedless_hourly_cost_reports_actionable_permission_error(monkeypatch, tmp_path):
+def test_seedless_hourly_cost_reports_actionable_permission_error(
+    monkeypatch, tmp_path
+):
     verified = tmp_path / "verified.env"
     verified.write_text("CHUTES_MINER_HOURLY_COST=12.5\n", encoding="ascii")
     settings = MinerSettings(
@@ -318,7 +340,8 @@ def test_seedless_api_leader_election_uses_postgres_not_stale_pidfile():
     from pathlib import Path
 
     source = (
-        Path(__file__).resolve().parents[2] / "src/chutes-miner/chutes_miner/api/main.py"
+        Path(__file__).resolve().parents[2]
+        / "src/chutes-miner/chutes_miner/api/main.py"
     ).read_text()
     assert "pg_try_advisory_lock" in source
     assert "pg_advisory_unlock" in source
@@ -351,7 +374,9 @@ def test_dev_helpers_use_public_owner_without_wallet_material():
         assert "MINER_" + "SEED" not in source
         assert "MINER_SS58" not in source
 
-    verification = (root / "src/chutes-miner/chutes_miner/api/server/verification.py").read_text()
+    verification = (
+        root / "src/chutes-miner/chutes_miner/api/server/verification.py"
+    ).read_text()
     assert "miner_" + "keypair" not in verification
     for source_root in (
         root / "src/chutes-miner",
@@ -402,9 +427,9 @@ def test_merged_dev_compose_contains_only_public_owner_identity():
     )
     document = json.loads(resolved.stdout)
     api_environment = document["services"]["api"]["environment"]
-    assert {key: value for key, value in api_environment.items() if key.startswith("MINER_")} == {
-        "MINER_OWNER_SS58": "5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj"
-    }
+    assert {
+        key: value for key, value in api_environment.items() if key.startswith("MINER_")
+    } == {"MINER_OWNER_SS58": "5Df8xCSkGWk9VWU2QeWXDLn2p7zebV58TsFWxfhs8VRbARFj"}
     serialized = json.dumps(document, sort_keys=True)
     assert "MINER_SS58" not in serialized
     assert "MINER_SEED" not in serialized
@@ -414,7 +439,9 @@ def test_seedless_workload_cache_redis_and_registry_scopes_are_ephemeral():
     root = Path(__file__).resolve().parents[2]
     k8s_util = (root / "src/chutes-miner/chutes_miner/api/k8s/util.py").read_text()
     redis = (root / "charts/chutes-miner/templates/redis-deployment.yaml").read_text()
-    registry = (root / "charts/chutes-miner-gpu/templates/registry-daemonset.yaml").read_text()
+    registry = (
+        root / "charts/chutes-miner-gpu/templates/registry-daemonset.yaml"
+    ).read_text()
     assert "V1HostPathVolumeSource" not in k8s_util
     assert 'name="cache"' in k8s_util
     assert "V1EmptyDirVolumeSource" in k8s_util
@@ -428,7 +455,9 @@ def test_seedless_workload_cache_redis_and_registry_scopes_are_ephemeral():
 
 def test_seedless_adoption_keeps_logical_and_kubernetes_ids_separate():
     root = Path(__file__).resolve().parents[2]
-    adoption = (root / "src/chutes-miner/chutes_miner/api/server/seedless_adoption.py").read_text()
+    adoption = (
+        root / "src/chutes-miner/chutes_miner/api/server/seedless_adoption.py"
+    ).read_text()
     model = (root / "src/chutes-common/chutes_common/schemas/server.py").read_text()
     gpu_model = (root / "src/chutes-common/chutes_common/schemas/gpu.py").read_text()
     migration = (
@@ -571,7 +600,9 @@ async def test_registrar_identity_is_adopted_without_duplicate_server(monkeypatc
     assert await seedless_adoption.adopt_seedless_gpu_server() == "logical-server"
     server = next(value for value in session.added if isinstance(value, Server))
     gpu = next(value for value in session.added if isinstance(value, GPU))
-    node_identity = next(value for value in session.added if isinstance(value, ServerNodeIdentity))
+    node_identity = next(
+        value for value in session.added if isinstance(value, ServerNodeIdentity)
+    )
     assert server.server_id == "logical-server"
     assert server.kubernetes_node_uid == "kubernetes-node-uid"
     assert server.kubernetes_node_generation == 1
@@ -713,7 +744,9 @@ async def test_new_attestation_rotates_node_uid_without_rotating_logical_server(
     assert server.kubernetes_node_generation == 2
     assert server.hourly_cost == 12.5
     assert prior.retired_at is not None
-    current = next(value for value in session.added if isinstance(value, ServerNodeIdentity))
+    current = next(
+        value for value in session.added if isinstance(value, ServerNodeIdentity)
+    )
     assert current.generation == 2
     assert current.kubernetes_node_uid == "node-uid-2"
 

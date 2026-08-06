@@ -1,10 +1,14 @@
 seedlessStack:
   image: ""
   runtimeHostPath: /run/chutes-gpu
-  sessionEnvPath: /run/chutes-gpu/miner-session.env
-  sessionJsonPath: /run/chutes-gpu/miner-session.json
+  sessionEnvPath: /run/chutes-gpu/credentials/runtime-session.env
+  sessionJsonPath: /run/chutes-gpu/credentials/runtime-session.json
   registrationPath: /run/chutes-gpu/registration.json
+  verifiedEnvPath: /run/chutes-gpu/verified.env
   attestedCertPath: /run/chutes-tls/server.crt
+  attestedKeyPath: /run/chutes-tls/server.key
+  attestedCertHostPath: /run/chutes-gpu/registry-tls/server.crt
+  attestedKeyHostPath: /run/chutes-gpu/registry-tls/server.key
   kubectlImage: bitnamilegacy/kubectl@sha256:cd354d5b25562b195b277125439c23e4046902d7f1abc0dc3c75aad04d298c17
 
 # Set this value to true if oeprating a mutli cluster k3s environment
@@ -126,6 +130,10 @@ registry:
   service:
     # BE SURE THIS MATCHES registry_port IN ANSIBLE!
     nodePort: 30500
+
+registryWorkloadAuth:
+  # Pre-provision this Secret with one 64-character alphanumeric `token` key.
+  existingSecret: registry-workload-auth
 
 
 monitor:

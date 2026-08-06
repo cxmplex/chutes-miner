@@ -18,6 +18,10 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        supplementalGroups:
+          - 2000
       {{- with .Values.registry.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -45,8 +49,6 @@ spec:
                 secretKeyRef:
                   name: miner-credentials
                   key: owner
-            - name: CHUTES_ATTESTED_SESSION_FILE
-              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: CHUTES_VALIDATORS_FILE
               value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
             - name: CHUTES_GPU_REGISTRATION_FILE
@@ -56,7 +58,9 @@ spec:
             - name: GPU_TEE_ONLY
               value: "true"
             - name: CHUTES_ATTESTED_KEY_FILE
-              value: /run/chutes-tls/server.key
+              value: {{ .Values.seedlessStack.attestedKeyPath | quote }}
+            - name: CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE
+              value: /var/run/secrets/chutes-registry-workload/token
             - name: CHUTES_REGISTRY_SCOPES_FILE
               value: /var/lib/chutes-registry/scopes.json
           ports:
@@ -72,11 +76,20 @@ spec:
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
           volumeMounts:
-            - name: chutes-gpu-runtime
-              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+            - name: chutes-gpu-session-json
+              mountPath: {{ .Values.seedlessStack.sessionJsonPath }}
               readOnly: true
-            - name: chutes-registry-tls
-              mountPath: /run/chutes-tls
+            - name: chutes-gpu-registration
+              mountPath: {{ .Values.seedlessStack.registrationPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-cert
+              mountPath: {{ .Values.seedlessStack.attestedCertPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-key
+              mountPath: {{ .Values.seedlessStack.attestedKeyPath }}
+              readOnly: true
+            - name: registry-workload-auth
+              mountPath: /var/run/secrets/chutes-registry-workload
               readOnly: true
             - name: chutes-registry-scopes
               mountPath: /var/lib/chutes-registry
@@ -94,20 +107,38 @@ spec:
             - name: registry-nginx-config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
-            - name: chutes-registry-tls
-              mountPath: /run/chutes-tls
+            - name: chutes-gpu-attested-cert
+              mountPath: {{ .Values.seedlessStack.attestedCertPath }}
+              readOnly: true
+            - name: chutes-gpu-attested-key
+              mountPath: {{ .Values.seedlessStack.attestedKeyPath }}
               readOnly: true
       volumes:
-        - name: chutes-gpu-runtime
+        - name: chutes-gpu-session-json
           hostPath:
-            path: {{ .Values.seedlessStack.runtimeHostPath }}
-            type: Directory
+            path: {{ .Values.seedlessStack.sessionJsonPath }}
+            type: File
+        - name: chutes-gpu-registration
+          hostPath:
+            path: {{ .Values.seedlessStack.registrationPath }}
+            type: File
         - name: registry-nginx-config
           configMap:
             name: registry-nginx-config
-        - name: chutes-registry-tls
+        - name: chutes-gpu-attested-cert
           hostPath:
-            path: /run/chutes-gpu/registry-tls
-            type: Directory
+            path: {{ .Values.seedlessStack.attestedCertHostPath }}
+            type: File
+        - name: chutes-gpu-attested-key
+          hostPath:
+            path: {{ .Values.seedlessStack.attestedKeyHostPath }}
+            type: File
+        - name: registry-workload-auth
+          secret:
+            secretName: {{ required "registryWorkloadAuth.existingSecret is required" .Values.registryWorkloadAuth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token
         - name: chutes-registry-scopes
           emptyDir: {}

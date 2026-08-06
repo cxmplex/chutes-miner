@@ -34,11 +34,14 @@ class DeploymentTeardownOperation(Base):
 
     operation_id = Column(String, primary_key=True, default=_uuid)
     deployment_id = Column(String, nullable=False)
-    phase = Column(String, nullable=False, default="requested", server_default="requested")
+    phase = Column(
+        String, nullable=False, default="requested", server_default="requested"
+    )
     reason = Column(String, nullable=False)
     retry_lease_owner = Column(String, nullable=True)
     retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
 
     validator = Column(String, nullable=False)
     server_id = Column(String, nullable=False)
@@ -87,7 +90,9 @@ class DeploymentTeardownOperation(Base):
     lineage_conflict_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -221,7 +226,9 @@ class DeploymentTeardownNodeIncarnationHandoff(Base):
     to_gpu_allocation_group_id = Column(String, nullable=False)
     to_gpu_allocation_group_generation = Column(Integer, nullable=False)
     to_cluster_context_sha256 = Column(String, nullable=False)
-    authorized_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    authorized_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
     operation = relationship(
         "DeploymentTeardownOperation",
@@ -286,17 +293,27 @@ class DeploymentTeardownK8sResource(Base):
     pod_uid_absence_evidence = Column(JSONB, nullable=True)
     pod_uid_absence_evidence_sha256 = Column(String, nullable=True)
     pod_uid_absence_observed_at = Column(DateTime(timezone=True), nullable=True)
-    pod_already_terminating = Column(Boolean, nullable=False, default=False, server_default="false")
+    pod_already_terminating = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
-    pod_teardown_finalizer_removal_requested_at = Column(DateTime(timezone=True), nullable=True)
+    pod_teardown_finalizer_removal_requested_at = Column(
+        DateTime(timezone=True), nullable=True
+    )
     pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
-    state = Column(String, nullable=False, default="observed", server_default="observed")
-    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    state = Column(
+        String, nullable=False, default="observed", server_default="observed"
+    )
+    observed_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     delete_requested_at = Column(DateTime(timezone=True), nullable=True)
     absent_at = Column(DateTime(timezone=True), nullable=True)
     replaced_by_resource_id = Column(
         String,
-        ForeignKey("deployment_teardown_k8s_resources.resource_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "deployment_teardown_k8s_resources.resource_id", ondelete="RESTRICT"
+        ),
         nullable=True,
     )
 
@@ -379,7 +396,9 @@ class DeploymentLaunchOperation(Base):
 
     operation_id = Column(String, primary_key=True, default=_uuid)
     deployment_id = Column(String, nullable=False, unique=True)
-    phase = Column(String, nullable=False, default="reserved", server_default="reserved")
+    phase = Column(
+        String, nullable=False, default="reserved", server_default="reserved"
+    )
     lease_owner = Column(String, nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     immutable_labels = Column(JSONB, nullable=False)
@@ -401,8 +420,12 @@ class DeploymentLaunchOperation(Base):
     job_name = Column(String, nullable=True)
     job_uid = Column(String, nullable=True)
     create_results = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -457,6 +480,16 @@ class DeploymentLaunchOperation(Base):
             unique=True,
             postgresql_where=text("launch_intent_id IS NOT NULL"),
         ),
+        Index(
+            "deployment_launch_next_retry_idx",
+            "next_retry_at",
+            "created_at",
+            postgresql_where=text("phase IN ('reserved', 'creating', 'failed')"),
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_deployment_launch_attempt_count",
+        ),
     )
 
 
@@ -494,8 +527,12 @@ class MinerLaunchIntent(Base):
     job_release_ack = Column(JSONB, nullable=True)
     job_released_at = Column(DateTime(timezone=True), nullable=True)
     deployment_id = Column(String, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -592,8 +629,12 @@ class RegistryScopeIntent(Base):
     registered_at = Column(DateTime(timezone=True), nullable=True)
     revocation_ack = Column(JSONB, nullable=True)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -673,10 +714,13 @@ class DelayedValidatorInstanceCleanup(Base):
     retry_lease_owner = Column(String, nullable=True)
     retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     deletion_ack = Column(JSONB, nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -710,20 +754,27 @@ class ParentDeletionOperation(Base):
     parent_id = Column(String, nullable=False)
     validator = Column(String, nullable=False)
     reason = Column(String, nullable=False)
-    phase = Column(String, nullable=False, default="requested", server_default="requested")
+    phase = Column(
+        String, nullable=False, default="requested", server_default="requested"
+    )
     retry_lease_owner = Column(String, nullable=True)
     retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     snapshot = Column(JSONB, nullable=False)
     monitor_stop_ack = Column(JSONB, nullable=True)
     monitor_stopped_at = Column(DateTime(timezone=True), nullable=True)
     validator_server_deletion_ack = Column(JSONB, nullable=True)
     validator_server_deleted_at = Column(DateTime(timezone=True), nullable=True)
+    validator_server_decommission_request = Column(JSONB, nullable=True)
+    validator_server_decommission_request_sha256 = Column(String(64), nullable=True)
     allocation_release_evidence = Column(JSONB, nullable=True)
     allocation_release_evidence_sha256 = Column(String(64), nullable=True)
     allocation_release_verified_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -761,6 +812,14 @@ class ParentDeletionOperation(Base):
             name="ck_parent_deletion_validator_ack",
         ),
         CheckConstraint(
+            "(validator_server_decommission_request IS NULL "
+            "AND validator_server_decommission_request_sha256 IS NULL) OR "
+            "(parent_type = 'server' "
+            "AND validator_server_decommission_request IS NOT NULL "
+            "AND validator_server_decommission_request_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_parent_deletion_decommission_request",
+        ),
+        CheckConstraint(
             "(allocation_release_evidence IS NULL "
             "AND allocation_release_evidence_sha256 IS NULL "
             "AND allocation_release_verified_at IS NULL) OR "
@@ -788,7 +847,9 @@ class ParentDeletionChild(Base):
         ForeignKey("deployment_teardown_operations.operation_id", ondelete="RESTRICT"),
         primary_key=True,
     )
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class KubernetesOrphanTombstone(Base):
@@ -803,14 +864,19 @@ class KubernetesOrphanTombstone(Base):
     namespace = Column(String, nullable=False)
     kubernetes_node_uid = Column(String, nullable=True)
     kubernetes_node_generation = Column(Integer, nullable=False)
-    phase = Column(String, nullable=False, default="recorded", server_default="recorded")
+    phase = Column(
+        String, nullable=False, default="recorded", server_default="recorded"
+    )
     retry_lease_owner = Column(String, nullable=True)
     retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     immutable_labels = Column(JSONB, nullable=False)
     last_failure = Column(Text, nullable=True)
     lineage_conflict_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     resources = relationship(
@@ -844,6 +910,56 @@ class KubernetesOrphanTombstone(Base):
     )
 
 
+class TeardownLineageResolutionAudit(Base):
+    """Immutable operator audit for normal and orphan lineage recovery."""
+
+    __tablename__ = "teardown_lineage_resolution_audits"
+
+    audit_id = Column(String, primary_key=True, default=_uuid)
+    operation_kind = Column(String, nullable=False)
+    operation_id = Column(String, nullable=False)
+    action = Column(String, nullable=False)
+    policy = Column(String, nullable=False)
+    conflict_at = Column(DateTime(timezone=True), nullable=False)
+    expected_lineage_sha256 = Column(String(64), nullable=False)
+    observed_lineage = Column(JSONB, nullable=False)
+    observed_lineage_sha256 = Column(String(64), nullable=False)
+    reason = Column(Text, nullable=False)
+    actor = Column(String, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "operation_kind IN ('deployment', 'orphan')",
+            name="ck_teardown_lineage_resolution_kind",
+        ),
+        CheckConstraint(
+            "action IN ('requeue', 'resolve')",
+            name="ck_teardown_lineage_resolution_action",
+        ),
+        CheckConstraint(
+            "policy IN ('exact_lineage_retry', 'verified_terminal_absence')",
+            name="ck_teardown_lineage_resolution_policy",
+        ),
+        CheckConstraint(
+            "expected_lineage_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_teardown_lineage_resolution_expected_sha256",
+        ),
+        CheckConstraint(
+            "observed_lineage_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_teardown_lineage_resolution_observed_sha256",
+        ),
+        Index(
+            "teardown_lineage_resolution_operation_idx",
+            "operation_kind",
+            "operation_id",
+            "created_at",
+        ),
+    )
+
+
 class KubernetesOrphanTombstoneResource(Base):
     __tablename__ = "kubernetes_orphan_tombstone_resources"
 
@@ -867,10 +983,16 @@ class KubernetesOrphanTombstoneResource(Base):
     pod_termination_evidence = Column(JSONB, nullable=True)
     pod_termination_evidence_sha256 = Column(String, nullable=True)
     pod_teardown_finalizer_attached_at = Column(DateTime(timezone=True), nullable=True)
-    pod_teardown_finalizer_removal_requested_at = Column(DateTime(timezone=True), nullable=True)
+    pod_teardown_finalizer_removal_requested_at = Column(
+        DateTime(timezone=True), nullable=True
+    )
     pod_teardown_finalizer_removed_at = Column(DateTime(timezone=True), nullable=True)
-    state = Column(String, nullable=False, default="observed", server_default="observed")
-    observed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    state = Column(
+        String, nullable=False, default="observed", server_default="observed"
+    )
+    observed_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     absent_at = Column(DateTime(timezone=True), nullable=True)
 
     tombstone = relationship("KubernetesOrphanTombstone", back_populates="resources")

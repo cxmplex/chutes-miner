@@ -22,6 +22,8 @@ spec:
         fsGroup: 1000
         runAsUser: 1000
         runAsGroup: 1000
+        supplementalGroups:
+          - 2000
       {{- with .Values.agent.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -54,8 +56,6 @@ spec:
                 secretKeyRef:
                   name: miner-credentials
                   key: owner
-            - name: CHUTES_ATTESTED_SESSION_FILE
-              value: {{ .Values.seedlessStack.sessionEnvPath | quote }}
             - name: CHUTES_VALIDATORS_FILE
               value: {{ .Values.seedlessStack.sessionJsonPath | quote }}
             - name: CHUTES_GPU_REGISTRATION_FILE
@@ -75,8 +75,11 @@ spec:
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
           volumeMounts:
-            - name: chutes-gpu-runtime
-              mountPath: {{ .Values.seedlessStack.runtimeHostPath }}
+            - name: chutes-gpu-session-json
+              mountPath: {{ .Values.seedlessStack.sessionJsonPath }}
+              readOnly: true
+            - name: chutes-gpu-registration
+              mountPath: {{ .Values.seedlessStack.registrationPath }}
               readOnly: true
             - name: chutes-agent-state
               mountPath: /app/state
@@ -98,10 +101,14 @@ spec:
             timeoutSeconds: 3        # Shorter timeout
             failureThreshold: 3      # Fail after 3 consecutive failures
       volumes:
-        - name: chutes-gpu-runtime
+        - name: chutes-gpu-session-json
           hostPath:
-            path: {{ .Values.seedlessStack.runtimeHostPath }}
-            type: Directory
+            path: {{ .Values.seedlessStack.sessionJsonPath }}
+            type: File
+        - name: chutes-gpu-registration
+          hostPath:
+            path: {{ .Values.seedlessStack.registrationPath }}
+            type: File
         - name: chutes-agent-state
           hostPath:
             path: /var/lib/chutes/agent

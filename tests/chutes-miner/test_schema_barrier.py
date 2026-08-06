@@ -93,7 +93,9 @@ async def test_adoption_wait_allows_only_supplied_teardown_progress(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_adoption_wait_does_not_run_teardown_without_deployment_blockers(monkeypatch):
+async def test_adoption_wait_does_not_run_teardown_without_deployment_blockers(
+    monkeypatch,
+):
     observed = iter([False, True])
 
     async def fake_present(_engine, _identity):
@@ -123,7 +125,7 @@ def test_barrier_uses_exact_version_not_maximum():
     sql = str(schema_barrier._REQUIRED_SCHEMA_VERSION_PRESENT)
     assert "WHERE version = :required_version" in sql
     assert "MAX(" not in sql.upper()
-    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260730160000"
+    assert schema_barrier.REQUIRED_SCHEMA_VERSION == "20260806120000"
     adoption_sql = str(schema_barrier._SEEDLESS_ADOPTION_PRESENT)
     assert "array_agg(gpu.hardware_uuid ORDER BY gpu.hardware_uuid)" in adoption_sql
     assert "server.registration_attestation_id = :attestation_id" in adoption_sql
@@ -178,7 +180,9 @@ async def test_active_stale_gpu_blockers_are_structured_for_readiness():
 
 
 @pytest.mark.asyncio
-async def test_migration_leader_retries_only_deployment_owned_adoption_blockers(monkeypatch):
+async def test_migration_leader_retries_only_deployment_owned_adoption_blockers(
+    monkeypatch,
+):
     from chutes_miner.api import main
     from chutes_miner.api.server.seedless_adoption import SeedlessAdoptionBlocked
 
@@ -237,7 +241,9 @@ async def test_blocked_adoption_keeps_health_live_and_all_other_routes_unready()
 
 
 @pytest.mark.asyncio
-async def test_background_adoption_opens_readiness_only_after_exact_barrier(monkeypatch):
+async def test_background_adoption_opens_readiness_only_after_exact_barrier(
+    monkeypatch,
+):
     from chutes_miner.api import main
 
     application = SimpleNamespace(
@@ -299,7 +305,9 @@ def test_all_api_workers_and_gepetto_wait_before_work():
 
     lifespan_source = inspect.getsource(main.lifespan)
     nonleader = lifespan_source.index("if not is_migration_process:")
-    nonleader_schema = lifespan_source.index("await wait_for_required_schema(engine)", nonleader)
+    nonleader_schema = lifespan_source.index(
+        "await wait_for_required_schema(engine)", nonleader
+    )
     nonleader_background = lifespan_source.index(
         "_complete_follower_readiness(application)", nonleader_schema
     )
@@ -312,12 +320,20 @@ def test_all_api_workers_and_gepetto_wait_before_work():
     direct_adoption = lifespan_source.index(
         "server_id = await adopt_seedless_gpu_server()", leader_schema
     )
-    typed_blocker = lifespan_source.index("except SeedlessAdoptionBlocked as exc:", direct_adoption)
+    typed_blocker = lifespan_source.index(
+        "except SeedlessAdoptionBlocked as exc:", direct_adoption
+    )
     blocked_background = lifespan_source.index(
         "_complete_blocked_leader_readiness(application)", typed_blocker
     )
     leader_yield = lifespan_source.index("yield", blocked_background)
-    assert leader_schema < direct_adoption < typed_blocker < blocked_background < leader_yield
+    assert (
+        leader_schema
+        < direct_adoption
+        < typed_blocker
+        < blocked_background
+        < leader_yield
+    )
 
     run_source = inspect.getsource(gepetto.Gepetto.run)
     assert "Base.metadata.create_all" not in run_source
@@ -366,6 +382,7 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
             gpu_tee_only=True,
             seedless_gpu_identity={"server_id": "server-1"},
             validator_migrations_enabled=False,
+            registry_workload_token="w" * 64,
         ),
     )
     monkeypatch.setattr(gepetto.k8s, "purge_legacy_source_config_maps", AsyncMock())
@@ -390,12 +407,15 @@ async def test_gepetto_mutators_stay_blocked_until_seedless_adoption(monkeypatch
     coordinator.resume_launch_intents.assert_awaited_once()
     assert coordinator.teardown.resume_pending.await_count == 2
     coordinator.reconcile.assert_awaited_once()
-    coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(reconstruct_active=True)
+    coordinator.reconcile_registry_scope_intents.assert_awaited_once_with(
+        reconstruct_active=True
+    )
 
 
 def test_api_chart_keeps_liveness_open_and_readiness_schema_gated():
     chart = (
-        Path(__file__).resolve().parents[2] / "charts/chutes-miner/templates/api-deployment.yaml"
+        Path(__file__).resolve().parents[2]
+        / "charts/chutes-miner/templates/api-deployment.yaml"
     ).read_text(encoding="utf-8")
     assert "livenessProbe:" in chart
     assert "path: /ping" in chart

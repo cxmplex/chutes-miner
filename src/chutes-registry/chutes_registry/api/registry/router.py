@@ -30,6 +30,7 @@ router = APIRouter()
 _scopes: dict[str, dict] = {}
 _scope_lock = asyncio.Lock()
 _scopes_loaded = False
+_SCOPE_REFRESH_MARGIN = timedelta(minutes=5)
 
 
 def _persist_scopes() -> None:
@@ -141,7 +142,9 @@ def _quarantine_corrupt_scope_cache(path: Path, exc: Exception) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
-    logger.error("quarantined corrupt registry scope cache %s as %s: %s", path, quarantine, exc)
+    logger.error(
+        "quarantined corrupt registry scope cache %s as %s: %s", path, quarantine, exc
+    )
 
 
 def _load_scopes() -> None:
@@ -151,7 +154,13 @@ def _load_scopes() -> None:
     path = Path(settings.registry_scopes_file)
     try:
         _load_scopes_unchecked()
-    except (json.JSONDecodeError, UnicodeError, RuntimeError, TypeError, ValueError) as exc:
+    except (
+        json.JSONDecodeError,
+        UnicodeError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         _quarantine_corrupt_scope_cache(path, exc)
         _scopes.clear()
         _scopes_loaded = True
@@ -200,6 +209,21 @@ def _private_request(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="go away",
+        )
+
+
+def _workload_request(token: str | None) -> None:
+    """Require the exact Gepetto-to-broker workload channel credential."""
+
+    if (
+        not settings.gpu_tee_only
+        or not isinstance(token, str)
+        or not token
+        or not hmac.compare_digest(token, settings.registry_workload_token)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Registry scope mutation requires workload authentication.",
         )
 
 
@@ -296,6 +320,28 @@ def _current_scope_identity() -> tuple[str, str, str]:
     )
 
 
+def _reusable_scope(
+    scope: dict | None,
+    body: RegistryScopeRequest,
+    now: datetime,
+) -> bool:
+    """Return true only for the same live authority with safe expiry margin."""
+
+    if scope is None or scope.get("revoked") is True:
+        return False
+    try:
+        return bool(
+            scope["launch_config_id"] == body.launch_config_id
+            and scope["repository"] == body.repository
+            and scope["manifest_digest"] == body.manifest_digest
+            and scope["expires_at_value"] > now + _SCOPE_REFRESH_MARGIN
+            and _scope_identity(scope) == _current_scope_identity()
+            and scope["server_id"] == body.server_id
+        )
+    except (KeyError, RuntimeError, TypeError):
+        return False
+
+
 def _select_scope(
     scopes: list[dict],
     method: str,
@@ -313,7 +359,10 @@ def _select_scope(
         if scope.get("expires_at_value") is not None
         and scope["expires_at_value"] > now
         and _scope_identity(scope) == current_identity
-        and (launch_config_id is None or scope.get("launch_config_id") == launch_config_id)
+        and (
+            launch_config_id is None
+            or scope.get("launch_config_id") == launch_config_id
+        )
     ]
     matches = [scope for scope in active if _matches(scope, method, uri)]
     if not matches:
@@ -321,7 +370,9 @@ def _select_scope(
     parsed = urlsplit(uri)
     if parsed.path.startswith("/v2/") and "/manifests/" in parsed.path:
         reference = parsed.path.rsplit("/manifests/", 1)[1]
-        exact_roots = [scope for scope in matches if scope["manifest_digest"] == reference]
+        exact_roots = [
+            scope for scope in matches if scope["manifest_digest"] == reference
+        ]
         if exact_roots:
             matches = exact_roots
             if len({scope["descriptor_closure_sha256"] for scope in matches}) != 1:
@@ -414,7 +465,8 @@ async def _mint_registry_scope(
             result.get("descriptor_closure_sha256", ""),
         )
         or any(
-            not isinstance(result.get(field), list) or result[field] != sorted(set(result[field]))
+            not isinstance(result.get(field), list)
+            or result[field] != sorted(set(result[field]))
             for field in (
                 "allowed_manifests",
                 "allowed_blobs",
@@ -486,8 +538,13 @@ async def register_registry_scope(
         None,
         alias="X-Chutes-Attested-Session",
     ),
+    workload_token: str | None = Header(
+        None,
+        alias="X-Chutes-Registry-Workload-Token",
+    ),
 ):
     _private_request(request)
+    _workload_request(workload_token)
     if (
         not settings.gpu_tee_only
         or not attested_session
@@ -498,10 +555,20 @@ async def register_registry_scope(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Registry scope registration requires the current attested identity.",
         )
-    scope = await _mint_registry_scope(body, attested_session)
     async with _scope_lock:
         _load_scopes()
-        _garbage_collect_scopes(datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        _garbage_collect_scopes(now)
+        existing = _scopes.get(body.launch_config_id)
+        if _reusable_scope(existing, body, now):
+            return {
+                "registered": True,
+                "launch_config_id": body.launch_config_id,
+                "expires_at": existing["expires_at"],
+            }
+        # Serialize the validator mint with the cache check. Concurrent healthy
+        # Gepetto reconciles must not create multiple authorities for one scope.
+        scope = await _mint_registry_scope(body, attested_session)
         _scopes[body.launch_config_id] = scope
         _persist_scopes()
     return {
@@ -523,8 +590,13 @@ async def revoke_registry_scope(
         None,
         alias="X-Chutes-Server-Id",
     ),
+    workload_token: str | None = Header(
+        None,
+        alias="X-Chutes-Registry-Workload-Token",
+    ),
 ):
     _private_request(request)
+    _workload_request(workload_token)
     if (
         not settings.gpu_tee_only
         or not attested_session
