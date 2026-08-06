@@ -1266,6 +1266,7 @@ class K8sOperator(abc.ABC):
         server_id: Union[str | Server],
         token: str = None,
         launch_intent_id: str = None,
+        launch_intent_lease_owner: str = None,
         job_id: str = None,
         config_id: str = None,
         registry_repository: str = None,
@@ -1321,6 +1322,7 @@ class K8sOperator(abc.ABC):
                     registry_repository,
                     registry_manifest_digest,
                     launch_intent_id,
+                    launch_intent_lease_owner,
                     hashlib.sha256(token.encode()).hexdigest(),
                 )
 
@@ -1482,6 +1484,7 @@ class K8sOperator(abc.ABC):
         registry_repository: str = None,
         registry_manifest_digest: str = None,
         launch_intent_id: str = None,
+        launch_intent_lease_owner: str = None,
         launch_token_sha256: str = None,
     ):
         # Immediately track this deployment (before actually creating it) to avoid allocation contention.
@@ -1542,6 +1545,11 @@ class K8sOperator(abc.ABC):
         if (
             intent is None
             or intent.phase != "registry_acked"
+            or not isinstance(launch_intent_lease_owner, str)
+            or not launch_intent_lease_owner
+            or intent.retry_lease_owner != launch_intent_lease_owner
+            or intent.retry_lease_expires_at is None
+            or intent.retry_lease_expires_at <= datetime.now(timezone.utc)
             or persisted_lineage != expected_lineage
             or (intent.response_payload or {}).get("config_id") != config_id
             or launch_token_sha256 not in set(intent.authorized_token_sha256s or [])
@@ -1630,6 +1638,9 @@ class K8sOperator(abc.ABC):
         intent.phase = "consumed"
         intent.deployment_id = deployment_id
         intent.last_failure = None
+        intent.next_retry_at = None
+        intent.retry_lease_owner = None
+        intent.retry_lease_expires_at = None
         await session.commit()
 
         return deployment_id, gpu_uuids

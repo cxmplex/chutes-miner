@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
 import textwrap
@@ -35,6 +37,7 @@ from kubernetes.client import (
     V1VolumeMount,
 )
 from kubernetes.client.rest import ApiException
+from sqlalchemy.dialects import postgresql
 
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s import operator as operator_module
@@ -130,6 +133,11 @@ def _canonical_intent(
         "job_release_ack": None,
         "job_released_at": None,
         "deployment_id": None if job_cleanup_only else DEPLOYMENT_UUID,
+        "retry_lease_owner": "lease-1",
+        "retry_lease_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "attempt_count": 1,
+        "next_retry_at": None,
+        "created_at": datetime.now(timezone.utc),
         "completed_at": None,
         "last_failure": None,
     }
@@ -889,10 +897,12 @@ async def test_launch_response_replay_accumulates_only_validator_returned_tokens
     await gepetto._record_launch_response(
         "intent-1",
         {**stable, "token": "token-1"},
+        lease_owner="lease-1",
     )
     await gepetto._record_launch_response(
         "intent-1",
         {**stable, "token": "token-2"},
+        lease_owner="lease-1",
     )
 
     assert intent.response_payload == {"config_id": "config-1", "registry": None}
@@ -928,7 +938,13 @@ async def test_tampered_launch_intent_stops_before_external_replay_or_failure_mu
     gepetto._revoke_registry_scope = AsyncMock()
     gepetto._release_job_exact = AsyncMock()
 
-    assert await gepetto._resume_launch_intent("intent-1") is False
+    assert (
+        await gepetto._resume_launch_intent(
+            "intent-1",
+            lease_owner="lease-1",
+        )
+        is False
+    )
     assert intent.phase == "pending"
     assert intent.last_failure is None
     gepetto._fetch_launch_config.assert_not_awaited()
@@ -939,8 +955,160 @@ async def test_tampered_launch_intent_stops_before_external_replay_or_failure_mu
 
 
 class _IntentResult:
+    def __init__(self, intents):
+        self.intents = list(intents)
+
     def scalars(self):
-        return ["intent-1"]
+        return self
+
+    def unique(self):
+        return self
+
+    def __iter__(self):
+        return iter(self.intents)
+
+
+@pytest.mark.asyncio
+async def test_recovery_query_excludes_live_preemption_owner_and_uses_skip_locked(
+    monkeypatch,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_IntentResult([])),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+
+    assert await gepetto._claim_launch_intents({"registry_acked"}) == []
+    statement = session.execute.await_args.args[0]
+    sql = str(
+        statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": False},
+        )
+    )
+    assert "retry_lease_owner IS NULL" in sql
+    assert "retry_lease_expires_at IS NULL" in sql
+    assert "retry_lease_expires_at <=" in sql
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert statement._for_update_arg.skip_locked is True
+    assert statement._limit_clause.value == gepetto_module.RESUME_CONCURRENCY
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_expired_launch_owner_is_atomically_reclaimed(monkeypatch):
+    expired = _canonical_intent(
+        phase="registry_acked",
+        retry_lease_owner="crashed-producer",
+        retry_lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        attempt_count=2,
+        next_retry_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_IntentResult([expired])),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    gepetto = object.__new__(Gepetto)
+    gepetto._launch_intent_lease_owner = Mock(return_value="recovery-owner")
+
+    assert await gepetto._claim_launch_intents({"registry_acked"}) == [
+        ("intent-1", "recovery-owner")
+    ]
+    assert expired.retry_lease_owner == "recovery-owner"
+    assert expired.retry_lease_expires_at > datetime.now(timezone.utc)
+    assert expired.attempt_count == 3
+    assert expired.next_retry_at is None
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preemption_gap_heartbeat_keeps_exact_producer_lease_live(monkeypatch):
+    intent = _canonical_intent(
+        phase="registry_acked",
+        retry_lease_owner="producer-owner",
+        retry_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=intent),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    monkeypatch.setattr(gepetto_module, "LAUNCH_INTENT_HEARTBEAT_SECONDS", 0.01)
+    gepetto = object.__new__(Gepetto)
+
+    async with gepetto._launch_intent_lease_guard(
+        "intent-1",
+        "producer-owner",
+    ):
+        # This sleep stands in for the long undeploy loop in preempting_deploy.
+        await asyncio.sleep(0.035)
+        assert intent.retry_lease_owner == "producer-owner"
+        assert intent.retry_lease_expires_at > datetime.now(timezone.utc)
+
+    assert session.commit.await_count >= 2
+    source = inspect.getsource(Gepetto.preempting_deploy)
+    guard = source.index("_launch_intent_lease_guard")
+    preemption = source.index("await self.undeploy", guard)
+    final_renewal = source.index("_renew_launch_intent_lease", preemption)
+    consumption = source.index("k8s.deploy_chute", final_renewal)
+    assert guard < preemption < final_renewal < consumption
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_launch_fence_rejects_stale_producer_mutations(monkeypatch):
+    intent = _canonical_intent(
+        phase="registry_acked",
+        retry_lease_owner="recovery-owner",
+        retry_lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        response_payload={"config_id": "config-1", "registry": None},
+    )
+    session = SimpleNamespace(
+        get=AsyncMock(return_value=intent),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    monkeypatch.setattr(gepetto_module.settings, "gpu_tee_only", False)
+    gepetto = object.__new__(Gepetto)
+
+    with pytest.raises(DeploymentFailure, match="lease changed or expired"):
+        await gepetto._renew_launch_intent_lease("intent-1", "stale-producer")
+    with pytest.raises(DeploymentFailure, match="lease changed or expired"):
+        await gepetto._record_launch_response(
+            "intent-1",
+            {"config_id": "config-1", "token": "new-token"},
+            lease_owner="stale-producer",
+        )
+    with pytest.raises(DeploymentFailure, match="lease changed or expired"):
+        await gepetto.abort_launch_intent(
+            "intent-1",
+            lease_owner="stale-producer",
+        )
+
+    assert intent.phase == "registry_acked"
+    assert intent.retry_lease_owner == "recovery-owner"
+    session.commit.assert_not_awaited()
 
 
 class _NoIntentResult:
@@ -983,6 +1151,7 @@ async def test_pre_request_job_cleanup_is_committed_before_external_release(
         chute,
         server,
         "job-1",
+        lease_owner="lease-1",
     )
     assert intent_id == added[0].intent_id
     assert added[0].phase == "cleanup_required"
@@ -1006,7 +1175,7 @@ async def test_pending_launch_recovery_replays_persisted_identity_not_current_ro
         validator="validator-original",
     )
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=_IntentResult()),
+        execute=AsyncMock(return_value=_IntentResult([intent])),
         get=AsyncMock(return_value=intent),
         commit=AsyncMock(),
     )
@@ -1025,7 +1194,8 @@ async def test_pending_launch_recovery_replays_persisted_identity_not_current_ro
     payload = {"token": "fresh", "config_id": "config-1"}
     gepetto._fetch_launch_config = AsyncMock(return_value=payload)
 
-    async def record_response(_intent_id, response):
+    async def record_response(_intent_id, response, *, lease_owner):
+        assert lease_owner == intent.retry_lease_owner
         intent.phase = "response_persisted"
         intent.response_payload = {
             "config_id": response["config_id"],
@@ -1060,7 +1230,7 @@ async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
         response_payload={"config_id": "config-1", "registry": None},
     )
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=_IntentResult()),
+        execute=AsyncMock(return_value=_IntentResult([intent])),
         get=AsyncMock(return_value=intent),
         commit=AsyncMock(),
     )
@@ -1074,7 +1244,8 @@ async def test_failed_job_release_keeps_launch_intent_retryable(monkeypatch):
     gepetto._revoke_registry_scope = AsyncMock()
     gepetto._release_job_exact = AsyncMock(side_effect=DeploymentFailure("validator unavailable"))
 
-    async def record_failure(_intent_id, exc):
+    async def record_failure(_intent_id, exc, *, lease_owner):
+        assert lease_owner == intent.retry_lease_owner
         intent.last_failure = str(exc)
 
     gepetto._record_launch_intent_failure = AsyncMock(side_effect=record_failure)
@@ -1096,7 +1267,7 @@ async def test_predeployment_abort_persists_before_cleanup_and_retries_in_reconc
         response_payload={"config_id": "config-1", "registry": None},
     )
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=_IntentResult()),
+        execute=AsyncMock(return_value=_IntentResult([intent])),
         get=AsyncMock(return_value=intent),
         commit=AsyncMock(),
     )
@@ -1115,11 +1286,18 @@ async def test_predeployment_abort_persists_before_cleanup_and_retries_in_reconc
         ]
     )
 
-    async def record_failure(_intent_id, exc):
+    async def record_failure(_intent_id, exc, *, lease_owner):
+        assert lease_owner == intent.retry_lease_owner
         intent.last_failure = str(exc)
 
     gepetto._record_launch_intent_failure = AsyncMock(side_effect=record_failure)
-    assert await gepetto.abort_launch_intent("intent-1") is False
+    assert (
+        await gepetto.abort_launch_intent(
+            "intent-1",
+            lease_owner="lease-1",
+        )
+        is False
+    )
     assert intent.phase == "cleanup_required"
     assert intent.job_release_ack is None
     assert intent.last_failure == "release response lost"
@@ -1145,7 +1323,7 @@ async def test_job_cleanup_only_intent_releases_without_requesting_launch_config
         job_cleanup_only=True,
     )
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=_IntentResult()),
+        execute=AsyncMock(return_value=_IntentResult([intent])),
         get=AsyncMock(return_value=intent),
         commit=AsyncMock(),
     )

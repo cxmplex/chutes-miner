@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import uuid
 
 import pytest
@@ -31,6 +32,8 @@ def _gepetto() -> Gepetto:
     gepetto._record_launch_intent_failure = AsyncMock()
     gepetto._begin_job_cleanup_intent = AsyncMock(return_value="job-cleanup-1")
     gepetto.abort_launch_intent = AsyncMock(return_value=True)
+    gepetto._launch_intent_lease_owner = MagicMock(return_value="lease-1")
+    gepetto._renew_launch_intent_lease = AsyncMock()
     return gepetto
 
 
@@ -199,6 +202,7 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
         "config_id": "config-1",
         "_miner_launch_request_id": "request-1",
         "_miner_deployment_id": DEPLOYMENT_ID,
+        "_miner_launch_lease_owner": "lease-1",
     }
 
     mock_aiohttp_response.json.return_value = {
@@ -208,7 +212,11 @@ async def test_get_launch_token_requires_exact_response_schema(mock_aiohttp_resp
     }
     with pytest.raises(DeploymentFailure, match="expected exactly"):
         await gepetto.get_launch_token(_chute(), _server(), deployment_id=DEPLOYMENT_ID)
-    gepetto.abort_launch_intent.assert_awaited_once_with("request-1")
+    gepetto.abort_launch_intent.assert_awaited_once_with(
+        "request-1",
+        lease_owner="lease-1",
+        failure=ANY,
+    )
 
     mock_aiohttp_response.json.return_value = {
         "token": "launch-token",
@@ -468,6 +476,7 @@ async def test_run_job_propagates_version_and_launch_context():
             "token": "launch-jwt",
             "config_id": "config-1",
             "_miner_launch_request_id": "request-1",
+            "_miner_launch_lease_owner": "lease-1",
         }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[{"port": 9000}])
@@ -490,6 +499,7 @@ async def test_run_job_propagates_version_and_launch_context():
     assert deploy.await_args.kwargs["token"] == "launch-jwt"
     assert deploy.await_args.kwargs["config_id"] == "config-1"
     assert deploy.await_args.kwargs["job_id"] == "job-1"
+    assert deploy.await_args.kwargs["launch_intent_lease_owner"] == "lease-1"
 
 
 @pytest.mark.asyncio
@@ -502,8 +512,17 @@ async def test_job_path_rejects_nonpositive_hourly_cost_before_token_fetch():
         await gepetto.run_job(chute, "job-1", server, settings.validators[0])
     gepetto.get_launch_token.assert_not_awaited()
     deploy.assert_not_awaited()
-    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(chute, server, "job-1")
-    gepetto.abort_launch_intent.assert_awaited_once_with("job-cleanup-1")
+    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(
+        chute,
+        server,
+        "job-1",
+        lease_owner="lease-1",
+    )
+    gepetto.abort_launch_intent.assert_awaited_once_with(
+        "job-cleanup-1",
+        lease_owner="lease-1",
+        failure=ANY,
+    )
 
 
 @pytest.mark.asyncio
@@ -519,8 +538,17 @@ async def test_run_job_rejects_cross_validator_server_before_token_fetch():
 
     gepetto.get_launch_token.assert_not_awaited()
     deploy.assert_not_awaited()
-    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(chute, server, "job-1")
-    gepetto.abort_launch_intent.assert_awaited_once_with("job-cleanup-1")
+    gepetto._begin_job_cleanup_intent.assert_awaited_once_with(
+        chute,
+        server,
+        "job-1",
+        lease_owner="lease-1",
+    )
+    gepetto.abort_launch_intent.assert_awaited_once_with(
+        "job-cleanup-1",
+        lease_owner="lease-1",
+        failure=ANY,
+    )
 
 
 @pytest.mark.asyncio
@@ -536,6 +564,7 @@ async def test_normal_scale_up_propagates_server_version():
             "token": "launch-jwt",
             "config_id": "config-1",
             "_miner_launch_request_id": "request-1",
+            "_miner_launch_lease_owner": "lease-1",
         }
     )
     deployment = SimpleNamespace(deployment_id="deployment-1")
@@ -567,6 +596,7 @@ async def test_preemption_job_propagates_version_job_identity_and_exact_disk(mon
             "token": "launch-jwt",
             "config_id": "config-1",
             "_miner_launch_request_id": "request-1",
+            "_miner_launch_lease_owner": "lease-1",
         }
     )
     gepetto._get_job_extra_services = AsyncMock(return_value=[])
@@ -590,6 +620,8 @@ async def test_preemption_job_propagates_version_job_identity_and_exact_disk(mon
     disk_check.assert_awaited_once_with(server.name, 48)
     assert deploy.await_args.kwargs["vm_version"] == "1.8.0"
     assert deploy.await_args.kwargs["job_id"] == "job-1"
+    assert deploy.await_args.kwargs["launch_intent_lease_owner"] == "lease-1"
+    assert gepetto._renew_launch_intent_lease.await_count >= 2
 
 
 @pytest.mark.asyncio
@@ -669,6 +701,7 @@ async def test_rolling_update_propagates_version_on_matching_server():
             "token": "launch-jwt",
             "config_id": "config-2",
             "_miner_launch_request_id": "request-2",
+            "_miner_launch_lease_owner": "lease-1",
         }
     )
     created = SimpleNamespace(deployment_id="deployment-new")
@@ -813,6 +846,10 @@ class _ClaimSession:
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
             deployment_id=DEPLOYMENT_ID,
             last_failure=None,
+            next_retry_at=None,
+            retry_lease_owner="lease-1",
+            retry_lease_expires_at=datetime.now(timezone.utc)
+            + timedelta(minutes=5),
         )
 
     def add(self, value):
@@ -860,6 +897,7 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
         server,
         available,
         launch_intent_id="launch-intent-1",
+        launch_intent_lease_owner="lease-1",
         launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
     )
 
@@ -867,6 +905,8 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
     assert len(gpu_uuids) == 2
     assert session.flushed
     assert session.committed
+    assert session.intent.retry_lease_owner is None
+    assert session.intent.retry_lease_expires_at is None
     assert len(session.added) == 2
     assert "gpus.deployment_id IS NULL" in str(session.statement)
 
@@ -896,9 +936,54 @@ async def test_atomic_gpu_claim_fails_on_partial_contention():
             server,
             {gpu.gpu_id for gpu in server.gpus},
             launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
             launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
         )
 
+    assert not session.committed
+
+
+@pytest.mark.parametrize(
+    ("presented_owner", "expires_delta"),
+    [
+        ("stale-producer", timedelta(minutes=5)),
+        ("lease-1", timedelta(seconds=-1)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_atomic_gpu_claim_rejects_stale_or_expired_launch_owner(
+    presented_owner,
+    expires_delta,
+):
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    session.intent.retry_lease_expires_at = datetime.now(timezone.utc) + expires_delta
+
+    with pytest.raises(DeploymentFailure, match="launch intent lineage conflicts"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner=presented_owner,
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+        )
+
+    assert session.statement is None
+    assert not session.added
     assert not session.committed
 
 
@@ -926,6 +1011,7 @@ async def test_atomic_gpu_claim_rejects_token_not_returned_for_launch_intent():
             server,
             {server.gpus[0].gpu_id},
             launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
             launch_token_sha256=hashlib.sha256(b"attacker-token").hexdigest(),
         )
 
@@ -958,6 +1044,7 @@ async def test_atomic_gpu_claim_rejects_noncanonical_launch_intent_before_assign
             server,
             {server.gpus[0].gpu_id},
             launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
             launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
         )
 

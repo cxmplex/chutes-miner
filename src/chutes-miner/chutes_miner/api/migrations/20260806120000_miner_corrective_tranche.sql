@@ -87,8 +87,17 @@ ALTER TABLE delayed_validator_instance_cleanups
     ADD COLUMN next_retry_at TIMESTAMPTZ;
 
 ALTER TABLE miner_launch_intents
+    ADD COLUMN retry_lease_owner TEXT,
+    ADD COLUMN retry_lease_expires_at TIMESTAMPTZ,
     ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN next_retry_at TIMESTAMPTZ,
+    ADD CONSTRAINT ck_miner_launch_intent_retry_lease CHECK (
+        (retry_lease_owner IS NULL) = (retry_lease_expires_at IS NULL)
+        AND (
+            phase NOT IN ('consumed', 'completed', 'failed')
+            OR retry_lease_owner IS NULL
+        )
+    ),
     ADD CONSTRAINT ck_miner_launch_intent_attempt_count CHECK (attempt_count >= 0);
 
 ALTER TABLE registry_scope_intents
@@ -117,7 +126,7 @@ CREATE INDEX delayed_validator_cleanup_next_retry_idx
     WHERE phase <> 'completed';
 
 CREATE INDEX miner_launch_intent_next_retry_idx
-    ON miner_launch_intents(next_retry_at, created_at)
+    ON miner_launch_intents(next_retry_at, retry_lease_expires_at, created_at)
     WHERE phase NOT IN ('completed', 'failed');
 
 CREATE INDEX registry_scope_intent_next_retry_idx
@@ -185,7 +194,10 @@ BEGIN
        OR EXISTS (
             SELECT 1
             FROM miner_launch_intents
-            WHERE attempt_count > 0 OR next_retry_at IS NOT NULL
+            WHERE attempt_count > 0
+               OR next_retry_at IS NOT NULL
+               OR retry_lease_owner IS NOT NULL
+               OR retry_lease_expires_at IS NOT NULL
        )
        OR EXISTS (
             SELECT 1
@@ -237,9 +249,12 @@ ALTER TABLE registry_scope_intents
     DROP COLUMN attempt_count;
 
 ALTER TABLE miner_launch_intents
+    DROP CONSTRAINT ck_miner_launch_intent_retry_lease,
     DROP CONSTRAINT ck_miner_launch_intent_attempt_count,
     DROP COLUMN next_retry_at,
-    DROP COLUMN attempt_count;
+    DROP COLUMN attempt_count,
+    DROP COLUMN retry_lease_expires_at,
+    DROP COLUMN retry_lease_owner;
 
 ALTER TABLE delayed_validator_instance_cleanups
     DROP COLUMN next_retry_at;

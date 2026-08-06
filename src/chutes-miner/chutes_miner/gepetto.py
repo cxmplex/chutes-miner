@@ -9,6 +9,7 @@ import random
 import re
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -27,6 +28,7 @@ from chutes_common.settings import Validator
 from chutes_miner.api.config import settings, validator_by_hotkey
 from chutes_miner.api.database import engine, get_session
 from chutes_miner.api.deployment.teardown import (
+    LEASE_SECONDS,
     RESUME_CONCURRENCY,
     RESUME_ITEM_TIMEOUT_SECONDS,
     DeploymentTeardownCoordinator,
@@ -57,13 +59,15 @@ from chutes_miner.api.schema_barrier import (
 from chutes_miner.leader import run_gepetto_leader_loop
 from chutes_miner.validator_migrations import run_validator_migrations
 from loguru import logger
-from sqlalchemy import case, func, select, text, update
+from sqlalchemy import and_, case, func, or_, select, text, update
 
 # When scaling up, randomly pick from up to this many of the tightest-fitting servers
 # (rather than always the single most-utilized one) to spread load and avoid repeatedly
 # scheduling onto a server that has an issue the disk check doesn't catch.
 SCALE_UP_CANDIDATE_POOL = 2
 REGISTRY_SCOPE_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+LAUNCH_AUTHORITY_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+LAUNCH_INTENT_HEARTBEAT_SECONDS = max(1, LEASE_SECONDS // 3)
 
 
 def _canonical_sha256(document: Any) -> str:
@@ -121,6 +125,117 @@ class Gepetto:
         self.pubsub.on_event("job_created")(self.job_created)
         self.pubsub.on_event("job_deleted")(self.job_deleted)
         self.pubsub.on_event("chute_updated")(self.chute_updated)
+
+    @staticmethod
+    def _launch_intent_lease_owner(kind: str) -> str:
+        """Return one opaque owner token for a producer or recovery attempt."""
+
+        return f"miner-launch:{kind}:{uuid.uuid4()}"
+
+    @staticmethod
+    def _require_live_launch_intent_lease(
+        intent: MinerLaunchIntent | None,
+        lease_owner: str,
+        *,
+        now: datetime | None = None,
+    ) -> MinerLaunchIntent:
+        deadline = getattr(intent, "retry_lease_expires_at", None)
+        if (
+            intent is None
+            or not isinstance(lease_owner, str)
+            or not lease_owner
+            or intent.retry_lease_owner != lease_owner
+            or deadline is None
+            or deadline <= (now or datetime.now(timezone.utc))
+        ):
+            raise DeploymentFailure("durable miner launch lease changed or expired")
+        return intent
+
+    async def _renew_launch_intent_lease(
+        self,
+        intent_id: str,
+        lease_owner: str,
+    ) -> None:
+        """Renew only an unexpired lease still owned by this exact attempt."""
+
+        async with get_session() as session:
+            intent = await session.get(
+                MinerLaunchIntent,
+                intent_id,
+                with_for_update=True,
+            )
+            self._validated_launch_intent(intent)
+            if intent is None or intent.phase not in {
+                "pending",
+                "response_persisted",
+                "registry_acked",
+                "cleanup_required",
+            }:
+                raise DeploymentFailure("durable miner launch is no longer renewable")
+            self._require_live_launch_intent_lease(intent, lease_owner)
+            intent.retry_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=LEASE_SECONDS
+            )
+            await session.commit()
+
+    @asynccontextmanager
+    async def _launch_intent_lease_guard(
+        self,
+        intent_id: str,
+        lease_owner: str,
+    ):
+        """Keep DB ownership live through the producer-to-deployment handoff."""
+
+        await self._renew_launch_intent_lease(intent_id, lease_owner)
+        producer_task = asyncio.current_task()
+        if producer_task is None:
+            raise DeploymentFailure("miner launch producer task is unavailable")
+        stop = asyncio.Event()
+        lease_failure: BaseException | None = None
+
+        async def heartbeat() -> None:
+            nonlocal lease_failure
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(),
+                            timeout=LAUNCH_INTENT_HEARTBEAT_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+                    if stop.is_set():
+                        return
+                    await self._renew_launch_intent_lease(intent_id, lease_owner)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                lease_failure = exc
+                producer_task.cancel()
+
+        heartbeat_task = asyncio.create_task(
+            heartbeat(),
+            name=f"miner-launch-lease-{intent_id}",
+        )
+        try:
+            yield
+        except asyncio.CancelledError as exc:
+            if lease_failure is not None:
+                raise DeploymentFailure(
+                    "durable miner launch lease heartbeat failed"
+                ) from lease_failure
+            raise exc
+        finally:
+            stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except BaseException:
+                pass
+        if lease_failure is not None:
+            raise DeploymentFailure(
+                "durable miner launch lease heartbeat failed"
+            ) from lease_failure
 
     @staticmethod
     def _platform_managed(data: Any) -> bool:
@@ -569,8 +684,12 @@ class Gepetto:
         server: Server,
         job_id: str | None,
         deployment_id: str,
+        *,
+        lease_owner: str,
     ) -> str:
         """Persist/reuse one request UUID before any validator or registry call."""
+        if not isinstance(lease_owner, str) or not lease_owner:
+            raise DeploymentFailure("durable launch lease owner is required")
         try:
             canonical_deployment_id = str(uuid.UUID(deployment_id))
         except (AttributeError, TypeError, ValueError) as exc:
@@ -603,6 +722,25 @@ class Gepetto:
                     raise DeploymentFailure(
                         f"durable launch request is already {existing.phase}"
                     )
+                now = datetime.now(timezone.utc)
+                if existing.next_retry_at is not None and existing.next_retry_at > now:
+                    raise DeploymentFailure("durable launch request is backed off")
+                if (
+                    existing.retry_lease_owner is not None
+                    and existing.retry_lease_expires_at is not None
+                    and existing.retry_lease_expires_at > now
+                ):
+                    raise DeploymentFailure(
+                        "durable launch request is owned by another producer"
+                    )
+                existing.retry_lease_owner = lease_owner
+                existing.retry_lease_expires_at = now + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                existing.attempt_count += 1
+                existing.next_retry_at = None
+                existing.last_failure = None
+                await session.commit()
                 return existing.intent_id
             intent_id = str(uuid.uuid4())
             request_payload = {
@@ -623,6 +761,10 @@ class Gepetto:
                     request_payload=request_payload,
                     request_sha256=_canonical_sha256(request_payload),
                     lineage_sha256=lineage_sha256,
+                    retry_lease_owner=lease_owner,
+                    retry_lease_expires_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=LEASE_SECONDS),
+                    attempt_count=1,
                 )
             )
             await session.commit()
@@ -633,8 +775,12 @@ class Gepetto:
         chute: Chute,
         server: Server,
         job_id: str,
+        *,
+        lease_owner: str,
     ) -> str:
         """Persist validator job cleanup when launch validation fails pre-request."""
+        if not isinstance(lease_owner, str) or not lease_owner:
+            raise DeploymentFailure("durable job cleanup lease owner is required")
         lineage = self._launch_lineage(chute, server, job_id, None)
         lineage_sha256 = _canonical_sha256(lineage)
         async with get_session() as session:
@@ -657,6 +803,29 @@ class Gepetto:
             if existing is not None:
                 if self._validated_launch_intent(existing) != lineage:
                     raise DeploymentFailure("durable job cleanup lineage conflicts")
+                if existing.phase == "consumed":
+                    raise DeploymentFailure(
+                        f"durable job cleanup request is already {existing.phase}"
+                    )
+                now = datetime.now(timezone.utc)
+                if existing.next_retry_at is not None and existing.next_retry_at > now:
+                    raise DeploymentFailure("durable job cleanup is backed off")
+                if (
+                    existing.retry_lease_owner is not None
+                    and existing.retry_lease_expires_at is not None
+                    and existing.retry_lease_expires_at > now
+                ):
+                    raise DeploymentFailure(
+                        "durable job cleanup is owned by another producer"
+                    )
+                existing.retry_lease_owner = lease_owner
+                existing.retry_lease_expires_at = now + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                existing.attempt_count += 1
+                existing.next_retry_at = None
+                existing.last_failure = None
+                await session.commit()
                 return existing.intent_id
             intent_id = str(uuid.uuid4())
             request_payload = {
@@ -677,6 +846,10 @@ class Gepetto:
                     request_payload=request_payload,
                     request_sha256=_canonical_sha256(request_payload),
                     lineage_sha256=lineage_sha256,
+                    retry_lease_owner=lease_owner,
+                    retry_lease_expires_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=LEASE_SECONDS),
+                    attempt_count=1,
                 )
             )
             await session.commit()
@@ -686,6 +859,8 @@ class Gepetto:
         self,
         intent_id: str,
         payload: dict[str, Any],
+        *,
+        lease_owner: str,
     ) -> None:
         stable = {
             "config_id": payload["config_id"],
@@ -705,6 +880,7 @@ class Gepetto:
                 raise DeploymentFailure(
                     "durable launch response arrived in an invalid phase"
                 )
+            self._require_live_launch_intent_lease(intent, lease_owner)
             if (
                 intent.response_payload is not None
                 and intent.response_payload != stable
@@ -723,6 +899,9 @@ class Gepetto:
                 intent.phase = "response_persisted"
             intent.last_failure = None
             intent.next_retry_at = None
+            intent.retry_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=LEASE_SECONDS
+            )
             if settings.gpu_tee_only:
                 await ensure_registry_scope_registration_in_session(
                     session, intent, payload
@@ -733,6 +912,8 @@ class Gepetto:
         self,
         intent_id: str,
         ack: dict[str, Any],
+        *,
+        lease_owner: str,
     ) -> None:
         async with get_session() as session:
             intent = await session.get(
@@ -746,6 +927,7 @@ class Gepetto:
                 raise DeploymentFailure(
                     "registry ACK arrived in an invalid launch phase"
                 )
+            self._require_live_launch_intent_lease(intent, lease_owner)
             expected_config_id = (intent.response_payload or {}).get("config_id")
             if (
                 not isinstance(ack, dict)
@@ -767,10 +949,17 @@ class Gepetto:
             intent.phase = "registry_acked"
             intent.last_failure = None
             intent.next_retry_at = None
+            intent.retry_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=LEASE_SECONDS
+            )
             await session.commit()
 
     async def _record_launch_intent_failure(
-        self, intent_id: str, exc: Exception
+        self,
+        intent_id: str,
+        exc: BaseException,
+        *,
+        lease_owner: str,
     ) -> None:
         async with get_session() as session:
             intent = await session.get(
@@ -785,12 +974,19 @@ class Gepetto:
                 )
                 return
             if intent is not None and intent.phase not in {"completed", "failed"}:
-                intent.attempt_count = getattr(intent, "attempt_count", 0) + 1
+                self._require_live_launch_intent_lease(intent, lease_owner)
                 intent.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
                 intent.next_retry_at = retry_at(intent.attempt_count)
+                intent.retry_lease_owner = None
+                intent.retry_lease_expires_at = None
                 await session.commit()
 
-    async def _resume_launch_intent(self, intent_id: str) -> bool:
+    async def _resume_launch_intent(
+        self,
+        intent_id: str,
+        *,
+        lease_owner: str,
+    ) -> bool:
         """Replay and close one exact pre-deployment launch authority."""
         try:
             async with get_session() as session:
@@ -806,11 +1002,11 @@ class Gepetto:
                     "cleanup_required",
                 }:
                     return False
-                now = datetime.now(timezone.utc)
-                next_retry_at = getattr(intent, "next_retry_at", None)
-                if next_retry_at is not None and next_retry_at > now:
-                    return False
                 self._validated_launch_intent(intent)
+                self._require_live_launch_intent_lease(intent, lease_owner)
+                intent.retry_lease_expires_at = datetime.now(
+                    timezone.utc
+                ) + timedelta(seconds=LEASE_SECONDS)
                 phase = intent.phase
                 chute_id = intent.chute_id
                 server_id = intent.server_id
@@ -820,6 +1016,7 @@ class Gepetto:
                 job_cleanup_only = bool(getattr(intent, "job_cleanup_only", False))
                 job_release_ack = intent.job_release_ack
                 stable_response = dict(intent.response_payload or {})
+                await session.commit()
 
             # An exact request replay closes the response-loss window. The
             # replayed JWT stays in memory and is intentionally discarded.
@@ -835,17 +1032,23 @@ class Gepetto:
                     intent_id=intent_id,
                     deployment_id=deployment_id,
                 )
-                await self._record_launch_response(intent_id, payload)
+                await self._record_launch_response(
+                    intent_id,
+                    payload,
+                    lease_owner=lease_owner,
+                )
                 stable_response = {
                     "config_id": payload["config_id"],
                     "registry": payload.get("registry"),
                 }
             config_id = stable_response.get("config_id")
             if config_id:
+                await self._renew_launch_intent_lease(intent_id, lease_owner)
                 await self._revoke_registry_scope(
                     validator_hotkey, config_id, server_id
                 )
             if job_id and job_release_ack is None:
+                await self._renew_launch_intent_lease(intent_id, lease_owner)
                 job_release_ack = await self._release_job_exact(
                     validator_hotkey,
                     job_id,
@@ -857,73 +1060,133 @@ class Gepetto:
                     with_for_update=True,
                 )
                 self._validated_launch_intent(current)
-                if current and current.phase in {
+                self._require_live_launch_intent_lease(current, lease_owner)
+                if current.phase not in {
                     "response_persisted",
                     "registry_acked",
                     "cleanup_required",
                 }:
-                    if job_id:
-                        if job_release_ack is None:
-                            raise DeploymentFailure(
-                                "launch intent cleanup lacks validator job release ACK"
-                            )
-                        current.job_release_ack = job_release_ack
-                        current.job_released_at = datetime.now(timezone.utc)
-                    current.phase = "completed"
-                    current.completed_at = datetime.now(timezone.utc)
-                    current.last_failure = None
-                    current.next_retry_at = None
-                    await session.commit()
-                    return True
-            return False
+                    return False
+                if job_id:
+                    if job_release_ack is None:
+                        raise DeploymentFailure(
+                            "launch intent cleanup lacks validator job release ACK"
+                        )
+                    current.job_release_ack = job_release_ack
+                    current.job_released_at = datetime.now(timezone.utc)
+                current.phase = "completed"
+                current.completed_at = datetime.now(timezone.utc)
+                current.last_failure = None
+                current.next_retry_at = None
+                current.retry_lease_owner = None
+                current.retry_lease_expires_at = None
+                await session.commit()
+                return True
         except Exception as exc:
-            await self._record_launch_intent_failure(intent_id, exc)
+            try:
+                await self._record_launch_intent_failure(
+                    intent_id,
+                    exc,
+                    lease_owner=lease_owner,
+                )
+            except DeploymentFailure as fence_error:
+                logger.error(
+                    f"Refusing stale launch cleanup mutation for {intent_id}: "
+                    f"{fence_error}"
+                )
             logger.warning(
                 f"Durable launch intent {intent_id} cleanup paused for retry: {exc}"
             )
             return False
 
-    async def _launch_intent_ids(self, phases: set[str]) -> list[str]:
+    async def _claim_launch_intents(
+        self,
+        phases: set[str],
+    ) -> list[tuple[str, str]]:
+        """Claim only due, abandoned work with a durable skip-locked lease."""
+
         now = datetime.now(timezone.utc)
         async with get_session() as session:
-            return list(
-                (
-                    await session.execute(
-                        select(MinerLaunchIntent.intent_id).where(
-                            MinerLaunchIntent.phase.in_(phases),
-                            (
-                                MinerLaunchIntent.next_retry_at.is_(None)
-                                | (MinerLaunchIntent.next_retry_at <= now)
-                            ),
-                        )
-                    )
-                ).scalars()
+            result = await session.execute(
+                select(MinerLaunchIntent)
+                .where(
+                    MinerLaunchIntent.phase.in_(phases),
+                    or_(
+                        MinerLaunchIntent.next_retry_at.is_(None),
+                        MinerLaunchIntent.next_retry_at <= now,
+                    ),
+                    or_(
+                        and_(
+                            MinerLaunchIntent.retry_lease_owner.is_(None),
+                            MinerLaunchIntent.retry_lease_expires_at.is_(None),
+                        ),
+                        MinerLaunchIntent.retry_lease_expires_at <= now,
+                    ),
+                )
+                .order_by(
+                    MinerLaunchIntent.created_at,
+                    MinerLaunchIntent.intent_id,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(RESUME_CONCURRENCY)
             )
+            intents = list(result.scalars())
+            claims: list[tuple[str, str]] = []
+            for intent in intents:
+                lease_owner = self._launch_intent_lease_owner("recovery")
+                intent.retry_lease_owner = lease_owner
+                intent.retry_lease_expires_at = now + timedelta(
+                    seconds=LEASE_SECONDS
+                )
+                intent.attempt_count += 1
+                intent.next_retry_at = None
+                claims.append((intent.intent_id, lease_owner))
+            await session.commit()
+            return claims
 
     async def resume_launch_intents(self) -> None:
         """Close pre-deployment launch authority left by a crashed worker."""
-        intent_ids = await self._launch_intent_ids(
+        claims = await self._claim_launch_intents(
             {"pending", "response_persisted", "registry_acked", "cleanup_required"}
         )
-        semaphore = asyncio.Semaphore(RESUME_CONCURRENCY)
 
-        async def resume_one(intent_id: str) -> None:
-            async with semaphore:
+        async def resume_one(intent_id: str, lease_owner: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._resume_launch_intent(
+                        intent_id,
+                        lease_owner=lease_owner,
+                    ),
+                    timeout=RESUME_ITEM_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
                 try:
-                    await asyncio.wait_for(
-                        self._resume_launch_intent(intent_id),
-                        timeout=RESUME_ITEM_TIMEOUT_SECONDS,
+                    await self._record_launch_intent_failure(
+                        intent_id,
+                        exc,
+                        lease_owner=lease_owner,
                     )
-                except TimeoutError as exc:
-                    await self._record_launch_intent_failure(intent_id, exc)
+                except DeploymentFailure as fence_error:
+                    logger.error(
+                        f"Refusing stale timed-out launch mutation for {intent_id}: "
+                        f"{fence_error}"
+                    )
 
-        await asyncio.gather(*(resume_one(intent_id) for intent_id in intent_ids))
+        await asyncio.gather(
+            *(resume_one(intent_id, lease_owner) for intent_id, lease_owner in claims)
+        )
 
     async def resume_aborted_launch_intents(self) -> None:
         """Retry only explicitly aborted intents during live reconciliation."""
         await self.resume_launch_intents()
 
-    async def abort_launch_intent(self, intent_id: str) -> bool:
+    async def abort_launch_intent(
+        self,
+        intent_id: str,
+        *,
+        lease_owner: str,
+        failure: BaseException | None = None,
+    ) -> bool:
         """Persist an exact abort before revoking registry and job authority."""
         async with get_session() as session:
             intent = await session.get(
@@ -934,11 +1197,22 @@ class Gepetto:
             if intent is None or intent.phase in {"consumed", "completed", "failed"}:
                 return False
             self._validated_launch_intent(intent)
+            self._require_live_launch_intent_lease(intent, lease_owner)
             intent.phase = "cleanup_required"
-            intent.last_failure = None
+            intent.last_failure = (
+                f"{type(failure).__name__}: {failure}"[:8000]
+                if failure is not None
+                else None
+            )
             intent.next_retry_at = None
+            intent.retry_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=LEASE_SECONDS
+            )
             await session.commit()
-        return await self._resume_launch_intent(intent_id)
+        return await self._resume_launch_intent(
+            intent_id,
+            lease_owner=lease_owner,
+        )
 
     async def _revoke_registry_scope(
         self,
@@ -1017,7 +1291,10 @@ class Gepetto:
         deployment_id: str,
     ) -> dict[str, Any]:
         """Replay one persisted validator request without recomputing its lineage."""
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            raise_for_status=False,
+            timeout=LAUNCH_AUTHORITY_HTTP_TIMEOUT,
+        ) as session:
             headers, _ = sign_request(purpose="launch")
             params = {"chute_id": chute_id, "server_id": server_id}
             if job_id:
@@ -1094,8 +1371,13 @@ class Gepetto:
         if (validator := validator_by_hotkey(chute.validator)) is None:
             raise DeploymentFailure(f"Validator not found: {chute.validator}")
         deployment_id = deployment_id or str(uuid.uuid4())
+        lease_owner = self._launch_intent_lease_owner("producer")
         intent_id = await self._begin_launch_intent(
-            chute, server, job_id, deployment_id
+            chute,
+            server,
+            job_id,
+            deployment_id,
+            lease_owner=lease_owner,
         )
         try:
             payload = await self._fetch_launch_config(
@@ -1106,23 +1388,50 @@ class Gepetto:
                 intent_id=intent_id,
                 deployment_id=deployment_id,
             )
-            await self._record_launch_response(intent_id, payload)
+            await self._record_launch_response(
+                intent_id,
+                payload,
+                lease_owner=lease_owner,
+            )
             registry_ack = await self._register_registry_scope(
                 validator,
                 server,
                 payload,
             )
-            await self._record_registry_ack(intent_id, registry_ack)
+            await self._record_registry_ack(
+                intent_id,
+                registry_ack,
+                lease_owner=lease_owner,
+            )
             payload["_miner_launch_request_id"] = intent_id
             payload["_miner_deployment_id"] = deployment_id
+            payload["_miner_launch_lease_owner"] = lease_owner
             return payload
         except DeploymentFailure as exc:
-            await self._record_launch_intent_failure(intent_id, exc)
-            await self.abort_launch_intent(intent_id)
+            try:
+                await self.abort_launch_intent(
+                    intent_id,
+                    lease_owner=lease_owner,
+                    failure=exc,
+                )
+            except DeploymentFailure as cleanup_exc:
+                logger.error(
+                    f"Launch cleanup lost its durable fence for {intent_id}: "
+                    f"{cleanup_exc}"
+                )
             raise
         except Exception as exc:
-            await self._record_launch_intent_failure(intent_id, exc)
-            await self.abort_launch_intent(intent_id)
+            try:
+                await self.abort_launch_intent(
+                    intent_id,
+                    lease_owner=lease_owner,
+                    failure=exc,
+                )
+            except DeploymentFailure as cleanup_exc:
+                logger.error(
+                    f"Launch cleanup lost its durable fence for {intent_id}: "
+                    f"{cleanup_exc}"
+                )
             logger.warning(f"Unable to fetch launch config token: {exc}")
             raise DeploymentFailure(f"Failed to fetch JWT for launch: {exc}") from exc
 
@@ -1379,7 +1688,10 @@ class Gepetto:
         validator = validator_by_hotkey(validator_hotkey)
         if validator is None:
             raise DeploymentFailure("Validator job owner is unavailable")
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            raise_for_status=False,
+            timeout=LAUNCH_AUTHORITY_HTTP_TIMEOUT,
+        ) as session:
             headers, _ = sign_request(purpose="miner")
             async with session.delete(
                 f"{validator.api}/miner/jobs/{job_id}",
@@ -1467,12 +1779,23 @@ class Gepetto:
                 server,
                 job_id=job_id,
             )
-            extra_ports = await self._get_job_extra_services(chute)
+            async with self._launch_intent_lease_guard(
+                launch_token["_miner_launch_request_id"],
+                launch_token["_miner_launch_lease_owner"],
+            ):
+                extra_ports = await self._get_job_extra_services(chute)
+            await self._renew_launch_intent_lease(
+                launch_token["_miner_launch_request_id"],
+                launch_token["_miner_launch_lease_owner"],
+            )
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 server.server_id,
                 token=launch_token["token"],
                 launch_intent_id=launch_token["_miner_launch_request_id"],
+                launch_intent_lease_owner=launch_token[
+                    "_miner_launch_lease_owner"
+                ],
                 config_id=launch_token["config_id"],
                 registry_repository=(launch_token.get("registry") or {}).get(
                     "repository"
@@ -1498,14 +1821,26 @@ class Gepetto:
                     deployment.deployment_id, reason="job_launch_failure"
                 )
             elif launch_token:
-                await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
+                await self.abort_launch_intent(
+                    launch_token["_miner_launch_request_id"],
+                    lease_owner=launch_token["_miner_launch_lease_owner"],
+                    failure=exc,
+                )
             elif not token_requested:
+                cleanup_lease_owner = self._launch_intent_lease_owner(
+                    "job-cleanup"
+                )
                 cleanup_intent_id = await self._begin_job_cleanup_intent(
                     chute,
                     server,
                     job_id,
+                    lease_owner=cleanup_lease_owner,
                 )
-                await self.abort_launch_intent(cleanup_intent_id)
+                await self.abort_launch_intent(
+                    cleanup_intent_id,
+                    lease_owner=cleanup_lease_owner,
+                    failure=exc,
+                )
 
     async def chute_updated(self, event_data: Dict[str, Any]):
         """
@@ -2093,11 +2428,18 @@ class Gepetto:
                 launch_token = None
                 try:
                     launch_token = await self.get_launch_token(chute, server)
+                    await self._renew_launch_intent_lease(
+                        launch_token["_miner_launch_request_id"],
+                        launch_token["_miner_launch_lease_owner"],
+                    )
                     deployment, _ = await k8s.deploy_chute(
                         chute.chute_id,
                         server_id,
                         token=launch_token["token"],
                         launch_intent_id=launch_token["_miner_launch_request_id"],
+                        launch_intent_lease_owner=launch_token[
+                            "_miner_launch_lease_owner"
+                        ],
                         config_id=launch_token["config_id"],
                         registry_repository=(launch_token.get("registry") or {}).get(
                             "repository"
@@ -2121,7 +2463,11 @@ class Gepetto:
                         )
                     elif launch_token:
                         await self.abort_launch_intent(
-                            launch_token["_miner_launch_request_id"]
+                            launch_token["_miner_launch_request_id"],
+                            lease_owner=launch_token[
+                                "_miner_launch_lease_owner"
+                            ],
+                            failure=exc,
                         )
                     return
 
@@ -2535,29 +2881,49 @@ class Gepetto:
 
         # Do the preemption.
         try:
-            if to_preempt:
-                logger.info(
-                    f"Preempting deployments to make room for {chute.chute_id=}: {to_preempt}"
+            async with self._launch_intent_lease_guard(
+                launch_token["_miner_launch_request_id"],
+                launch_token["_miner_launch_lease_owner"],
+            ):
+                if to_preempt:
+                    logger.info(
+                        f"Preempting deployments to make room for {chute.chute_id=}: {to_preempt}"
+                    )
+                    for deployment_id in to_preempt:
+                        if not await self.undeploy(
+                            deployment_id,
+                            reason="preemption",
+                        ):
+                            raise DeploymentFailure(
+                                f"preempted deployment {deployment_id} remains in teardown"
+                            )
+                extra_ports = (
+                    await self._get_job_extra_services(chute) if job_id else []
                 )
-                for deployment_id in to_preempt:
-                    if not await self.undeploy(deployment_id, reason="preemption"):
-                        raise DeploymentFailure(
-                            f"preempted deployment {deployment_id} remains in teardown"
-                        )
         except Exception as exc:
             logger.error(f"Unexpected error preempting deployments: {exc}")
-            await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
+            await self.abort_launch_intent(
+                launch_token["_miner_launch_request_id"],
+                lease_owner=launch_token["_miner_launch_lease_owner"],
+                failure=exc,
+            )
             return False
 
         # Deploy on our target server.
         deployment = None
         try:
-            extra_ports = await self._get_job_extra_services(chute) if job_id else []
+            await self._renew_launch_intent_lease(
+                launch_token["_miner_launch_request_id"],
+                launch_token["_miner_launch_lease_owner"],
+            )
             deployment, k8s_dep = await k8s.deploy_chute(
                 chute.chute_id,
                 target_server.server_id,
                 token=launch_token["token"],
                 launch_intent_id=launch_token["_miner_launch_request_id"],
+                launch_intent_lease_owner=launch_token[
+                    "_miner_launch_lease_owner"
+                ],
                 config_id=launch_token["config_id"],
                 registry_repository=(launch_token.get("registry") or {}).get(
                     "repository"
@@ -2586,7 +2952,11 @@ class Gepetto:
                     reason="preemption_launch_failure",
                 )
             else:
-                await self.abort_launch_intent(launch_token["_miner_launch_request_id"])
+                await self.abort_launch_intent(
+                    launch_token["_miner_launch_request_id"],
+                    lease_owner=launch_token["_miner_launch_lease_owner"],
+                    failure=exc,
+                )
         return False
 
     async def scale_chute(
@@ -2659,12 +3029,19 @@ class Gepetto:
                                 chute,
                                 server,
                             )
+                            await self._renew_launch_intent_lease(
+                                launch_token["_miner_launch_request_id"],
+                                launch_token["_miner_launch_lease_owner"],
+                            )
                             deployment, _ = await k8s.deploy_chute(
                                 chute.chute_id,
                                 server.server_id,
                                 token=launch_token["token"],
                                 launch_intent_id=launch_token[
                                     "_miner_launch_request_id"
+                                ],
+                                launch_intent_lease_owner=launch_token[
+                                    "_miner_launch_lease_owner"
                                 ],
                                 config_id=launch_token["config_id"],
                                 registry_repository=(
@@ -2692,7 +3069,11 @@ class Gepetto:
                                 )
                             elif launch_token:
                                 await self.abort_launch_intent(
-                                    launch_token["_miner_launch_request_id"]
+                                    launch_token["_miner_launch_request_id"],
+                                    lease_owner=launch_token[
+                                        "_miner_launch_lease_owner"
+                                    ],
+                                    failure=exc,
                                 )
                             scaled = False
                             break

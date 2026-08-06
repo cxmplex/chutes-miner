@@ -527,6 +527,8 @@ class MinerLaunchIntent(Base):
     job_release_ack = Column(JSONB, nullable=True)
     job_released_at = Column(DateTime(timezone=True), nullable=True)
     deployment_id = Column(String, nullable=True)
+    retry_lease_owner = Column(String, nullable=True)
+    retry_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     next_retry_at = Column(DateTime(timezone=True), nullable=True)
     last_failure = Column(Text, nullable=True)
@@ -572,6 +574,12 @@ class MinerLaunchIntent(Base):
             name="ck_miner_launch_intent_job_ack",
         ),
         CheckConstraint(
+            "(retry_lease_owner IS NULL) = (retry_lease_expires_at IS NULL) "
+            "AND (phase NOT IN ('consumed', 'completed', 'failed') "
+            "OR retry_lease_owner IS NULL)",
+            name="ck_miner_launch_intent_retry_lease",
+        ),
+        CheckConstraint(
             "NOT job_cleanup_only OR (job_id IS NOT NULL "
             "AND response_payload IS NULL AND response_sha256 IS NULL "
             "AND token_sha256 IS NULL AND registry_ack IS NULL "
@@ -585,6 +593,13 @@ class MinerLaunchIntent(Base):
         Index(
             "miner_launch_intent_recovery_idx",
             "phase",
+            "created_at",
+            postgresql_where=text("phase NOT IN ('completed', 'failed')"),
+        ),
+        Index(
+            "miner_launch_intent_next_retry_idx",
+            "next_retry_at",
+            "retry_lease_expires_at",
             "created_at",
             postgresql_where=text("phase NOT IN ('completed', 'failed')"),
         ),

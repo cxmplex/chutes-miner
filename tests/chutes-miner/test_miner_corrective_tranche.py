@@ -599,12 +599,17 @@ def test_registry_workload_token_file_is_strict_and_fail_closed(tmp_path):
 @pytest.mark.asyncio
 async def test_bounded_launch_resume_isolates_hung_and_failed_items(monkeypatch):
     coordinator = object.__new__(gepetto_module.Gepetto)
-    coordinator._launch_intent_ids = AsyncMock(
-        return_value=["hung", "failed", "healthy"]
+    coordinator._claim_launch_intents = AsyncMock(
+        return_value=[
+            ("hung", "lease-hung"),
+            ("failed", "lease-failed"),
+            ("healthy", "lease-healthy"),
+        ]
     )
     completed: list[str] = []
 
-    async def resume(intent_id: str) -> bool:
+    async def resume(intent_id: str, *, lease_owner: str) -> bool:
+        assert lease_owner == f"lease-{intent_id}"
         if intent_id == "hung":
             await asyncio.Event().wait()
         if intent_id == "failed":
@@ -624,6 +629,9 @@ async def test_bounded_launch_resume_isolates_hung_and_failed_items(monkeypatch)
         coordinator._record_launch_intent_failure.await_args.args[1],
         TimeoutError,
     )
+    assert coordinator._record_launch_intent_failure.await_args.kwargs == {
+        "lease_owner": "lease-hung"
+    }
 
 
 @pytest.mark.asyncio
@@ -1530,7 +1538,26 @@ def test_broad_chutes_service_account_is_used_only_by_api_and_gepetto():
 def test_corrective_schema_and_migration_are_durable():
     assert "next_retry_at" in Base.metadata.tables["deployment_teardown_operations"].c
     assert "next_retry_at" in Base.metadata.tables["deployment_launch_operations"].c
-    assert "next_retry_at" in Base.metadata.tables["miner_launch_intents"].c
+    launch_intents = Base.metadata.tables["miner_launch_intents"]
+    assert {
+        "next_retry_at",
+        "retry_lease_owner",
+        "retry_lease_expires_at",
+    }.issubset(launch_intents.c.keys())
+    assert any(
+        constraint.name == "ck_miner_launch_intent_retry_lease"
+        for constraint in launch_intents.constraints
+    )
+    retry_index = next(
+        index
+        for index in launch_intents.indexes
+        if index.name == "miner_launch_intent_next_retry_idx"
+    )
+    assert [column.name for column in retry_index.columns] == [
+        "next_retry_at",
+        "retry_lease_expires_at",
+        "created_at",
+    ]
     assert (
         "validator_server_decommission_request"
         in Base.metadata.tables["parent_deletion_operations"].c
@@ -1543,3 +1570,6 @@ def test_corrective_schema_and_migration_are_durable():
     assert "prevent_teardown_lineage_resolution_audit_mutation" in migration
     assert "validator_server_decommission_request_sha256" in migration
     assert "next_retry_at" in migration
+    assert "ck_miner_launch_intent_retry_lease" in migration
+    assert "retry_lease_expires_at" in migration
+    assert "miner_launch_intent_next_retry_idx" in migration

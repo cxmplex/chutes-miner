@@ -10,7 +10,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from kubernetes.client import V1PodList
 from kubernetes.client.rest import ApiException
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # Import the module under test
 from chutes_common.schemas.deployment import Deployment
@@ -70,6 +70,10 @@ def _mock_durable_launch(
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
             deployment_id=deployment_id,
             last_failure=None,
+            next_retry_at=None,
+            retry_lease_owner="lease-1",
+            retry_lease_expires_at=datetime.now(timezone.utc)
+            + timedelta(minutes=5),
         )
     )
 
@@ -529,6 +533,7 @@ async def test_deploy_chute_success(
             sample_server,
             token="launch-token",
             launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
             config_id="config-1",
         )
 
@@ -631,6 +636,7 @@ async def test_deploy_chute_deployment_disappeared(
                 sample_server,
                 token="launch-token",
                 launch_intent_id="launch-intent-1",
+                launch_intent_lease_owner="lease-1",
                 config_id="config-1",
             )
     rollback.assert_awaited_once()
@@ -693,6 +699,7 @@ async def test_deploy_chute_api_exception(
                 sample_server,
                 token="launch-token",
                 launch_intent_id="launch-intent-1",
+                launch_intent_lease_owner="lease-1",
                 config_id="config-1",
             )
     rollback.assert_awaited_once()

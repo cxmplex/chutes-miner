@@ -169,6 +169,10 @@ def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
         "job_release_ack",
         "job_released_at",
         "deployment_id",
+        "retry_lease_owner",
+        "retry_lease_expires_at",
+        "attempt_count",
+        "next_retry_at",
         "last_failure",
         "completed_at",
     }.issubset(intent.c.keys())
@@ -179,6 +183,23 @@ def test_miner_launch_intent_is_durable_and_has_one_active_lineage():
     assert "phase NOT IN ('completed', 'failed')" in str(
         active_index.dialect_options["postgresql"]["where"]
     )
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in intent.constraints
+        if hasattr(constraint, "sqltext")
+    }
+    assert "ck_miner_launch_intent_retry_lease" in constraints
+    assert "retry_lease_owner IS NULL" in constraints[
+        "ck_miner_launch_intent_retry_lease"
+    ]
+    retry_index = next(
+        index for index in intent.indexes if index.name == "miner_launch_intent_next_retry_idx"
+    )
+    assert [column.name for column in retry_index.columns] == [
+        "next_retry_at",
+        "retry_lease_expires_at",
+        "created_at",
+    ]
     assert _ondelete("deployment_launch_operations", "launch_intent_id") == "RESTRICT"
 
 
