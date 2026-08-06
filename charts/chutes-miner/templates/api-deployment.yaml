@@ -34,6 +34,8 @@ spec:
     spec:
       serviceAccountName: chutes
       securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         supplementalGroups:
           - 2000
       {{- with .Values.minerApi.nodeSelector }}
@@ -114,6 +116,8 @@ spec:
               value: {{ required "seedlessStack.attestedCertPath is required" .Values.seedlessStack.attestedCertPath | quote }}
             - name: CHUTES_ATTESTED_KEY_FILE
               value: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath | quote }}
+            - name: CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE
+              value: /var/run/secrets/chutes-registry-workload/token
             - name: GPU_TEE_ONLY
               value: "true"
             - name: CHUTES_REQUIRE_V2_MANAGEMENT_SIGNATURES
@@ -147,6 +151,9 @@ spec:
               readOnly: true
             - name: chutes-gpu-attested-key
               mountPath: {{ required "seedlessStack.attestedKeyPath is required" .Values.seedlessStack.attestedKeyPath }}
+              readOnly: true
+            - name: registry-workload-auth
+              mountPath: /var/run/secrets/chutes-registry-workload
               readOnly: true
           {{ if .Values.multiCluster }}
             - name: shared-data
@@ -203,6 +210,13 @@ spec:
           hostPath:
             path: {{ required "seedlessStack.attestedKeyHostPath is required" .Values.seedlessStack.attestedKeyHostPath }}
             type: File
+        - name: registry-workload-auth
+          secret:
+            secretName: {{ required "registryWorkloadAuth.existingSecret is required" .Values.registryWorkloadAuth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token
       {{ if .Values.multiCluster }}
         - name: shared-data
           emptyDir: {}

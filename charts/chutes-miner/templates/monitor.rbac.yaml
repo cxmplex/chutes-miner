@@ -1,0 +1,30 @@
+{{ if and .Values.multiCluster .Values.monitor.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chutes-monitor
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chutes-monitor
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chutes-monitor
+subjects:
+  - kind: ServiceAccount
+    name: chutes-monitor
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chutes-monitor
+{{- end }}

@@ -11,12 +11,14 @@ spec:
     spec:
       template:
         spec:
-          serviceAccountName: chutes
+          serviceAccountName: failed-chute-cleanup
           automountServiceAccountToken: false
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             runAsGroup: 1000
+            fsGroup: 1000
+            fsGroupChangePolicy: OnRootMismatch
           {{- if not .Values.multiCluster}}
           nodeSelector:
             chutes/seedless-control-plane: "true"
@@ -24,6 +26,7 @@ spec:
           volumes:
           - name: kube-api-access
             projected:
+              defaultMode: 0440
               sources:
               - serviceAccountToken:
                   expirationSeconds: 3607
@@ -43,6 +46,11 @@ spec:
           - name: cleanup
             image: {{ .Values.failedChuteCleanup.image }}
             imagePullPolicy: {{ .Values.failedChuteCleanup.imagePullPolicy | default "Always" }}
+            env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             resources:
               requests:
                 cpu: "250m"

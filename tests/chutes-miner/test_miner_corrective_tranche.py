@@ -1094,6 +1094,59 @@ def _render_template(
     return subprocess.run(command, check=False, capture_output=True, text=True)
 
 
+def _render_copied_chart_template(
+    chart_path: Path, template: str, *extra: str
+) -> subprocess.CompletedProcess[str]:
+    if shutil.which("helm"):
+        command = ["helm"]
+        rendered_chart_path = str(chart_path)
+    elif (
+        shutil.which("docker")
+        and subprocess.run(
+            ["docker", "image", "inspect", "alpine/helm:latest"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    ):
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{chart_path}:/chart:ro",
+            "alpine/helm:latest",
+        ]
+        rendered_chart_path = "/chart"
+    else:
+        pytest.skip("neither Helm nor the local alpine/helm image is available")
+    command.extend(
+        [
+            "template",
+            "chutes-miner",
+            rendered_chart_path,
+            "--namespace",
+            "chutes",
+            "--show-only",
+            f"templates/{template}",
+            "--set-string",
+            f"seedlessStack.image={STACK_IMAGE}",
+            "--set-string",
+            "minerCredentials.ownerSs58=fixture-owner",
+            *extra,
+        ]
+    )
+    return subprocess.run(command, check=False, capture_output=True, text=True)
+
+
+def _workload_pod_spec(document: dict) -> dict | None:
+    if document["kind"] in {"Deployment", "DaemonSet", "StatefulSet", "Job"}:
+        return document["spec"]["template"]["spec"]
+    if document["kind"] == "CronJob":
+        return document["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    return None
+
+
 def _render_chart(chart: str, *extra: str) -> subprocess.CompletedProcess[str]:
     if shutil.which("helm"):
         command = ["helm"]
@@ -1125,6 +1178,8 @@ def _render_chart(chart: str, *extra: str) -> subprocess.CompletedProcess[str]:
             "template",
             chart,
             chart_path,
+            "--namespace",
+            "chutes",
             "--set-string",
             f"seedlessStack.image={STACK_IMAGE}",
             "--set-string",
@@ -1140,6 +1195,7 @@ def _render_chart(chart: str, *extra: str) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize(
     ("chart", "template"),
     [
+        ("chutes-miner", "api-deployment.yaml"),
         ("chutes-miner", "gepetto-deployment.yaml"),
         ("chutes-miner-gpu", "registry-daemonset.yaml"),
     ],
@@ -1192,16 +1248,18 @@ def test_decommission_callers_cannot_render_without_current_mtls(template):
 
 
 def test_chart_mounts_exact_credentials_with_dedicated_supplemental_gid():
-    for chart, template in (
-        ("chutes-miner", "api-deployment.yaml"),
-        ("chutes-miner", "gepetto-deployment.yaml"),
-        ("chutes-miner-gpu", "registry-daemonset.yaml"),
+    for chart, template, credential_gid in (
+        ("chutes-miner", "api-deployment.yaml", 65532),
+        ("chutes-miner", "gepetto-deployment.yaml", 65532),
+        ("chutes-miner-gpu", "registry-daemonset.yaml", 1000),
     ):
         result = _render_template(chart, template)
         assert result.returncode == 0, result.stderr
         document = next(item for item in yaml.safe_load_all(result.stdout) if item)
         pod = document["spec"]["template"]["spec"]
         assert 2000 in pod["securityContext"]["supplementalGroups"]
+        assert pod["securityContext"]["fsGroup"] == credential_gid
+        assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch"
         host_paths = {
             volume["hostPath"]["path"]
             for volume in pod["volumes"]
@@ -1211,63 +1269,262 @@ def test_chart_mounts_exact_credentials_with_dedicated_supplemental_gid():
         assert "/run/chutes-gpu/credentials/runtime-session.json" in host_paths
 
 
-def test_workload_token_mount_is_confined_to_gepetto_and_registry_auth():
-    gepetto = _render_template("chutes-miner", "gepetto-deployment.yaml")
-    registry = _render_template("chutes-miner-gpu", "registry-daemonset.yaml")
-    assert gepetto.returncode == registry.returncode == 0
-    gepetto_pod = next(yaml.safe_load_all(gepetto.stdout))["spec"]["template"]["spec"]
-    registry_pod = next(yaml.safe_load_all(registry.stdout))["spec"]["template"]["spec"]
+def test_workload_token_mount_is_confined_to_exact_three_consumers():
+    miner = _render_chart("chutes-miner")
+    gpu = _render_chart("chutes-miner-gpu")
+    assert miner.returncode == gpu.returncode == 0
 
-    gepetto_container = gepetto_pod["containers"][0]
-    auth_container = registry_pod["initContainers"][0]
-    nginx_container = registry_pod["containers"][0]
-    for container in (gepetto_container, auth_container):
-        assert any(
-            item["name"] == "registry-workload-auth"
-            and item["mountPath"] == "/var/run/secrets/chutes-registry-workload"
-            and item["readOnly"] is True
-            for item in container["volumeMounts"]
-        )
-        assert any(
-            item["name"] == "CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE"
-            and item["value"] == "/var/run/secrets/chutes-registry-workload/token"
-            for item in container["env"]
-        )
-    assert all(
-        item["name"] != "registry-workload-auth"
-        for item in nginx_container.get("volumeMounts", [])
+    consumers: set[tuple[str, str]] = set()
+    for document in [
+        *yaml.safe_load_all(miner.stdout),
+        *yaml.safe_load_all(gpu.stdout),
+    ]:
+        if not document or not (pod := _workload_pod_spec(document)):
+            continue
+        containers = [
+            *pod.get("initContainers", []),
+            *pod.get("containers", []),
+        ]
+        pod_consumers = []
+        for container in containers:
+            mounts = container.get("volumeMounts", [])
+            env = container.get("env", [])
+            has_mount = any(
+                item["name"] == "registry-workload-auth"
+                and item["mountPath"] == "/var/run/secrets/chutes-registry-workload"
+                and item["readOnly"] is True
+                for item in mounts
+            )
+            has_env = any(
+                item["name"] == "CHUTES_REGISTRY_WORKLOAD_TOKEN_FILE"
+                and item["value"] == "/var/run/secrets/chutes-registry-workload/token"
+                for item in env
+            )
+            assert has_mount is has_env
+            if has_mount:
+                identity = (document["metadata"]["name"], container["name"])
+                consumers.add(identity)
+                pod_consumers.append(identity)
+
+        volumes = [
+            item
+            for item in pod.get("volumes", [])
+            if item["name"] == "registry-workload-auth"
+        ]
+        assert bool(volumes) is bool(pod_consumers)
+        if volumes:
+            assert volumes == [
+                {
+                    "name": "registry-workload-auth",
+                    "secret": {
+                        "secretName": "registry-workload-auth",
+                        "defaultMode": 288,
+                        "items": [{"key": "token", "path": "token"}],
+                    },
+                }
+            ]
+
+    assert consumers == {
+        ("api", "api"),
+        ("gepetto", "api"),
+        ("registry", "auth"),
+    }
+
+
+def test_cleanup_uses_dedicated_exact_rbac_and_projected_token():
+    rbac = _render_template(
+        "chutes-miner-gpu",
+        "failed-chute-cleanup.rbac.yaml",
+        "--namespace",
+        "chutes",
     )
-    for pod in (gepetto_pod, registry_pod):
-        volume = next(
-            item for item in pod["volumes"] if item["name"] == "registry-workload-auth"
-        )
-        assert volume["secret"] == {
-            "secretName": "registry-workload-auth",
-            "defaultMode": 288,
-            "items": [{"key": "token", "path": "token"}],
+    cron = _render_template(
+        "chutes-miner-gpu",
+        "failed-chute-cleanup-cronjob.yaml",
+        "--namespace",
+        "chutes",
+    )
+    assert rbac.returncode == cron.returncode == 0
+    documents = [item for item in yaml.safe_load_all(rbac.stdout) if item]
+    account = next(item for item in documents if item["kind"] == "ServiceAccount")
+    role = next(item for item in documents if item["kind"] == "Role")
+    binding = next(item for item in documents if item["kind"] == "RoleBinding")
+    assert account["metadata"]["name"] == "failed-chute-cleanup"
+    assert account["automountServiceAccountToken"] is False
+    assert role["rules"] == [
+        {
+            "apiGroups": [""],
+            "resources": ["pods"],
+            "verbs": ["list", "delete"],
+        },
+        {
+            "apiGroups": [""],
+            "resources": ["services"],
+            "verbs": ["get", "list", "delete"],
+        },
+        {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["list"]},
+    ]
+    assert binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "failed-chute-cleanup",
+            "namespace": "chutes",
         }
+    ]
 
-    absent_templates = (
-        ("chutes-miner", "api-deployment.yaml", ()),
-        ("chutes-miner", "postgres-deployment.yaml", ()),
-        ("chutes-miner", "redis-deployment.yaml", ()),
-        ("chutes-miner-gpu", "failed-chute-cleanup-cronjob.yaml", ()),
+    pod = next(yaml.safe_load_all(cron.stdout))["spec"]["jobTemplate"]["spec"][
+        "template"
+    ]["spec"]
+    assert pod["serviceAccountName"] == "failed-chute-cleanup"
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["fsGroup"] == 1000
+    assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch"
+    container = pod["containers"][0]
+    assert container["env"] == [
+        {
+            "name": "NAMESPACE",
+            "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+        }
+    ]
+    assert container["volumeMounts"] == [
+        {
+            "name": "kube-api-access",
+            "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+            "readOnly": True,
+        }
+    ]
+    cleanup_script = (ROOT / "docker/chutes-failed-chute-cleanup/cleanup.sh").read_text(
+        encoding="utf-8"
     )
-    for chart, template, extra in absent_templates:
-        rendered = _render_template(chart, template, *extra)
-        assert rendered.returncode == 0, rendered.stderr
-        assert "registry-workload-auth" not in rendered.stdout
-        assert "/var/run/secrets/chutes-registry-workload/token" not in rendered.stdout
-    # Monitor is deliberately disabled in the supported single-cluster render;
-    # its gated legacy template must remain free of the credential as well.
-    monitor_template = (
-        ROOT / "charts/chutes-miner/templates/monitor.deploy.yaml"
-    ).read_text(encoding="utf-8")
-    assert "registry-workload-auth" not in monitor_template
-    agent_template = (
-        ROOT / "charts/chutes-miner-gpu/templates/agent.deploy.yaml"
-    ).read_text(encoding="utf-8")
-    assert "registry-workload-auth" not in agent_template
+    assert cleanup_script.count("--wait=false") == 2
+
+
+def test_agent_secret_rbac_is_exact_and_cannot_enumerate_workload_token(tmp_path):
+    # Multi-cluster mode is intentionally unreachable in the seedless chart;
+    # isolate the dormant agent manifests from that registry fail gate so their
+    # future-facing authority stays regression tested.
+    chart_path = tmp_path / "chutes-miner-gpu"
+    shutil.copytree(ROOT / "charts/chutes-miner-gpu", chart_path)
+    (chart_path / "templates/registry-cm.yaml").unlink()
+    rendered = _render_copied_chart_template(
+        chart_path,
+        "agent.rbac.yaml",
+        "--set",
+        "multiCluster=true",
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    documents = [item for item in yaml.safe_load_all(rendered.stdout) if item]
+    secret_rules = [
+        (document, rule)
+        for document in documents
+        if document["kind"] in {"Role", "ClusterRole"}
+        for rule in document.get("rules", [])
+        if "secrets" in rule.get("resources", [])
+    ]
+    assert len(secret_rules) == 1
+    secret_role, secret_rule = secret_rules[0]
+    assert secret_role["metadata"] == {
+        "name": "agent-secret-access",
+        "namespace": "default",
+    }
+    assert secret_rule == {
+        "apiGroups": [""],
+        "resources": ["secrets"],
+        "resourceNames": ["miner-kubeconfig"],
+        "verbs": ["get"],
+    }
+    for document in documents:
+        for rule in document.get("rules", []):
+            assert "*" not in rule.get("resources", [])
+            assert "*" not in rule.get("verbs", [])
+            if "pods" in rule.get("resources", []):
+                assert "create" not in rule["verbs"]
+
+    deployment = _render_copied_chart_template(
+        chart_path,
+        "agent.deploy.yaml",
+        "--set",
+        "multiCluster=true",
+    )
+    assert deployment.returncode == 0, deployment.stderr
+    pod = next(yaml.safe_load_all(deployment.stdout))["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "agent"
+    assert "registry-workload-auth" not in deployment.stdout
+
+
+def test_legacy_monitor_uses_get_node_only_identity(tmp_path):
+    # The production chart rejects multi-cluster mode before rendering this
+    # legacy-gated workload. Render an otherwise exact temporary chart without
+    # that fail-closed API template so the dormant manifests remain tested.
+    chart_path = tmp_path / "chutes-miner"
+    shutil.copytree(ROOT / "charts/chutes-miner", chart_path)
+    (chart_path / "templates/api-deployment.yaml").unlink()
+
+    deployment = _render_copied_chart_template(
+        chart_path,
+        "monitor.deploy.yaml",
+        "--set",
+        "multiCluster=true",
+        "--set",
+        "monitor.enabled=true",
+    )
+    rbac = _render_copied_chart_template(
+        chart_path,
+        "monitor.rbac.yaml",
+        "--set",
+        "multiCluster=true",
+        "--set",
+        "monitor.enabled=true",
+    )
+    assert deployment.returncode == rbac.returncode == 0
+
+    pod = next(yaml.safe_load_all(deployment.stdout))["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "chutes-monitor"
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["fsGroup"] == 65532
+    assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch"
+    init_container = pod["initContainers"][0]
+    monitor_container = pod["containers"][0]
+    assert any(
+        mount["name"] == "monitor-kube-api-access"
+        and mount["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+        and mount["readOnly"] is True
+        for mount in init_container["volumeMounts"]
+    )
+    assert all(
+        mount["name"] != "monitor-kube-api-access"
+        for mount in monitor_container["volumeMounts"]
+    )
+    assert "registry-workload-auth" not in deployment.stdout
+
+    documents = [item for item in yaml.safe_load_all(rbac.stdout) if item]
+    account = next(item for item in documents if item["kind"] == "ServiceAccount")
+    role = next(item for item in documents if item["kind"] == "ClusterRole")
+    binding = next(item for item in documents if item["kind"] == "ClusterRoleBinding")
+    assert account["metadata"]["name"] == "chutes-monitor"
+    assert account["automountServiceAccountToken"] is False
+    assert role["rules"] == [
+        {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}
+    ]
+    assert binding["subjects"] == [
+        {"kind": "ServiceAccount", "name": "chutes-monitor", "namespace": "chutes"}
+    ]
+
+
+def test_broad_chutes_service_account_is_used_only_by_api_and_gepetto():
+    miner = _render_chart("chutes-miner")
+    gpu = _render_chart("chutes-miner-gpu")
+    assert miner.returncode == gpu.returncode == 0
+    broad_consumers = set()
+    for document in [
+        *yaml.safe_load_all(miner.stdout),
+        *yaml.safe_load_all(gpu.stdout),
+    ]:
+        if not document or not (pod := _workload_pod_spec(document)):
+            continue
+        if pod.get("serviceAccountName") == "chutes":
+            broad_consumers.add(document["metadata"]["name"])
+    assert broad_consumers == {"api", "gepetto"}
 
 
 def test_corrective_schema_and_migration_are_durable():
