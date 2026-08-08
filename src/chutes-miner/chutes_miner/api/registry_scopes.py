@@ -21,12 +21,15 @@ _RETRY_MAX_SECONDS = 15 * 60
 @dataclass(frozen=True)
 class RegistryScopeWorkItem:
     launch_config_id: str
+    launch_intent_id: str | None
+    deployment_id: str | None
     validator: str
     server_id: str | None
     repository: str | None
     manifest_digest: str | None
     desired_state: str
     phase: str
+    attempt_count: int = 0
 
 
 def _utc_now() -> datetime:
@@ -273,20 +276,47 @@ async def record_registry_scope_revoked(
         return durable_ack
 
 
+async def record_registry_scope_failure_in_session(
+    session: Any,
+    launch_config_id: str,
+    exc: BaseException,
+    *,
+    advance_generation: bool = True,
+) -> RegistryScopeIntent | None:
+    """Invalidate in-flight registrations and persist one fail-closed retry."""
+
+    row = await session.get(
+        RegistryScopeIntent,
+        launch_config_id,
+        with_for_update=True,
+    )
+    if row is not None and row.phase != "revoked":
+        # Generic failures claim a new generation. A two-phase reconstruction
+        # failure passes advance_generation=False because its claim already
+        # established the generation that the failure CAS preserves.
+        if advance_generation:
+            row.attempt_count = int(row.attempt_count or 0) + 1
+        if row.desired_state == "active":
+            row.phase = "register_pending"
+        else:
+            row.phase = "revoke_pending"
+        row.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
+        row.next_retry_at = _retry_at(row.attempt_count)
+    return row
+
+
 async def record_registry_scope_failure(
     launch_config_id: str,
-    exc: Exception,
+    exc: BaseException,
 ) -> None:
     async with get_session() as session:
-        row = await session.get(
-            RegistryScopeIntent,
+        row = await record_registry_scope_failure_in_session(
+            session,
             launch_config_id,
-            with_for_update=True,
+            exc,
+            advance_generation=True,
         )
         if row is not None and row.phase != "revoked":
-            row.attempt_count += 1
-            row.last_failure = f"{type(exc).__name__}: {exc}"[:8000]
-            row.next_retry_at = _retry_at(row.attempt_count)
             await session.commit()
 
 
@@ -327,12 +357,15 @@ async def registry_scope_work_items(
         return [
             RegistryScopeWorkItem(
                 launch_config_id=row.launch_config_id,
+                launch_intent_id=row.launch_intent_id,
+                deployment_id=row.deployment_id,
                 validator=row.validator,
                 server_id=row.server_id,
                 repository=row.repository,
                 manifest_digest=row.manifest_digest,
                 desired_state=row.desired_state,
                 phase=row.phase,
+                attempt_count=int(row.attempt_count or 0),
             )
             for row in rows
         ]

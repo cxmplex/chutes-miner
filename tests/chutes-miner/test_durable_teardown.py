@@ -837,6 +837,8 @@ async def test_orphan_retries_already_absent_after_ack_record_crash_before_compl
         sql = str(statement)
         if "FROM servers" in sql:
             return _QueryResult(server)
+        if "FROM kubernetes_orphan_tombstones" in sql:
+            return _QueryResult(tombstone)
         if "FROM kubernetes_orphan_tombstone_resources" in sql:
             return EmptyRows()
         raise AssertionError(f"unexpected statement: {sql}")
@@ -844,6 +846,7 @@ async def test_orphan_retries_already_absent_after_ack_record_crash_before_compl
     session = SimpleNamespace(
         get=AsyncMock(side_effect=get),
         execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
     )
 
@@ -1125,9 +1128,11 @@ async def test_nonseedless_orphan_with_config_completes_without_registry_broker(
                 _QueryResult(server),
                 empty_rows(),
                 _QueryResult(server),
+                _QueryResult(tombstone),
                 empty_rows(),
             ]
         ),
+        scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
     )
 

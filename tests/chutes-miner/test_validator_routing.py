@@ -9,6 +9,7 @@ import pytest
 
 from chutes_common.schemas.gpu import GPU
 from chutes_common.schemas.chute import Chute
+from chutes_common.schemas.teardown import MinerLaunchIntent, RegistryScopeIntent
 from chutes_miner.api.config import settings
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.k8s.operator import K8sOperator
@@ -810,6 +811,10 @@ class _ClaimSession:
         self.statement = None
         self.flushed = False
         self.committed = False
+        self.orphan_fence = None
+        self.deployment_fence = None
+        self.registry_scope = None
+        self.get_calls = []
         lineage = {
             "schema": "chutes.miner-launch-lineage",
             "version": 1,
@@ -843,6 +848,7 @@ class _ClaimSession:
             request_sha256=canonical_miner_launch_sha256(request),
             lineage_sha256=canonical_miner_launch_sha256(lineage),
             response_payload={"config_id": None, "registry": None},
+            registry_ack=None,
             authorized_token_sha256s=[hashlib.sha256(b"launch-token").hexdigest()],
             deployment_id=DEPLOYMENT_ID,
             last_failure=None,
@@ -862,14 +868,60 @@ class _ClaimSession:
         self.statement = statement
         return SimpleNamespace(rowcount=self.claimed)
 
-    async def scalar(self, _statement):
+    async def scalar(self, statement):
+        if "kubernetes_orphan_tombstones" in str(statement):
+            return self.orphan_fence
+        if "FROM deployments" in str(statement):
+            return self.deployment_fence
         return None
 
-    async def get(self, _model, identity, **_kwargs):
-        return self.intent if identity == "launch-intent-1" else None
+    async def get(self, model, identity, **kwargs):
+        self.get_calls.append((model, identity, kwargs))
+        if identity == "launch-intent-1":
+            return self.intent
+        if model is RegistryScopeIntent:
+            return self.registry_scope
+        return None
 
     async def commit(self):
         self.committed = True
+
+
+def _enable_exact_seedless_scope(session: _ClaimSession) -> tuple[str, str, str]:
+    config_id = "config-1"
+    repository = "owner/image"
+    digest = f"sha256:{'a' * 64}"
+    ack = {
+        "registered": True,
+        "launch_config_id": config_id,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    }
+    session.intent.response_payload = {
+        "config_id": config_id,
+        "registry": {
+            "repository": repository,
+            "manifest_digest": digest,
+        },
+    }
+    session.intent.registry_ack = ack
+    session.registry_scope = SimpleNamespace(
+        launch_config_id=config_id,
+        launch_intent_id="launch-intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator=VALIDATOR,
+        server_id="server-1",
+        repository=repository,
+        manifest_digest=digest,
+        desired_state="active",
+        phase="active",
+        registration_ack=ack,
+        registered_at=datetime.now(timezone.utc),
+        last_failure=None,
+        next_retry_at=None,
+        revocation_ack=None,
+        revoked_at=None,
+    )
+    return config_id, repository, digest
 
 
 @pytest.mark.asyncio
@@ -909,6 +961,296 @@ async def test_atomic_gpu_claim_requires_unassigned_rows():
     assert session.intent.retry_lease_expires_at is None
     assert len(session.added) == 2
     assert "gpus.deployment_id IS NULL" in str(session.statement)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_placement_rejects_existing_deployment_before_intent_lock():
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    session.deployment_fence = DEPLOYMENT_ID
+
+    with pytest.raises(DeploymentFailure, match="deployment already exists"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+        )
+
+    intent_gets = [call for call in session.get_calls if call[0] is MinerLaunchIntent]
+    assert len(intent_gets) == 1
+    assert intent_gets[0][2].get("with_for_update") is not True
+    assert session.added == []
+    assert session.statement is None
+    assert session.committed is False
+
+
+@pytest.mark.asyncio
+async def test_placement_revalidates_snapshotted_deployment_id_under_intent_lock():
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+
+    class DriftSession(_ClaimSession):
+        async def get(self, model, identity, **kwargs):
+            value = await super().get(model, identity, **kwargs)
+            if model is MinerLaunchIntent and kwargs.get("with_for_update") is True:
+                self.intent.deployment_id = "changed-deployment-id"
+            return value
+
+    session = DriftSession(claimed=1, chute=chute, server=server)
+
+    with pytest.raises(DeploymentFailure, match="launch intent lineage conflicts"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+        )
+
+    intent_gets = [call for call in session.get_calls if call[0] is MinerLaunchIntent]
+    assert [call[2].get("with_for_update", False) for call in intent_gets] == [
+        False,
+        True,
+    ]
+    assert intent_gets[1][2].get("populate_existing") is True
+    assert session.added == []
+    assert session.statement is None
+    assert session.committed is False
+
+
+@pytest.mark.asyncio
+async def test_seedless_placement_accepts_exact_renewed_registry_authority(monkeypatch):
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    config_id, repository, digest = _enable_exact_seedless_scope(session)
+    historical_ack = session.intent.registry_ack
+    session.registry_scope.registration_ack = {
+        **historical_ack,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+    }
+    assert session.registry_scope.registration_ack != historical_ack
+
+    deployment_id, _ = await operator._track_deployment(
+        session,
+        chute,
+        server,
+        {server.gpus[0].gpu_id},
+        config_id=config_id,
+        registry_repository=repository,
+        registry_manifest_digest=digest,
+        launch_intent_id="launch-intent-1",
+        launch_intent_lease_owner="lease-1",
+        launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+    )
+
+    assert deployment_id == DEPLOYMENT_ID
+    assert session.committed is True
+
+
+@pytest.mark.parametrize("gpu_tee_only", [False, True])
+@pytest.mark.asyncio
+async def test_placement_rejects_completed_or_active_orphan_history(
+    monkeypatch,
+    gpu_tee_only,
+):
+    monkeypatch.setattr(settings, "gpu_tee_only", gpu_tee_only)
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server(
+        gpus=[
+            GPU(
+                gpu_id=str(uuid.uuid4()),
+                hardware_uuid=f"GPU-{uuid.uuid4()}",
+                server_id="server-1",
+                verified=True,
+                deployment_id=None,
+            )
+        ]
+    )
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    session.orphan_fence = "completed-or-nonterminal-tombstone"
+
+    with pytest.raises(DeploymentFailure, match="fenced by orphan cleanup"):
+        await operator._track_deployment(
+            session,
+            chute,
+            server,
+            {server.gpus[0].gpu_id},
+            launch_intent_id="launch-intent-1",
+            launch_intent_lease_owner="lease-1",
+            launch_token_sha256=hashlib.sha256(b"launch-token").hexdigest(),
+        )
+
+    assert session.added == []
+    assert session.statement is None
+    assert session.committed is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("launch_config_id", "other-config", "authority conflicts"),
+        ("launch_intent_id", "other-intent", "authority conflicts"),
+        ("deployment_id", "other-deployment", "authority conflicts"),
+        ("validator", "other-validator", "authority conflicts"),
+        ("server_id", "other-server", "authority conflicts"),
+        ("repository", "other/image", "authority conflicts"),
+        ("manifest_digest", f"sha256:{'b' * 64}", "authority conflicts"),
+        ("desired_state", "revoked", "not exactly active"),
+        ("phase", "revoke_pending", "not exactly active"),
+        ("registration_ack", None, "not exactly active"),
+        ("registered_at", None, "not exactly active"),
+        ("last_failure", "compensated registration", "not exactly active"),
+        ("next_retry_at", datetime.now(timezone.utc), "not exactly active"),
+        ("revocation_ack", {"revoked": True}, "not exactly active"),
+        ("revoked_at", datetime.now(timezone.utc), "not exactly active"),
+        (
+            "registration_ack",
+            {
+                "registered": True,
+                "launch_config_id": "config-1",
+                "expires_at": "2030-01-01T00:00:00+00:00",
+                "unexpected": True,
+            },
+            "not exactly active",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_seedless_placement_fails_closed_on_registry_scope_drift(
+    monkeypatch,
+    field,
+    value,
+    message,
+):
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server()
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    config_id, repository, digest = _enable_exact_seedless_scope(session)
+    setattr(session.registry_scope, field, value)
+    if field == "registration_ack" and isinstance(value, dict):
+        session.intent.registry_ack = value
+
+    with pytest.raises(DeploymentFailure, match=message):
+        await operator._assert_orphan_and_registry_placement_fence(
+            session,
+            session.intent,
+            config_id=config_id,
+            launch_intent_id="launch-intent-1",
+            deployment_id=DEPLOYMENT_ID,
+            validator=VALIDATOR,
+            server_id="server-1",
+            registry_repository=repository,
+            registry_manifest_digest=digest,
+        )
+
+    assert session.added == []
+    assert session.committed is False
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    ["not-a-time", "2020-01-01T00:00:00+00:00", 123, None],
+)
+@pytest.mark.asyncio
+async def test_seedless_placement_rejects_invalid_registry_ack_expiry(
+    monkeypatch,
+    expires_at,
+):
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server()
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    config_id, repository, digest = _enable_exact_seedless_scope(session)
+    malformed = {**session.registry_scope.registration_ack, "expires_at": expires_at}
+    session.registry_scope.registration_ack = malformed
+
+    with pytest.raises(DeploymentFailure, match="expired or malformed"):
+        await operator._assert_orphan_and_registry_placement_fence(
+            session,
+            session.intent,
+            config_id=config_id,
+            launch_intent_id="launch-intent-1",
+            deployment_id=DEPLOYMENT_ID,
+            validator=VALIDATOR,
+            server_id="server-1",
+            registry_repository=repository,
+            registry_manifest_digest=digest,
+        )
+
+
+@pytest.mark.asyncio
+async def test_seedless_placement_rejects_malformed_historical_launch_ack(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "gpu_tee_only", True)
+    operator = K8sOperator()
+    chute = _chute()
+    server = _server()
+    session = _ClaimSession(claimed=1, chute=chute, server=server)
+    config_id, repository, digest = _enable_exact_seedless_scope(session)
+    session.intent.registry_ack = {
+        **session.intent.registry_ack,
+        "unexpected": True,
+    }
+
+    with pytest.raises(DeploymentFailure, match="not exactly active"):
+        await operator._assert_orphan_and_registry_placement_fence(
+            session,
+            session.intent,
+            config_id=config_id,
+            launch_intent_id="launch-intent-1",
+            deployment_id=DEPLOYMENT_ID,
+            validator=VALIDATOR,
+            server_id="server-1",
+            registry_repository=repository,
+            registry_manifest_digest=digest,
+        )
 
 
 @pytest.mark.asyncio

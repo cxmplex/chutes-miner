@@ -31,8 +31,10 @@ from chutes_common.schemas.server import Server, ServerNodeIdentity
 from chutes_common.schemas.teardown import (
     DeploymentLaunchOperation,
     DeploymentTeardownK8sResource,
+    KubernetesOrphanTombstone,
     MinerLaunchIntent,
     ParentDeletionOperation,
+    RegistryScopeIntent,
 )
 from chutes_miner.api.config import (
     k8s_api_client,
@@ -111,6 +113,72 @@ def _without_none(value: Any) -> Any:
     if isinstance(value, list):
         return [_without_none(item) for item in value]
     return value
+
+
+def _require_exact_active_registry_scope(
+    scope: RegistryScopeIntent | None,
+    intent: MinerLaunchIntent,
+    *,
+    config_id: str | None,
+    launch_intent_id: str,
+    deployment_id: str,
+    validator: str,
+    server_id: str,
+    repository: str | None,
+    manifest_digest: str | None,
+) -> None:
+    """Fail closed unless placement still owns one exact live registry scope."""
+
+    expected_identity = {
+        "launch_config_id": config_id,
+        "launch_intent_id": launch_intent_id,
+        "deployment_id": deployment_id,
+        "validator": validator,
+        "server_id": server_id,
+        "repository": repository,
+        "manifest_digest": manifest_digest,
+    }
+    if scope is None or any(
+        getattr(scope, field) != value
+        for field, value in expected_identity.items()
+    ):
+        raise DeploymentFailure("durable registry scope authority conflicts")
+    ack = scope.registration_ack
+    launch_ack = intent.registry_ack
+    if (
+        scope.desired_state != "active"
+        or scope.phase != "active"
+        or scope.registered_at is None
+        or scope.last_failure is not None
+        or scope.next_retry_at is not None
+        or scope.revocation_ack is not None
+        or scope.revoked_at is not None
+        or not isinstance(ack, dict)
+        or set(ack) != {"registered", "launch_config_id", "expires_at"}
+        or ack.get("registered") is not True
+        or ack.get("launch_config_id") != config_id
+        or not isinstance(launch_ack, dict)
+        or set(launch_ack) != {"registered", "launch_config_id", "expires_at"}
+        or launch_ack.get("registered") is not True
+        or launch_ack.get("launch_config_id") != config_id
+        or not isinstance(launch_ack.get("expires_at"), str)
+        or not launch_ack["expires_at"]
+    ):
+        raise DeploymentFailure("durable registry scope is not exactly active")
+    try:
+        expires_at = (
+            datetime.fromisoformat(ack["expires_at"].replace("Z", "+00:00"))
+            if isinstance(ack["expires_at"], str)
+            else None
+        )
+    except ValueError:
+        expires_at = None
+    if (
+        expires_at is None
+        or expires_at.tzinfo is None
+        or expires_at <= datetime.now(timezone.utc)
+    ):
+        raise DeploymentFailure("durable registry scope ACK is expired or malformed")
 
 
 def _model_value(value: Any) -> Any:
@@ -1473,6 +1541,49 @@ class K8sOperator(abc.ABC):
             )
         return available_gpus
 
+    async def _assert_orphan_and_registry_placement_fence(
+        self,
+        session: AsyncSession,
+        intent: MinerLaunchIntent,
+        *,
+        config_id: str | None,
+        launch_intent_id: str,
+        deployment_id: str,
+        validator: str,
+        server_id: str,
+        registry_repository: str | None,
+        registry_manifest_digest: str | None,
+    ) -> None:
+        # A tombstone is immutable deletion history for deployment_id. This
+        # rejects both work still in flight and resurrection after completion;
+        # a subsequent launch must use a fresh deployment UUID.
+        orphan_fence = await session.scalar(
+            select(KubernetesOrphanTombstone.tombstone_id)
+            .where(KubernetesOrphanTombstone.deployment_id == deployment_id)
+            .with_for_update()
+            .limit(1)
+        )
+        if orphan_fence is not None:
+            raise DeploymentFailure("deployment placement is fenced by orphan cleanup")
+        if not settings.gpu_tee_only:
+            return
+        registry_scope = await session.get(
+            RegistryScopeIntent,
+            config_id,
+            with_for_update=True,
+        )
+        _require_exact_active_registry_scope(
+            registry_scope,
+            intent,
+            config_id=config_id,
+            launch_intent_id=launch_intent_id,
+            deployment_id=deployment_id,
+            validator=validator,
+            server_id=server_id,
+            repository=registry_repository,
+            manifest_digest=registry_manifest_digest,
+        )
+
     async def _track_deployment(
         self,
         session: AsyncSession,
@@ -1509,10 +1620,28 @@ class K8sOperator(abc.ABC):
             raise DeploymentFailure("deployment placement is fenced by parent deletion")
         if not launch_intent_id:
             raise DeploymentFailure("durable miner launch intent is required")
+        # Server is already locked by deploy_chute. Inspect the intended
+        # immutable deployment UUID and any committed Deployment before taking
+        # the launch-intent row lock. A duplicate placement must not wait on an
+        # intent held by teardown while teardown waits for this Server fence.
+        intent_snapshot = await session.get(MinerLaunchIntent, launch_intent_id)
+        snapshot_deployment_id = (
+            intent_snapshot.deployment_id if intent_snapshot is not None else None
+        )
+        if not isinstance(snapshot_deployment_id, str) or not snapshot_deployment_id:
+            raise DeploymentFailure("durable miner launch intent identity is invalid")
+        existing_deployment_id = await session.scalar(
+            select(Deployment.deployment_id).where(
+                Deployment.deployment_id == snapshot_deployment_id
+            )
+        )
+        if existing_deployment_id is not None:
+            raise DeploymentFailure("durable miner deployment already exists")
         intent = await session.get(
             MinerLaunchIntent,
             launch_intent_id,
             with_for_update=True,
+            populate_existing=True,
         )
         expected_lineage = {
             "schema": "chutes.miner-launch-lineage",
@@ -1544,6 +1673,7 @@ class K8sOperator(abc.ABC):
             persisted_lineage = None
         if (
             intent is None
+            or intent.deployment_id != snapshot_deployment_id
             or intent.phase != "registry_acked"
             or not isinstance(launch_intent_lease_owner, str)
             or not launch_intent_lease_owner
@@ -1565,6 +1695,17 @@ class K8sOperator(abc.ABC):
         ):
             raise DeploymentFailure("durable miner launch intent lineage conflicts")
         deployment_id = intent.deployment_id
+        await self._assert_orphan_and_registry_placement_fence(
+            session,
+            intent,
+            config_id=config_id,
+            launch_intent_id=launch_intent_id,
+            deployment_id=deployment_id,
+            validator=server.validator,
+            server_id=server.server_id,
+            registry_repository=registry_repository,
+            registry_manifest_digest=registry_manifest_digest,
+        )
         gpu_candidates = [gpu for gpu in server.gpus if gpu.gpu_id in available_gpus][
             : chute.gpu_count
         ]

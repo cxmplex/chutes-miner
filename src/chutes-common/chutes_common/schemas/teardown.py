@@ -914,6 +914,13 @@ class KubernetesOrphanTombstone(Base):
             unique=True,
             postgresql_where=text("phase <> 'completed'"),
         ),
+        # Placement treats completed tombstones as immutable deployment-ID
+        # revocation history, so its all-history lookup cannot use the active
+        # partial index above.
+        Index(
+            "kubernetes_orphan_deployment_history_idx",
+            "deployment_id",
+        ),
         CheckConstraint(
             "kubernetes_node_generation >= 0",
             name="ck_kubernetes_orphan_node_generation",

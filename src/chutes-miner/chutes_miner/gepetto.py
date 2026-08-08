@@ -45,7 +45,7 @@ from chutes_miner.api.k8s.util import (
 )
 from chutes_miner.api.registry_scopes import (
     ensure_registry_scope_registration_in_session,
-    record_registry_scope_failure,
+    record_registry_scope_failure_in_session,
     record_registry_scope_registered_in_session,
     record_registry_scope_revoked,
     registry_scope_work_items,
@@ -68,6 +68,18 @@ SCALE_UP_CANDIDATE_POOL = 2
 REGISTRY_SCOPE_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 LAUNCH_AUTHORITY_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 LAUNCH_INTENT_HEARTBEAT_SECONDS = max(1, LEASE_SECONDS // 3)
+
+
+async def _await_registry_cleanup(awaitable: Any) -> Any:
+    """Finish fail-closed cleanup even if cancellation is repeated."""
+
+    task = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
 
 
 def _canonical_sha256(document: Any) -> str:
@@ -3119,7 +3131,10 @@ class Gepetto:
                         timeout=RESUME_ITEM_TIMEOUT_SECONDS,
                     )
                 except Exception as exc:
-                    await record_registry_scope_failure(item.launch_config_id, exc)
+                    await self._record_registry_scope_work_item_failure(
+                        item,
+                        exc,
+                    )
                     logger.warning(
                         "registry scope {} reconciliation paused for retry: {}",
                         item.launch_config_id,
@@ -3128,16 +3143,100 @@ class Gepetto:
 
         await asyncio.gather(*(reconcile_one(item) for item in items))
 
+    async def _record_registry_scope_work_item_failure(
+        self,
+        item: Any,
+        exc: BaseException,
+    ) -> bool:
+        """Record only against the exact unclaimed work-item snapshot."""
+
+        async with get_session() as session:
+            current = await session.get(
+                RegistryScopeIntent,
+                item.launch_config_id,
+                with_for_update=True,
+            )
+            expected = {
+                "launch_intent_id": item.launch_intent_id,
+                "deployment_id": item.deployment_id,
+                "validator": item.validator,
+                "server_id": item.server_id,
+                "repository": item.repository,
+                "manifest_digest": item.manifest_digest,
+                "desired_state": item.desired_state,
+                "phase": item.phase,
+                "attempt_count": item.attempt_count,
+            }
+            if current is None or any(
+                getattr(current, field) != value
+                for field, value in expected.items()
+            ):
+                return False
+            await record_registry_scope_failure_in_session(
+                session,
+                item.launch_config_id,
+                exc,
+                advance_generation=True,
+            )
+            await session.commit()
+            return True
+
+    async def _resolve_registry_reconstruction_failure(
+        self,
+        item: Any,
+        attempt_identity: dict[str, Any],
+        attempt_generation: int,
+        exc: BaseException,
+    ) -> str:
+        """CAS one failed generation without mutating newer active work."""
+
+        async with get_session() as session:
+            current = await session.get(
+                RegistryScopeIntent,
+                item.launch_config_id,
+                with_for_update=True,
+            )
+            if current is None:
+                return "missing"
+            if current.desired_state != "active":
+                return "revoked"
+            if (
+                current.phase != "register_pending"
+                or current.attempt_count != attempt_generation
+                or any(
+                    getattr(current, field) != value
+                    for field, value in attempt_identity.items()
+                )
+            ):
+                # The current active/pending generation owns the shared broker
+                # config ID. A stale attempt may neither DELETE nor demote it.
+                return "superseded_active"
+            row = await record_registry_scope_failure_in_session(
+                session,
+                item.launch_config_id,
+                exc,
+                advance_generation=False,
+            )
+            if row is None:
+                return "missing"
+            await session.commit()
+            return "failed"
+
     async def _reconcile_registry_scope_intent(self, item: Any) -> None:
-        validator = validator_by_hotkey(item.validator)
-        if validator is None:
-            raise DeploymentFailure("registry scope validator is unavailable")
         if item.desired_state == "revoked":
             await self._revoke_registry_scope(
                 item.validator, item.launch_config_id, item.server_id
             )
             return
+
+        attempt_identity: dict[str, Any] | None = None
+        attempt_generation: int | None = None
+        body: dict[str, Any] | None = None
         compensate = False
+
+        # Transaction 1 publishes fail-closed pending authority and a monotonic
+        # attempt generation before any external POST. No database row lock is
+        # held across registry I/O.
         async with get_session() as session:
             current = await session.get(
                 RegistryScopeIntent,
@@ -3153,7 +3252,21 @@ class Gepetto:
                 # stale active snapshot must never issue a POST.
                 compensate = True
             else:
+                if (
+                    current.next_retry_at is not None
+                    and current.next_retry_at > datetime.now(timezone.utc)
+                ):
+                    # The work-item snapshot predates a committed failure.
+                    return
+                if (
+                    current.phase != item.phase
+                    or current.attempt_count != item.attempt_count
+                ):
+                    # Another worker claimed or completed this snapshot.
+                    return
                 expected = {
+                    "launch_intent_id": item.launch_intent_id,
+                    "deployment_id": item.deployment_id,
                     "validator": item.validator,
                     "server_id": item.server_id,
                     "repository": item.repository,
@@ -3169,10 +3282,33 @@ class Gepetto:
                         expected[key]
                         for key in ("server_id", "repository", "manifest_digest")
                     )
+                    or not isinstance(current.launch_intent_id, str)
+                    or not current.launch_intent_id
+                    or not isinstance(current.deployment_id, str)
+                    or not current.deployment_id
                 ):
                     raise DeploymentFailure(
                         "active registry scope lacks exact reconstruction identity"
                     )
+                current.phase = "register_pending"
+                current.attempt_count = int(current.attempt_count or 0) + 1
+                current.last_failure = None
+                current.next_retry_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=RESUME_ITEM_TIMEOUT_SECONDS + 30
+                )
+                attempt_generation = current.attempt_count
+                attempt_identity = {
+                    field: getattr(current, field)
+                    for field in (
+                        "launch_config_id",
+                        "launch_intent_id",
+                        "deployment_id",
+                        "validator",
+                        "server_id",
+                        "repository",
+                        "manifest_digest",
+                    )
+                }
                 body = {
                     "schema": "chutes.miner-registry-scope",
                     "version": 1,
@@ -3181,10 +3317,46 @@ class Gepetto:
                     "repository": current.repository,
                     "manifest_digest": current.manifest_digest,
                 }
-                registration_attempted = False
-                try:
-                    registration_attempted = True
-                    ack = await self._send_registry_scope_registration(validator, body)
+                await session.commit()
+
+        if compensate:
+            await self._revoke_registry_scope(
+                item.validator,
+                item.launch_config_id,
+                item.server_id,
+            )
+            return
+
+        if body is None or attempt_identity is None or attempt_generation is None:
+            raise DeploymentFailure("registry scope reconstruction attempt disappeared")
+
+        registration_attempted = False
+        try:
+            validator = validator_by_hotkey(item.validator)
+            if validator is None:
+                raise DeploymentFailure("registry scope validator is unavailable")
+            registration_attempted = True
+            ack = await self._send_registry_scope_registration(validator, body)
+
+            # Transaction 2 promotes only the exact generation and identity
+            # published above. A revocation or newer attempt always wins.
+            disposition = "superseded_active"
+            async with get_session() as session:
+                current = await session.get(
+                    RegistryScopeIntent,
+                    item.launch_config_id,
+                    with_for_update=True,
+                )
+                if (
+                    current is not None
+                    and current.desired_state == "active"
+                    and current.phase == "register_pending"
+                    and current.attempt_count == attempt_generation
+                    and all(
+                        getattr(current, field) == value
+                        for field, value in attempt_identity.items()
+                    )
+                ):
                     persisted = await record_registry_scope_registered_in_session(
                         session,
                         current.launch_config_id,
@@ -3196,36 +3368,90 @@ class Gepetto:
                         or persisted.phase != "active"
                     ):
                         raise DeploymentFailure(
-                            "registry scope revocation raced locked reconstruction"
+                            "registry scope revocation raced reconstruction promotion"
                         )
                     await session.commit()
-                except BaseException:
-                    if registration_attempted:
-                        # POST completion is ambiguous after timeout/cancellation.
-                        # The broker serializes this DELETE behind any in-flight
-                        # POST, so do not release the row lock with uncertain live
-                        # authority. The durable row remains active and can remint.
-                        try:
-                            await asyncio.shield(
-                                self._send_registry_scope_revocation(
-                                    item.validator,
-                                    item.launch_config_id,
-                                    item.server_id,
-                                )
-                            )
-                        except BaseException as cleanup_exc:
-                            logger.error(
-                                "Could not compensate ambiguous registry scope POST {}: {}",
+                    disposition = "promoted"
+                elif current is None:
+                    disposition = "missing"
+                elif current.desired_state != "active":
+                    disposition = "revoked"
+                elif (
+                    current.desired_state == "active"
+                    and not all(
+                        getattr(current, field) == value
+                        for field, value in attempt_identity.items()
+                    )
+                ):
+                    raise DeploymentFailure(
+                        "registry scope immutable reconstruction identity changed"
+                    )
+            if disposition == "promoted":
+                return
+            if disposition == "superseded_active":
+                # Pending and active newer generations both own the same
+                # immutable broker authority. A stale attempt is a no-op.
+                return
+            if disposition == "revoked":
+                await self._revoke_registry_scope(
+                    item.validator,
+                    item.launch_config_id,
+                    item.server_id,
+                )
+                return
+            if disposition == "missing":
+                await self._send_registry_scope_revocation(
+                    item.validator,
+                    item.launch_config_id,
+                    item.server_id,
+                )
+                return
+            raise DeploymentFailure("registry scope reconstruction outcome is invalid")
+        except BaseException as exc:
+            resolution = "unresolved"
+            try:
+                resolution = await _await_registry_cleanup(
+                    self._resolve_registry_reconstruction_failure(
+                        item,
+                        attempt_identity,
+                        attempt_generation,
+                        exc,
+                    )
+                )
+            except BaseException as resolution_exc:
+                logger.error(
+                    "Could not durably resolve registry reconstruction {}: {}",
+                    item.launch_config_id,
+                    resolution_exc,
+                )
+            if registration_attempted and resolution in {"revoked", "missing"}:
+                # Only monotonic revoked/missing authority permits DELETE.
+                # Same-generation ambiguity and stale active generations stay
+                # broker-live while durable pending blocks placement.
+                try:
+                    if resolution == "revoked":
+                        await _await_registry_cleanup(
+                            self._revoke_registry_scope(
+                                item.validator,
                                 item.launch_config_id,
-                                cleanup_exc,
+                                item.server_id,
                             )
-                    raise
-        if compensate:
-            await self._revoke_registry_scope(
-                item.validator,
-                item.launch_config_id,
-                item.server_id,
-            )
+                        )
+                    else:
+                        await _await_registry_cleanup(
+                            self._send_registry_scope_revocation(
+                                item.validator,
+                                item.launch_config_id,
+                                item.server_id,
+                            )
+                        )
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "Could not clean revoked registry scope POST {}: {}",
+                        item.launch_config_id,
+                        cleanup_exc,
+                    )
+            raise
 
     async def reconcile(self):
         """

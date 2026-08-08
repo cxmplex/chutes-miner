@@ -20,6 +20,7 @@ from chutes_common.k8s import WatchEvent, WatchEventType, serializer
 # Import the module under test
 from chutes_common.schemas.deployment import Deployment
 import chutes_miner.api.k8s as k8s
+import chutes_miner.api.k8s.operator as operator_module
 from chutes_miner.api.exceptions import DeploymentFailure
 from chutes_miner.api.config import settings
 from chutes_miner.api.k8s.constants import (
@@ -189,12 +190,16 @@ def mock_multicluster_k8s_operator():
 
     # Clear any singleton instance that might exist
     K8sOperator._instance = None
+    operator_module._disk_info_cache.clear()
+    operator_module._disk_info_locks.clear()
 
     yield
 
     # Restore the original method after test
     K8sOperator.__new__ = original_new
     K8sOperator._instance = None
+    operator_module._disk_info_cache.clear()
+    operator_module._disk_info_locks.clear()
 
 
 @pytest.fixture(autouse=True)

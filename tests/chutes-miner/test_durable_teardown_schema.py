@@ -237,6 +237,21 @@ def test_orphan_tombstone_binds_cluster_and_node_lineage():
     }.issubset(resource.c.keys())
     assert "lineage_conflict_at" not in Base.metadata.tables["parent_deletion_operations"].c
     assert "owner_api_version" in Base.metadata.tables["kubernetes_orphan_tombstone_resources"].c
+    history_index = next(
+        index
+        for index in table.indexes
+        if index.name == "kubernetes_orphan_deployment_history_idx"
+    )
+    assert [column.name for column in history_index.columns] == ["deployment_id"]
+    assert history_index.dialect_options["postgresql"].get("where") is None
+
+
+def test_orphan_history_lookup_has_nonpartial_migration_index():
+    sql = MIGRATION.read_text(encoding="utf-8")
+    assert (
+        "CREATE INDEX IF NOT EXISTS kubernetes_orphan_deployment_history_idx\n"
+        "    ON kubernetes_orphan_tombstones (deployment_id);"
+    ) in sql
 
 
 def test_followup_migration_has_specific_locked_down_guard():

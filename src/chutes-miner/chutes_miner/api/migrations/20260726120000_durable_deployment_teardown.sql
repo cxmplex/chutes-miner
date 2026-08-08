@@ -299,6 +299,8 @@ CREATE TABLE IF NOT EXISTS kubernetes_orphan_tombstones (
 CREATE UNIQUE INDEX IF NOT EXISTS kubernetes_orphan_active_idx
     ON kubernetes_orphan_tombstones (deployment_id, cluster_context)
     WHERE phase <> 'completed';
+CREATE INDEX IF NOT EXISTS kubernetes_orphan_deployment_history_idx
+    ON kubernetes_orphan_tombstones (deployment_id);
 
 CREATE TABLE IF NOT EXISTS kubernetes_orphan_tombstone_resources (
     resource_id TEXT PRIMARY KEY,

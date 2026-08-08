@@ -4109,8 +4109,65 @@ class DeploymentTeardownCoordinator:
                 "lineage operation kind must be deployment or orphan"
             )
         if for_update:
-            statement = statement.with_for_update()
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
         return (await session.execute(statement)).unique().scalar_one_or_none()
+
+    async def _lineage_recovery_row(
+        self,
+        session: Any,
+        operation_kind: str,
+        operation_id: str,
+    ) -> Any:
+        """Lock orphan recovery Server-first to match placement/finalization."""
+
+        if operation_kind != "orphan":
+            return await self._lineage_conflict_row(
+                session,
+                operation_kind,
+                operation_id,
+                for_update=True,
+            )
+        snapshot = await self._lineage_conflict_row(
+            session,
+            operation_kind,
+            operation_id,
+            for_update=False,
+        )
+        if snapshot is None:
+            return None
+        snapshot_cluster_context = snapshot.cluster_context
+        locked_server_id = await session.scalar(
+            select(Server.server_id)
+            .where(Server.name == snapshot_cluster_context)
+            .with_for_update(of=Server)
+        )
+        if locked_server_id is None:
+            raise LineageConflict("orphan recovery has no stable Server-row fence")
+        row = await self._lineage_conflict_row(
+            session,
+            operation_kind,
+            operation_id,
+            for_update=True,
+        )
+        if row is not None:
+            if row.cluster_context != snapshot_cluster_context:
+                raise LineageConflict("orphan recovery cluster context changed")
+            # A supported placement cannot appear after the Server lock. If
+            # one is already visible, neither requeue nor terminal resolution
+            # is valid. Fail before taking RegistryScopeIntent because normal
+            # teardown locks Deployment -> RegistryScopeIntent -> Server.
+            deployment_id = await session.scalar(
+                select(Deployment.deployment_id).where(
+                    Deployment.deployment_id == row.deployment_id
+                )
+            )
+            if deployment_id is not None:
+                raise LineageConflict(
+                    "orphan recovery conflicts with a local Deployment"
+                )
+        return row
 
     async def _authoritative_lineage_document(
         self,
@@ -4119,6 +4176,7 @@ class DeploymentTeardownCoordinator:
         row: Any,
         *,
         for_update: bool,
+        server_fenced: bool = False,
     ) -> dict[str, Any]:
         """Observe durable, relational, registry, and live Kubernetes lineage."""
 
@@ -4138,7 +4196,8 @@ class DeploymentTeardownCoordinator:
             .where(GPU.deployment_id == row.deployment_id)
             .order_by(GPU.gpu_id)
         )
-        if for_update:
+        lock_related_rows = for_update and not server_fenced
+        if lock_related_rows:
             deployment_statement = deployment_statement.with_for_update(of=Deployment)
             server_statement = server_statement.with_for_update(of=Server)
             gpu_statement = gpu_statement.with_for_update(of=GPU)
@@ -4151,6 +4210,10 @@ class DeploymentTeardownCoordinator:
             await session.get(
                 RegistryScopeIntent,
                 config_id,
+                # A registry reconciler/revoker does not take the Server fence.
+                # Recovery must therefore still lock and revalidate this row;
+                # only Deployment/GPU reads become MVCC under Server-first
+                # orphan recovery to avoid their normal teardown lock cycle.
                 with_for_update=for_update,
             )
             if config_id
@@ -4454,11 +4517,10 @@ class DeploymentTeardownCoordinator:
         if policy != expected_policy:
             raise DeploymentFailure("lineage recovery policy does not match action")
         async with get_session() as session:
-            row = await self._lineage_conflict_row(
+            row = await self._lineage_recovery_row(
                 session,
                 operation_kind,
                 operation_id,
-                for_update=True,
             )
             if row is None:
                 return None
@@ -4471,6 +4533,7 @@ class DeploymentTeardownCoordinator:
                 operation_kind,
                 row,
                 for_update=True,
+                server_fenced=operation_kind == "orphan",
             )
             observed_sha256 = canonical_sha256(lineage)
             if observed_sha256 != expected_lineage_sha256:
@@ -5647,6 +5710,112 @@ class DeploymentTeardownCoordinator:
             finally:
                 self._claim_owner.reset(marker)
 
+    async def _complete_orphan_in_session(
+        self,
+        session: Any,
+        tombstone: KubernetesOrphanTombstone,
+    ) -> None:
+        """Commit orphan closure behind the placement Server-row fence."""
+
+        # Placement owns this same Server row before it can examine an orphan
+        # tombstone, registry authority, or insert Deployment. Lock it first
+        # here as well so absence and terminalization are one serializable
+        # decision at the application fence.
+        server = (
+            (
+                await session.execute(
+                    select(Server)
+                    .where(Server.name == tombstone.cluster_context)
+                    .with_for_update(of=Server)
+                )
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
+        current = (
+            await session.execute(
+                select(KubernetesOrphanTombstone)
+                .where(KubernetesOrphanTombstone.tombstone_id == tombstone.tombstone_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            current is None
+            or current.retry_lease_owner != self.worker_id
+            or current.phase != "verifying"
+            or current.deployment_id != tombstone.deployment_id
+            or current.cluster_context != tombstone.cluster_context
+            or current.namespace != tombstone.namespace
+            or current.immutable_labels != tombstone.immutable_labels
+        ):
+            raise DeploymentFailure("orphan lease changed before completion")
+        if (
+            server is None
+            or server.kubernetes_node_uid != current.kubernetes_node_uid
+            or server.kubernetes_node_generation != current.kubernetes_node_generation
+            or cluster_context_sha256(server) != current.cluster_context_sha256
+        ):
+            raise LineageConflict(
+                "orphan cluster/node lineage changed before completion"
+            )
+        # Server is the insertion fence for every supported placement path.
+        # An unlocked MVCC read is deliberate: a normal teardown may already
+        # own the Deployment row while waiting for Server, and waiting back on
+        # that row would create Deployment -> Server / Server -> Deployment.
+        deployment_id = await session.scalar(
+            select(Deployment.deployment_id).where(
+                Deployment.deployment_id == current.deployment_id
+            )
+        )
+        if deployment_id is not None:
+            raise LineageConflict("local Deployment appeared before orphan completion")
+        config_id = current.immutable_labels.get("chutes/config-id")
+        if config_id and settings.gpu_tee_only:
+            registry_intent = await session.get(
+                RegistryScopeIntent,
+                config_id,
+                with_for_update=True,
+            )
+            if (
+                self._terminal_orphan_registry_ack(
+                    registry_intent,
+                    launch_config_id=config_id,
+                    validator=server.validator,
+                    server_id=server.server_id,
+                    deployment_id=current.deployment_id,
+                )
+                is None
+            ):
+                raise DeploymentFailure(
+                    "orphan completion is awaiting registry revocation ACK"
+                )
+        all_resources = list(
+            (
+                await session.execute(
+                    select(KubernetesOrphanTombstoneResource)
+                    .where(
+                        KubernetesOrphanTombstoneResource.tombstone_id
+                        == tombstone.tombstone_id
+                    )
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if any(
+            resource.state != "absent"
+            or (resource.kind == "Pod" and not _pod_absence_proven(resource))
+            for resource in all_resources
+        ):
+            raise DeploymentFailure(
+                "orphan completion lacks exact Kubernetes UID closure"
+            )
+        current.phase = "completed"
+        current.completed_at = utc_now()
+        current.retry_lease_owner = None
+        current.retry_lease_expires_at = None
+        current.next_retry_at = None
+        current.last_failure = None
+
     async def _run_orphan_claimed(self, tombstone_id: str) -> bool:
         now = utc_now()
         async with get_session() as session:
@@ -5980,80 +6149,7 @@ class DeploymentTeardownCoordinator:
             # consume its ACK or replay the exact idempotent revoke now.
             await self._ensure_orphan_registry_revoked(tombstone)
             async with get_session() as session:
-                current = await session.get(
-                    KubernetesOrphanTombstone,
-                    tombstone_id,
-                    with_for_update=True,
-                )
-                if current.retry_lease_owner != self.worker_id:
-                    raise DeploymentFailure("orphan lease changed before completion")
-                server = (
-                    (
-                        await session.execute(
-                            select(Server)
-                            .where(Server.name == current.cluster_context)
-                            .with_for_update(of=Server)
-                        )
-                    )
-                    .unique()
-                    .scalar_one_or_none()
-                )
-                if (
-                    server is None
-                    or server.kubernetes_node_uid != current.kubernetes_node_uid
-                    or server.kubernetes_node_generation
-                    != current.kubernetes_node_generation
-                    or cluster_context_sha256(server) != current.cluster_context_sha256
-                ):
-                    raise LineageConflict(
-                        "orphan cluster/node lineage changed before completion"
-                    )
-                config_id = current.immutable_labels.get("chutes/config-id")
-                if config_id and settings.gpu_tee_only:
-                    registry_intent = await session.get(
-                        RegistryScopeIntent,
-                        config_id,
-                        with_for_update=True,
-                    )
-                    if (
-                        self._terminal_orphan_registry_ack(
-                            registry_intent,
-                            launch_config_id=config_id,
-                            validator=server.validator,
-                            server_id=server.server_id,
-                            deployment_id=current.deployment_id,
-                        )
-                        is None
-                    ):
-                        raise DeploymentFailure(
-                            "orphan completion is awaiting registry revocation ACK"
-                        )
-                all_resources = list(
-                    (
-                        await session.execute(
-                            select(KubernetesOrphanTombstoneResource)
-                            .where(
-                                KubernetesOrphanTombstoneResource.tombstone_id
-                                == tombstone_id
-                            )
-                            .with_for_update()
-                        )
-                    ).scalars()
-                )
-                if any(
-                    resource.state != "absent"
-                    or (resource.kind == "Pod" and not _pod_absence_proven(resource))
-                    for resource in all_resources
-                ):
-                    raise DeploymentFailure(
-                        "orphan completion lacks exact Kubernetes UID closure"
-                    )
-                current.phase = "completed"
-                current.completed_at = utc_now()
-                current.retry_lease_owner = None
-                current.retry_lease_expires_at = None
-                current.next_retry_at = None
-                current.last_failure = None
+                await self._complete_orphan_in_session(session, tombstone)
                 await session.commit()
             return True
         except Exception as exc:

@@ -153,6 +153,12 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
                   'chutes_require_parent_deletion',
                   'deployments_fence_parent_deletion'
               );
+            SELECT COUNT(*)
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'kubernetes_orphan_tombstones'
+              AND indexname = 'kubernetes_orphan_deployment_history_idx'
+              AND indexdef NOT LIKE '% WHERE %';
             """,
             schema=schema,
             tuples_only=True,
@@ -160,7 +166,7 @@ def test_teardown_migration_applies_to_both_supported_starting_schemas(baseline:
         _assert_ok(inspected)
         assert [
             line.strip() for line in inspected.stdout.decode().splitlines() if line.strip()
-        ] == ["9", "5"]
+        ] == ["9", "5", "1"]
 
         _assert_ok(_psql(f"BEGIN;\n{DOWN_SQL}\nCOMMIT;", schema=schema))
         restored = _psql(

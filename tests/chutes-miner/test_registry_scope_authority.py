@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -63,9 +64,33 @@ def _active_scope_row(config_id: str = "config-active") -> SimpleNamespace:
             "expires_at": "2030-01-01T00:00:00+00:00",
         },
         registered_at=object(),
+        attempt_count=0,
         last_failure=None,
         next_retry_at=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_registry_work_item_carries_full_immutable_launch_identity(monkeypatch):
+    row = _active_scope_row()
+
+    class Result:
+        def scalars(self):
+            return [row]
+
+    session = SimpleNamespace(execute=AsyncMock(return_value=Result()))
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(scope_module, "get_session", fake_session)
+
+    items = await scope_module.registry_scope_work_items(reconstruct_active=True)
+
+    assert len(items) == 1
+    assert items[0].launch_intent_id == "intent-1"
+    assert items[0].deployment_id == DEPLOYMENT_ID
 
 
 @pytest.mark.asyncio
@@ -233,6 +258,8 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
 ):
     active = RegistryScopeWorkItem(
         launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -242,6 +269,8 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
     )
     revoked = RegistryScopeWorkItem(
         launch_config_id="config-revoked",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -250,7 +279,6 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
         phase="revoke_pending",
     )
     work_items = AsyncMock(return_value=[active, revoked])
-    failures = AsyncMock()
     row = _active_scope_row()
     session = SimpleNamespace(
         get=AsyncMock(return_value=row),
@@ -269,7 +297,6 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
         "validator_by_hotkey",
         lambda hotkey: SimpleNamespace(hotkey=hotkey),
     )
-    monkeypatch.setattr(gepetto_module, "record_registry_scope_failure", failures)
     coordinator = object.__new__(Gepetto)
     coordinator._send_registry_scope_registration = AsyncMock(
         return_value={
@@ -298,17 +325,18 @@ async def test_gepetto_restart_reconstructs_active_cache_and_replays_revocation(
     coordinator._revoke_registry_scope.assert_awaited_once_with(
         "validator-1", "config-revoked", "server-1"
     )
-    failures.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete(
+async def test_reconstruction_commits_pending_before_post_and_revocation_wins(
     monkeypatch,
 ):
-    """When reconstruction locks first, teardown DELETE is necessarily last."""
+    """External POST is lock-free and a concurrent durable revoke wins."""
 
     active = RegistryScopeWorkItem(
         launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -322,9 +350,11 @@ async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete
     allow_post = asyncio.Event()
     sequence: list[str] = []
     broker_live = False
+    session_count = 0
 
     class LockedSession:
-        def __init__(self):
+        def __init__(self, label):
+            self.label = label
             self.held = False
 
         async def get(self, _model, _identity, *, with_for_update):
@@ -332,11 +362,11 @@ async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete
             if not self.held:
                 await row_lock.acquire()
                 self.held = True
-                sequence.append("reconstruction_lock")
+                sequence.append(f"{self.label}_lock")
             return row
 
         async def commit(self):
-            sequence.append("registration_commit")
+            sequence.append(f"{self.label}_commit")
             if self.held:
                 self.held = False
                 row_lock.release()
@@ -348,7 +378,9 @@ async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete
 
     @asynccontextmanager
     async def locked_session():
-        session = LockedSession()
+        nonlocal session_count
+        session_count += 1
+        session = LockedSession(f"txn{session_count}")
         try:
             yield session
         finally:
@@ -377,6 +409,12 @@ async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete
         broker_live = False
         sequence.append("teardown_delete")
 
+    async def revoke(*_args):
+        nonlocal broker_live
+        assert row_lock.locked() is False
+        broker_live = False
+        sequence.append("reconstruction_delete")
+
     monkeypatch.setattr(gepetto_module.settings, "gpu_tee_only", True)
     monkeypatch.setattr(gepetto_module, "get_session", locked_session)
     monkeypatch.setattr(
@@ -387,35 +425,43 @@ async def test_reconstruction_lock_orders_post_before_concurrent_teardown_delete
     coordinator = object.__new__(Gepetto)
     coordinator._send_registry_scope_registration = register
     coordinator._send_registry_scope_revocation = AsyncMock()
-    coordinator._revoke_registry_scope = AsyncMock()
+    coordinator._revoke_registry_scope = AsyncMock(side_effect=revoke)
 
     reconciliation = asyncio.create_task(
         coordinator._reconcile_registry_scope_intent(active)
     )
     await post_started.wait()
     teardown_task = asyncio.create_task(teardown())
-    await asyncio.sleep(0)
-    assert row.desired_state == "active"
+    await teardown_task
+    assert row.desired_state == "revoked"
+    assert row.phase == "revoke_pending"
+    assert broker_live is False
     allow_post.set()
-    await asyncio.gather(reconciliation, teardown_task)
+    await reconciliation
 
     assert sequence == [
-        "reconstruction_lock",
+        "txn1_lock",
+        "txn1_commit",
         "post_started",
         "teardown_waiting",
-        "post_completed",
-        "registration_commit",
         "teardown_commit",
         "teardown_delete",
+        "post_completed",
+        "txn2_lock",
+        "reconstruction_delete",
     ]
     assert broker_live is False
-    coordinator._revoke_registry_scope.assert_not_awaited()
+    coordinator._revoke_registry_scope.assert_awaited_once_with(
+        "validator-1", "config-active", "server-1"
+    )
 
 
 @pytest.mark.asyncio
 async def test_reconstruction_never_posts_after_teardown_commits_first(monkeypatch):
     active = RegistryScopeWorkItem(
         launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -453,10 +499,248 @@ async def test_reconstruction_never_posts_after_teardown_commits_first(monkeypat
     )
 
 
+@pytest.mark.parametrize("newer_phase", ["register_pending", "active"])
 @pytest.mark.asyncio
-async def test_cancelled_reconstruction_compensates_while_row_lock_is_held(monkeypatch):
+async def test_stale_reconstruction_does_not_mutate_or_delete_newer_generation(
+    monkeypatch,
+    newer_phase,
+):
+    item = RegistryScopeWorkItem(
+        launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator="validator-1",
+        server_id="server-1",
+        repository="owner/image",
+        manifest_digest=DIGEST,
+        desired_state="active",
+        phase="active",
+        attempt_count=0,
+    )
+    row = _active_scope_row()
+    session = SimpleNamespace(get=AsyncMock(return_value=row), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    async def register(_validator, _body):
+        # A newer exact worker claimed (and may have promoted) while this POST
+        # was in flight.
+        row.attempt_count = 2
+        row.phase = newer_phase
+        return {
+            "registered": True,
+            "launch_config_id": "config-active",
+            "expires_at": "2030-01-02T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    monkeypatch.setattr(
+        gepetto_module,
+        "validator_by_hotkey",
+        lambda hotkey: SimpleNamespace(hotkey=hotkey),
+    )
+    coordinator = object.__new__(Gepetto)
+    coordinator._send_registry_scope_registration = register
+    coordinator._send_registry_scope_revocation = AsyncMock()
+
+    await coordinator._reconcile_registry_scope_intent(item)
+
+    assert row.attempt_count == 2
+    assert row.phase == newer_phase
+    coordinator._send_registry_scope_revocation.assert_not_awaited()
+    assert session.commit.await_count == 1
+
+
+@pytest.mark.parametrize("stale_generation", [True, False])
+@pytest.mark.asyncio
+async def test_reconstruction_claim_rechecks_generation_and_backoff(
+    monkeypatch,
+    stale_generation,
+):
+    item = RegistryScopeWorkItem(
+        launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator="validator-1",
+        server_id="server-1",
+        repository="owner/image",
+        manifest_digest=DIGEST,
+        desired_state="active",
+        phase="active",
+        attempt_count=0,
+    )
+    row = _active_scope_row()
+    if stale_generation:
+        row.attempt_count = 1
+    else:
+        row.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    session = SimpleNamespace(get=AsyncMock(return_value=row), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    coordinator = object.__new__(Gepetto)
+    coordinator._send_registry_scope_registration = AsyncMock()
+
+    await coordinator._reconcile_registry_scope_intent(item)
+
+    coordinator._send_registry_scope_registration.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    assert row.phase == "active"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("launch_intent_id", "changed-intent"),
+        ("deployment_id", "changed-deployment"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reconstruction_claim_rejects_work_item_launch_identity_drift(
+    monkeypatch,
+    field,
+    value,
+):
+    item = RegistryScopeWorkItem(
+        launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator="validator-1",
+        server_id="server-1",
+        repository="owner/image",
+        manifest_digest=DIGEST,
+        desired_state="active",
+        phase="active",
+        attempt_count=0,
+    )
+    row = _active_scope_row()
+    setattr(row, field, value)
+    session = SimpleNamespace(get=AsyncMock(return_value=row), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    coordinator = object.__new__(Gepetto)
+    coordinator._send_registry_scope_registration = AsyncMock()
+
+    with pytest.raises(DeploymentFailure, match="exact reconstruction identity"):
+        await coordinator._reconcile_registry_scope_intent(item)
+
+    coordinator._send_registry_scope_registration.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    assert row.phase == "active"
+    assert row.attempt_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("launch_intent_id", "changed-intent"),
+        ("deployment_id", "changed-deployment"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_outer_failure_writer_rejects_work_item_launch_identity_drift(
+    monkeypatch,
+    field,
+    value,
+):
+    item = RegistryScopeWorkItem(
+        launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator="validator-1",
+        server_id="server-1",
+        repository="owner/image",
+        manifest_digest=DIGEST,
+        desired_state="active",
+        phase="active",
+        attempt_count=0,
+    )
+    row = _active_scope_row()
+    setattr(row, field, value)
+    session = SimpleNamespace(get=AsyncMock(return_value=row), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    coordinator = object.__new__(Gepetto)
+
+    recorded = await coordinator._record_registry_scope_work_item_failure(
+        item,
+        RuntimeError("stale work item"),
+    )
+
+    assert recorded is False
+    session.commit.assert_not_awaited()
+    assert row.phase == "active"
+    assert row.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reconstruction_identity_drift_stays_pending_and_never_deletes(
+    monkeypatch,
+):
+    item = RegistryScopeWorkItem(
+        launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
+        validator="validator-1",
+        server_id="server-1",
+        repository="owner/image",
+        manifest_digest=DIGEST,
+        desired_state="active",
+        phase="active",
+        attempt_count=0,
+    )
+    row = _active_scope_row()
+    session = SimpleNamespace(get=AsyncMock(return_value=row), commit=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield session
+
+    async def register(_validator, _body):
+        row.repository = "changed/image"
+        return {
+            "registered": True,
+            "launch_config_id": "config-active",
+            "expires_at": "2030-01-02T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr(gepetto_module, "get_session", fake_session)
+    monkeypatch.setattr(
+        gepetto_module,
+        "validator_by_hotkey",
+        lambda hotkey: SimpleNamespace(hotkey=hotkey),
+    )
+    coordinator = object.__new__(Gepetto)
+    coordinator._send_registry_scope_registration = register
+    coordinator._send_registry_scope_revocation = AsyncMock()
+
+    with pytest.raises(DeploymentFailure, match="immutable reconstruction identity"):
+        await coordinator._reconcile_registry_scope_intent(item)
+
+    assert row.phase == "register_pending"
+    assert row.attempt_count == 1
+    coordinator._send_registry_scope_revocation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reconstruction_persists_pending_without_delete(monkeypatch):
     active = RegistryScopeWorkItem(
         launch_config_id="config-active",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -468,35 +752,42 @@ async def test_cancelled_reconstruction_compensates_while_row_lock_is_held(monke
     row_lock = asyncio.Lock()
     post_started = asyncio.Event()
 
+    commits = 0
+
     class LockedSession:
+        def __init__(self):
+            self.held = False
+
         async def get(self, _model, _identity, *, with_for_update):
             assert with_for_update is True
-            await row_lock.acquire()
+            if not self.held:
+                await row_lock.acquire()
+                self.held = True
             return row
 
         async def commit(self):
-            row_lock.release()
+            nonlocal commits
+            commits += 1
+            if self.held:
+                self.held = False
+                row_lock.release()
+
+        def release(self):
+            if self.held:
+                self.held = False
+                row_lock.release()
 
     @asynccontextmanager
     async def locked_session():
+        session = LockedSession()
         try:
-            yield LockedSession()
+            yield session
         finally:
-            if row_lock.locked():
-                row_lock.release()
+            session.release()
 
     async def blocked_post(_validator, _body):
         post_started.set()
         await asyncio.Event().wait()
-
-    async def compensate(_validator, _launch_config_id, _server_id):
-        assert row_lock.locked()
-        return {
-            "status": "already_absent",
-            "revoked": True,
-            "launch_config_id": "config-active",
-            "server_id": "server-1",
-        }
 
     monkeypatch.setattr(gepetto_module.settings, "gpu_tee_only", True)
     monkeypatch.setattr(gepetto_module, "get_session", locked_session)
@@ -507,7 +798,7 @@ async def test_cancelled_reconstruction_compensates_while_row_lock_is_held(monke
     )
     coordinator = object.__new__(Gepetto)
     coordinator._send_registry_scope_registration = blocked_post
-    coordinator._send_registry_scope_revocation = AsyncMock(side_effect=compensate)
+    coordinator._send_registry_scope_revocation = AsyncMock()
 
     reconciliation = asyncio.create_task(
         coordinator._reconcile_registry_scope_intent(active)
@@ -517,18 +808,21 @@ async def test_cancelled_reconstruction_compensates_while_row_lock_is_held(monke
     with pytest.raises(asyncio.CancelledError):
         await reconciliation
 
-    coordinator._send_registry_scope_revocation.assert_awaited_once_with(
-        "validator-1",
-        "config-active",
-        "server-1",
-    )
+    coordinator._send_registry_scope_revocation.assert_not_awaited()
     assert row_lock.locked() is False
+    assert row.phase == "register_pending"
+    assert row.attempt_count == 1
+    assert row.last_failure.startswith("CancelledError:")
+    assert row.next_retry_at is not None
+    assert commits == 2
 
 
 @pytest.mark.asyncio
 async def test_registry_outage_keeps_scope_work_pending_for_retry(monkeypatch):
     item = RegistryScopeWorkItem(
         launch_config_id="config-1",
+        launch_intent_id="intent-1",
+        deployment_id=DEPLOYMENT_ID,
         validator="validator-1",
         server_id="server-1",
         repository="owner/image",
@@ -537,7 +831,6 @@ async def test_registry_outage_keeps_scope_work_pending_for_retry(monkeypatch):
         phase="register_pending",
     )
     failure = ConnectionError("registry unavailable")
-    recorded_failure = AsyncMock()
     row = _active_scope_row("config-1")
     row.phase = "register_pending"
     row.registration_ack = None
@@ -561,11 +854,6 @@ async def test_registry_outage_keeps_scope_work_pending_for_retry(monkeypatch):
     )
     monkeypatch.setattr(
         gepetto_module,
-        "record_registry_scope_failure",
-        recorded_failure,
-    )
-    monkeypatch.setattr(
-        gepetto_module,
         "get_session",
         fake_session,
     )
@@ -582,10 +870,12 @@ async def test_registry_outage_keeps_scope_work_pending_for_retry(monkeypatch):
 
     await coordinator.reconcile_registry_scope_intents(reconstruct_active=False)
 
-    recorded_failure.assert_awaited_once_with("config-1", failure)
-    coordinator._send_registry_scope_revocation.assert_awaited_once_with(
-        "validator-1", "config-1", "server-1"
-    )
+    coordinator._send_registry_scope_revocation.assert_not_awaited()
+    assert row.phase == "register_pending"
+    assert row.attempt_count == 1
+    assert row.last_failure == "ConnectionError: registry unavailable"
+    assert row.next_retry_at is not None
+    assert session.commit.await_count == 2
 
 
 def test_failed_and_terminating_pods_do_not_keep_registry_scope_live(monkeypatch):
