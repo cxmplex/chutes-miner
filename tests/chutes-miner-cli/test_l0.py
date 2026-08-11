@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -83,7 +84,9 @@ def _signed_manifest(private_key, now, *, compute_type="cpu"):
         manifest["gpu_build_inputs_sha256"] = "9" * 64
     return {
         "manifest": manifest,
-        "signature": base64.b64encode(private_key.sign(l0.canonical_json_bytes(manifest))).decode(),
+        "signature": base64.b64encode(
+            private_key.sign(l0.canonical_json_bytes(manifest))
+        ).decode(),
     }
 
 
@@ -101,8 +104,12 @@ def _registry(private_key, now):
                         serialization.PublicFormat.Raw,
                     )
                 ).decode(),
-                "not_before": (now - timedelta(days=1)).isoformat().replace("+00:00", "Z"),
-                "not_after": (now + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
+                "not_before": (now - timedelta(days=1))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "not_after": (now + timedelta(days=30))
+                .isoformat()
+                .replace("+00:00", "Z"),
                 "enabled": True,
             }
         ],
@@ -115,7 +122,12 @@ def test_manifest_signature_tamper_and_expiry(monkeypatch):
     monkeypatch.setattr(l0, "_publisher_registry", lambda: _registry(private_key, now))
     signed = _signed_manifest(private_key, now)
 
-    assert l0.verify_bootstrap(signed, tee_type="tdx", channel="stable", now=now)["generation"] == 1
+    assert (
+        l0.verify_bootstrap(signed, tee_type="tdx", channel="stable", now=now)[
+            "generation"
+        ]
+        == 1
+    )
 
     tampered = json.loads(json.dumps(signed))
     tampered["manifest"]["generation"] = 2
@@ -240,16 +252,15 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
     assert "PCCS_API_KEY" not in script
     assert "PCCS_PASSWORD" not in script
     assert "chutes_data_initialize=true" in script
-    assert (
-        "chutes_data_expected_uuid=11111111-2222-3333-4444-555555555555"
-        in script
-    )
+    assert "chutes_data_expected_uuid=11111111-2222-3333-4444-555555555555" in script
     assert manifest["squashfs"]["sha256"] in script
     assert "data:application/octet-stream" not in script
     assert "chutes_l0_enrollment_b64=" in script
     assert "chutes_l0_manifest_url=" in script
     encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
-    boot_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    boot_config = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
     assert boot_config["voucher"] == "voucher.secret"
     assert boot_config["data_expected_uuid"] == "11111111-2222-3333-4444-555555555555"
     assert boot_config["enrollment_generation"] == 1
@@ -293,7 +304,9 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
         r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
         gpu_script,
     ).group(1)
-    gpu_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    gpu_config = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
     assert gpu_config["version"] == 2
     assert gpu_config["compute_type"] == "gpu"
     assert gpu_config["storage_enabled"] is True
@@ -387,10 +400,42 @@ def test_rotation_boot_bytes_are_accepted_exactly_by_sek8s_consumer(tmp_path):
     )
     encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
     sek8s_root = repository_root("sek8s", start=Path(__file__))
-    firstboot = (
-        sek8s_root / "host-tools/scripts/l0/chutes-l0-firstboot.sh"
-    ).read_text(encoding="utf-8")
-    marker = 'BOOT_SECRET_ID_STAGING="$BOOT_SECRET_ID_STAGING" python3 - <<\'PY\'\n'
+    decoder_path = sek8s_root / "host-tools/scripts/l0/l0_boot_config.py"
+    decoder_spec = importlib.util.spec_from_file_location(
+        "sek8s_l0_boot_config", decoder_path
+    )
+    decoder = importlib.util.module_from_spec(decoder_spec)
+    decoder_spec.loader.exec_module(decoder)
+    decoded_document = decoder.decode_boot_config(encoded)
+    expected_projection = decoder.duplicated_kernel_values(decoded_document)
+    kernel_tokens = next(
+        line.split()[1:] for line in script.splitlines() if line.startswith("kernel ")
+    )
+    observed_projection = {}
+    for field in expected_projection:
+        matches = [
+            token.split("=", 1)[1]
+            for token in kernel_tokens
+            if token.startswith(f"{field}=")
+        ]
+        assert len(matches) == 1
+        observed_projection[field] = matches[0]
+    assert (
+        decoder.validate_kernel_projection(decoded_document, observed_projection)
+        == expected_projection
+    )
+    with pytest.raises(decoder.BootConfigError, match="data_expected_uuid"):
+        decoder.validate_kernel_projection(
+            decoded_document,
+            {
+                **observed_projection,
+                "chutes_data_expected_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            },
+        )
+    firstboot = (sek8s_root / "host-tools/scripts/l0/chutes-l0-firstboot.sh").read_text(
+        encoding="utf-8"
+    )
+    marker = "BOOT_SECRET_ID_STAGING=\"$BOOT_SECRET_ID_STAGING\" python3 - <<'PY'\n"
     consumer = firstboot.split(marker, 1)[1].split("\nPY\n", 1)[0]
 
     def consume(value):
@@ -404,6 +449,7 @@ def test_rotation_boot_bytes_are_accepted_exactly_by_sek8s_consumer(tmp_path):
                 "BOOT_CONFIG_B64": value,
                 "BOOT_SECRET_STAGING": str(config_path),
                 "BOOT_SECRET_ID_STAGING": str(boot_id_path),
+                "CHUTES_L0_BOOT_MODULE_DIR": str(sek8s_root / "host-tools/scripts/l0"),
             }
         )
         return subprocess.run(
@@ -420,13 +466,63 @@ def test_rotation_boot_bytes_are_accepted_exactly_by_sek8s_consumer(tmp_path):
     assert "CHUTES_DATA_INITIALIZE=false\n" in config_path.read_text()
 
     document = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    canonical_document = dict(document)
     document["initialize"] = True
-    altered = base64.urlsafe_b64encode(
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
-    ).decode("ascii").rstrip("=")
+    altered = (
+        base64.urlsafe_b64encode(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
     rejected, _config_path = consume(altered)
     assert rejected.returncode != 0
     assert "schema or enrollment mode is invalid" in rejected.stderr
+
+    noncanonical = (
+        base64.urlsafe_b64encode(
+            json.dumps(canonical_document, indent=2).encode("ascii")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    rejected, _config_path = consume(noncanonical)
+    assert rejected.returncode != 0
+    assert "JSON bytes are not canonical" in rejected.stderr
+
+    padded = encoded + "="
+    rejected, _config_path = consume(padded)
+    assert rejected.returncode != 0
+    assert "unpadded URL-safe base64" in rejected.stderr
+
+    boolean_version = dict(canonical_document)
+    boolean_version["version"] = True
+    rejected, _config_path = consume(
+        base64.urlsafe_b64encode(
+            json.dumps(
+                boolean_version,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert rejected.returncode != 0
+    assert "invalid version" in rejected.stderr
+
+    duplicate_version = (
+        base64.urlsafe_b64encode(
+            l0.canonical_json_bytes(canonical_document).replace(
+                b'"version":1', b'"version":1,"version":1'
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    rejected, _config_path = consume(duplicate_version)
+    assert rejected.returncode != 0
+    assert "repeats key" in rejected.stderr
 
 
 @pytest.mark.parametrize(
@@ -457,7 +553,9 @@ def test_renderer_rejects_missing_or_noncanonical_data_uuid(value):
         )
 
 
-def test_prepare_boot_always_writes_enrollment_and_steady_scripts(tmp_path, monkeypatch):
+def test_prepare_boot_always_writes_enrollment_and_steady_scripts(
+    tmp_path, monkeypatch
+):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
     signed = _signed_manifest(private_key, now)
@@ -538,7 +636,9 @@ def test_prepare_boot_always_writes_enrollment_and_steady_scripts(tmp_path, monk
         r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
         enrollment.read_text(),
     ).group(1)
-    enrollment_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    enrollment_config = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
     assert enrollment_config["voucher"] == "voucher.secret"
     mint_document = request.await_args.args[-1]
     assert "provider" not in mint_document
@@ -631,7 +731,9 @@ def test_prepare_boot_uses_gpu_v2_manifest_and_enrollment(tmp_path, monkeypatch)
         r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
         enrollment.read_text(),
     ).group(1)
-    boot_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    boot_config = json.loads(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    )
     assert boot_config["version"] == 2
     assert boot_config["compute_type"] == "gpu"
     assert boot_config["storage_enabled"] is True
@@ -813,7 +915,9 @@ def test_pcs_envelope_interoperability(monkeypatch):
         def sign(_payload):
             return b"s" * 64
 
-    monkeypatch.setattr(l0, "_load_hotkey", lambda _path: ({"ss58Address": "owner"}, SigningKey()))
+    monkeypatch.setattr(
+        l0, "_load_hotkey", lambda _path: ({"ss58Address": "owner"}, SigningKey())
+    )
     plaintext = b"pcs-subscription-key"
     envelope = l0._pcs_envelope("/unused", status, plaintext)
     assert envelope["version"] == 1
@@ -867,7 +971,9 @@ def test_pcs_envelope_interoperability(monkeypatch):
     )
 
 
-def test_gpu_start_uses_validator_owned_server_and_process_identity(monkeypatch, capsys):
+def test_gpu_start_uses_validator_owned_server_and_process_identity(
+    monkeypatch, capsys
+):
     claims = {
         "schema": "chutes.gpu-launch-reservation",
         "version": 1,
