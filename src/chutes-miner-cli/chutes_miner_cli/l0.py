@@ -15,6 +15,7 @@ import stat
 import subprocess  # nosec B404
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -558,6 +559,7 @@ def render_ipxe(
     channel: str,
     data_device: str,
     data_device_id: str,
+    data_expected_uuid: str,
     bootif: str,
     voucher: Optional[str],
     enrollment_generation: int,
@@ -573,6 +575,13 @@ def render_ipxe(
         raise L0CliError("signed L0 command line contains forbidden characters")
     if not isinstance(manifest_signature, str) or len(manifest_signature) != 88:
         raise L0CliError("manifest signature is invalid")
+    try:
+        canonical_data_uuid = str(uuid.UUID(data_expected_uuid))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise L0CliError("CHUTES_DATA expected filesystem UUID is invalid") from exc
+    if canonical_data_uuid != data_expected_uuid:
+        raise L0CliError("CHUTES_DATA expected filesystem UUID must be canonical lowercase")
+    initialize = bool(voucher) and not rotate_identity
     config_document = {
         "schema": "chutes.l0-boot-config",
         "version": 1,
@@ -584,7 +593,8 @@ def render_ipxe(
         "channel": channel,
         "data_device": data_device,
         "data_device_id": data_device_id,
-        "initialize": bool(voucher),
+        "data_expected_uuid": canonical_data_uuid,
+        "initialize": initialize,
         "voucher": voucher,
         "enrollment_generation": enrollment_generation,
         "rotate_identity": rotate_identity,
@@ -642,7 +652,8 @@ def render_ipxe(
         "console=tty0 console=ttyS0,115200 "
         f"{cmdline} chutes_data_device={data_device} "
         f"chutes_data_device_id={data_device_id} "
-        f"chutes_data_initialize={'true' if voucher else 'false'} "
+        f"chutes_data_expected_uuid={canonical_data_uuid} "
+        f"chutes_data_initialize={'true' if initialize else 'false'} "
         f"chutes_l0ca_url={validator_ca_url} "
         f"chutes_l0_squashfs_sha256={manifest['squashfs']['sha256']} "
         f"chutes_l0_manifest_generation={manifest['generation']} "
@@ -881,6 +892,7 @@ def prepare_boot(
     compute_type: str = typer.Option("cpu", "--compute-type"),
     data_device: str = typer.Option(..., "--data-device"),
     data_device_id: str = typer.Option(..., "--data-device-id"),
+    data_expected_uuid: str = typer.Option(..., "--data-expected-uuid"),
     data_device_serial: Optional[str] = typer.Option(None, "--data-device-serial"),
     gpu_l0_profile: Optional[str] = typer.Option(None, "--gpu-l0-profile"),
     storage_data_size_gb: Optional[int] = typer.Option(None, "--storage-data-size-gb", min=1),
@@ -939,6 +951,12 @@ def prepare_boot(
             r"[A-Za-z0-9._:+-]{1,255}", data_device_id
         ):
             raise L0CliError("data device or /dev/disk/by-id basename is invalid")
+        try:
+            canonical_data_uuid = str(uuid.UUID(data_expected_uuid))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise L0CliError("--data-expected-uuid must be a canonical UUID") from exc
+        if canonical_data_uuid != data_expected_uuid:
+            raise L0CliError("--data-expected-uuid must be canonical lowercase")
         gpu_disk_fields = (
             data_device_serial,
             gpu_l0_profile,
@@ -1041,6 +1059,7 @@ def prepare_boot(
                 channel=channel,
                 data_device=data_device,
                 data_device_id=data_device_id,
+                data_expected_uuid=canonical_data_uuid,
                 bootif=normalized_bootif,
                 voucher=voucher_result["voucher"],
                 enrollment_generation=int(voucher_result["claims"]["enrollment_generation"]),
@@ -1065,6 +1084,7 @@ def prepare_boot(
                 channel=channel,
                 data_device=data_device,
                 data_device_id=data_device_id,
+                data_expected_uuid=canonical_data_uuid,
                 bootif=normalized_bootif,
                 voucher=None,
                 enrollment_generation=int(voucher_result["claims"]["enrollment_generation"]),

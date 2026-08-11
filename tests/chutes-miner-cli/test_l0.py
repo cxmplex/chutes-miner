@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock
 
 import pytest
@@ -19,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cross_repo_tests import repository_root
 
 
 def _storage_closure():
@@ -227,6 +229,7 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
         channel="stable",
         data_device="/dev/nvme0n1",
         data_device_id="nvme-test",
+        data_expected_uuid="11111111-2222-3333-4444-555555555555",
         bootif="",
         voucher="voucher.secret",
         enrollment_generation=1,
@@ -237,6 +240,10 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
     assert "PCCS_API_KEY" not in script
     assert "PCCS_PASSWORD" not in script
     assert "chutes_data_initialize=true" in script
+    assert (
+        "chutes_data_expected_uuid=11111111-2222-3333-4444-555555555555"
+        in script
+    )
     assert manifest["squashfs"]["sha256"] in script
     assert "data:application/octet-stream" not in script
     assert "chutes_l0_enrollment_b64=" in script
@@ -244,6 +251,7 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
     encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
     boot_config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     assert boot_config["voucher"] == "voucher.secret"
+    assert boot_config["data_expected_uuid"] == "11111111-2222-3333-4444-555555555555"
     assert boot_config["enrollment_generation"] == 1
     assert boot_config["rotate_identity"] is False
     assert boot_config["version"] == 1
@@ -269,6 +277,7 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
         channel="stable",
         data_device="/dev/nvme0n1",
         data_device_id="nvme-gpu",
+        data_expected_uuid="11111111-2222-3333-4444-555555555555",
         bootif="",
         voucher="voucher.secret",
         enrollment_generation=1,
@@ -306,6 +315,7 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
             channel="stable",
             data_device="/dev/nvme0n1",
             data_device_id="nvme-gpu",
+            data_expected_uuid="11111111-2222-3333-4444-555555555555",
             bootif="",
             voucher="voucher.secret",
             enrollment_generation=1,
@@ -316,6 +326,134 @@ def test_rendered_scripts_are_seedless_and_private(tmp_path):
             gpu_l0_profile="b200-xeon6-8gpu-qemu10-2-numa",
             storage_data_size_gb=500,
             gpu_infra_size_gb=100,
+        )
+
+
+def test_rotation_voucher_never_authorizes_data_initialization():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    manifest = _signed_manifest(Ed25519PrivateKey.generate(), now)["manifest"]
+    expected_uuid = "9c3bb112-648e-4111-a24c-046bb5d0a78f"
+
+    script = l0.render_ipxe(
+        manifest,
+        manifest_signature=base64.b64encode(b"s" * 64).decode(),
+        validator_api="https://api.example.com",
+        socket_url="wss://ws.example.com",
+        validator_ca_url="https://objects.example.com/validator-ca.crt",
+        host_id="l0-intel-tdx-ovh-vin1",
+        tee_type="tdx",
+        channel="canary",
+        data_device="/dev/nvme0n1",
+        data_device_id="nvme-eui.000000000000000100a07524492f9248",
+        data_expected_uuid=expected_uuid,
+        bootif="",
+        voucher="one-use-voucher",
+        enrollment_generation=3,
+        rotate_identity=True,
+        cmdline="kvm_intel.tdx=1 nohibernate",
+    )
+
+    assert "chutes_data_initialize=false" in script
+    assert f"chutes_data_expected_uuid={expected_uuid}" in script
+    encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
+    config = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    assert config["voucher"] == "one-use-voucher"
+    assert config["rotate_identity"] is True
+    assert config["initialize"] is False
+    assert config["data_expected_uuid"] == expected_uuid
+
+
+def test_rotation_boot_bytes_are_accepted_exactly_by_sek8s_consumer(tmp_path):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    manifest = _signed_manifest(Ed25519PrivateKey.generate(), now)["manifest"]
+    expected_uuid = "9c3bb112-648e-4111-a24c-046bb5d0a78f"
+    script = l0.render_ipxe(
+        manifest,
+        manifest_signature=base64.b64encode(b"s" * 64).decode(),
+        validator_api="https://api.example.com",
+        socket_url="wss://ws.example.com",
+        validator_ca_url="https://objects.example.com/validator-ca.crt",
+        host_id="l0-intel-tdx-ovh-vin1",
+        tee_type="tdx",
+        channel="canary",
+        data_device="/dev/nvme0n1",
+        data_device_id="nvme-eui.000000000000000100a07524492f9248",
+        data_expected_uuid=expected_uuid,
+        bootif="",
+        voucher="one-use-voucher",
+        enrollment_generation=3,
+        rotate_identity=True,
+        cmdline="kvm_intel.tdx=1 nohibernate",
+    )
+    encoded = re.search(r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)", script).group(1)
+    sek8s_root = repository_root("sek8s", start=Path(__file__))
+    firstboot = (
+        sek8s_root / "host-tools/scripts/l0/chutes-l0-firstboot.sh"
+    ).read_text(encoding="utf-8")
+    marker = 'BOOT_SECRET_ID_STAGING="$BOOT_SECRET_ID_STAGING" python3 - <<\'PY\'\n'
+    consumer = firstboot.split(marker, 1)[1].split("\nPY\n", 1)[0]
+
+    def consume(value):
+        config_path = tmp_path / "l0.conf.boot-secret"
+        boot_id_path = tmp_path / "l0.conf.boot-secret.id"
+        config_path.unlink(missing_ok=True)
+        boot_id_path.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "BOOT_CONFIG_B64": value,
+                "BOOT_SECRET_STAGING": str(config_path),
+                "BOOT_SECRET_ID_STAGING": str(boot_id_path),
+            }
+        )
+        return subprocess.run(
+            [sys.executable, "-c", consumer],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        ), config_path
+
+    accepted, config_path = consume(encoded)
+    assert accepted.returncode == 0, accepted.stderr
+    assert f"CHUTES_DATA_EXPECTED_UUID={expected_uuid}\n" in config_path.read_text()
+    assert "CHUTES_DATA_INITIALIZE=false\n" in config_path.read_text()
+
+    document = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    document["initialize"] = True
+    altered = base64.urlsafe_b64encode(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).decode("ascii").rstrip("=")
+    rejected, _config_path = consume(altered)
+    assert rejected.returncode != 0
+    assert "schema or enrollment mode is invalid" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "NOT-A-UUID", "9C3BB112-648E-4111-A24C-046BB5D0A78F"],
+)
+def test_renderer_rejects_missing_or_noncanonical_data_uuid(value):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    manifest = _signed_manifest(Ed25519PrivateKey.generate(), now)["manifest"]
+    with pytest.raises(l0.L0CliError, match="UUID"):
+        l0.render_ipxe(
+            manifest,
+            manifest_signature=base64.b64encode(b"s" * 64).decode(),
+            validator_api="https://api.example.com",
+            socket_url="wss://ws.example.com",
+            validator_ca_url="https://objects.example.com/validator-ca.crt",
+            host_id="host-1",
+            tee_type="tdx",
+            channel="stable",
+            data_device="/dev/nvme0n1",
+            data_device_id="nvme-test",
+            data_expected_uuid=value,
+            bootif="",
+            voucher="voucher.secret",
+            enrollment_generation=1,
+            rotate_identity=False,
+            cmdline="kvm_intel.tdx=1 nohibernate",
         )
 
 
@@ -363,6 +501,7 @@ def test_prepare_boot_always_writes_enrollment_and_steady_scripts(tmp_path, monk
         compute_type="cpu",
         data_device="/dev/nvme0n1",
         data_device_id="nvme-test",
+        data_expected_uuid="11111111-2222-3333-4444-555555555555",
         data_device_serial=None,
         gpu_l0_profile=None,
         storage_data_size_gb=None,
@@ -387,6 +526,14 @@ def test_prepare_boot_always_writes_enrollment_and_steady_scripts(tmp_path, monk
     assert "voucher.secret" not in steady.read_text()
     assert "chutes_data_initialize=true" in enrollment.read_text()
     assert "chutes_data_initialize=false" in steady.read_text()
+    assert (
+        "chutes_data_expected_uuid=11111111-2222-3333-4444-555555555555"
+        in enrollment.read_text()
+    )
+    assert (
+        "chutes_data_expected_uuid=11111111-2222-3333-4444-555555555555"
+        in steady.read_text()
+    )
     encoded = re.search(
         r"chutes_l0_enrollment_b64=([A-Za-z0-9_-]+)",
         enrollment.read_text(),
@@ -447,6 +594,7 @@ def test_prepare_boot_uses_gpu_v2_manifest_and_enrollment(tmp_path, monkeypatch)
         compute_type="gpu",
         data_device="/dev/nvme0n1",
         data_device_id="nvme-gpu",
+        data_expected_uuid="11111111-2222-3333-4444-555555555555",
         data_device_serial="GPU-SERIAL",
         gpu_l0_profile="b200-8gpu",
         storage_data_size_gb=500,
@@ -505,6 +653,7 @@ def test_gpu_boot_renderer_rejects_missing_public_disk_contract():
             channel="stable",
             data_device="/dev/nvme0n1",
             data_device_id="nvme-gpu",
+            data_expected_uuid="11111111-2222-3333-4444-555555555555",
             bootif="",
             voucher="voucher.secret",
             enrollment_generation=1,
@@ -609,6 +758,7 @@ first = runner.invoke(app, [
     "--tee-type", "tdx",
     "--data-device", "/dev/nvme0n1",
     "--data-device-id", "nvme-test",
+    "--data-expected-uuid", "11111111-2222-3333-4444-555555555555",
     "--output", "/tmp/enrollment.ipxe",
     "--steady-output", "/tmp/steady.ipxe",
     "--validator-ca-url", "https://objects.example.com/validator-ca.crt",

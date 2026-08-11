@@ -29,6 +29,7 @@ chutes-miner l0 prepare-boot \
   --compute-type cpu \
   --data-device /dev/nvme0n1 \
   --data-device-id nvme-EXACT_DEVICE_ID \
+  --data-expected-uuid 00000000-0000-0000-0000-000000000000 \
   --validator-ca-url https://objects.example/validator-ca.crt \
   --hotkey ~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>.json \
   --output ./enroll.ipxe \
@@ -72,7 +73,9 @@ boot sequence can regenerate and validate its root-only runtime kubeconfig.
 
 `prepare-boot` always writes both the one-use enrollment script and the voucher-free steady-state
 script. Add `--wait` to poll readiness with a finite monotonic deadline; it does not delay either
-output. A wiped CHUTES_DATA disk requires a new voucher.
+output. `--data-expected-uuid` is mandatory and binds both scripts to the exact existing ext4
+filesystem. A rotation voucher never enables formatting; only a fresh, non-rotation enrollment can
+initialize a wiped CHUTES_DATA disk.
 
 ### Latitude and OVH provider adapters
 
@@ -313,4 +316,3 @@ All commands accept `--hotkey` (or `HOTKEY` env var). The `start-maintenance` co
 - `kubectl config get-contexts` lists the expected contexts (control plane + all tracked nodes, plus any manual additions).
 - Optional: run `sync_control_kubeconfig` to push the file to servers that need it.
 - Optional: `chutes-miner instance-logs` with a JWT from `get_chute_jwt` (see above) streams logs until the validator closes the stream or you interrupt; use the stderr resume hint and `--cursor` to continue after errors or Ctrl+C.
-
