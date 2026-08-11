@@ -20,12 +20,6 @@ validators:
       api: https://api.chutes.ai
       socket: wss://ws.chutes.ai
 
-# The seedless stack deliberately retains its node-local registry enforcement
-# point even on mTLS-capable guests. It converts one launch-config credential
-# into an exact descriptor-closed registry session and is the durable
-# RegistryScopeIntent registration/revocation endpoint. Its upstream TLS
-# connection uses the guest's attested mTLS certificate; removing this proxy
-# would widen a workload pull to the host's registry authority.
 registry:
   image: parachutes/nginx-proxy@sha256:af44ec89c18ed30caca38f08122d7cb091112cd01e3081b769e8172c86304a42
   imagePullPolicy: Always
