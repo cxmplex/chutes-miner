@@ -547,7 +547,7 @@ files = [
 
 [[package]]
 name = "chutes-agent"
-version = "0.1.6"
+version = "0.1.7"
 description = "Agent to monitor chutes in Chutes clusters"
 optional = false
 python-versions = ">=3.12,<4.0"
@@ -575,7 +575,7 @@ url = "../../src/chutes-agent"
 
 [[package]]
 name = "chutes-common"
-version = "0.2.2"
+version = "0.2.4"
 description = "Common library for Chutes Miner"
 optional = false
 python-versions = ">=3.12,<4.0"
@@ -601,7 +601,7 @@ url = "../../src/chutes-common"
 
 [[package]]
 name = "chutes-miner"
-version = "0.4.8"
+version = "0.6.1"
 description = "chutes.ai miner API"
 optional = false
 python-versions = "^3.12,<4.0"
@@ -671,7 +671,7 @@ url = "../../src/chutes-monitor"
 
 [[package]]
 name = "chutes-registry"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local registry for Chutes Miner nodes"
 optional = false
 python-versions = ">=3.12,<4.0"
