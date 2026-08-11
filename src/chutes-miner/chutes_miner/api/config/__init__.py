@@ -78,6 +78,11 @@ class Settings(CommonSettings):
     graval_bootstrap_timeout: int = int(os.getenv("GRAVAL_BOOTSTRAP_TIMEOUT", "900"))
     debug: bool = os.getenv("DEBUG", "false").lower() == "true"
     registry_proxy_port: int = int(os.getenv("REGISTRY_PROXY_PORT", "30500"))
+    # Non-seedless TEE VMs at or above this version pull directly from
+    # registry.chutes.ai. Seedless VMs retain their descriptor-scoping proxy,
+    # whose upstream connection uses the guest's attested mTLS identity. Empty
+    # string disables the direct path entirely.
+    mtls_registry_min_version: str = os.getenv("MTLS_REGISTRY_MIN_VERSION", "1.4.0")
     monitoring_namespace: str = os.getenv("MONITORING_NAMESPACE", "chutes")
     prometheus_url: str = f"http://prometheus-server.{os.getenv('MONITORING_NAMESPACE', 'chutes')}.svc.cluster.local:{os.getenv('PROMETHEUS_PORT', '80')}"
 

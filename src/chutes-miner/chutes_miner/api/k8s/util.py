@@ -255,6 +255,24 @@ def build_chute_job(
     cpu = str(server.cpu_per_gpu * chute.gpu_count)
     ram = str(server.memory_per_gpu * chute.gpu_count) + "Gi"
     validator = resolve_deployment_validator(chute, server)
+
+    # Non-seedless mTLS-capable VMs can pull directly from registry.chutes.ai.
+    # Seedless VMs must retain the node-local scoped proxy even when their VM
+    # version supports mTLS: that proxy converts a launch-config credential
+    # into an exact descriptor-closed registry session and provides the durable
+    # RegistryScopeIntent registration/revocation boundary. Its upstream
+    # connection already uses the guest's attested mTLS certificate.
+    use_direct_registry = bool(
+        not settings.gpu_tee_only
+        and vm_version
+        and settings.mtls_registry_min_version
+        and semcomp(vm_version, settings.mtls_registry_min_version) >= 0
+    )
+    registry_ref = (
+        "registry.chutes.ai"
+        if use_direct_registry
+        else f"{server.validator.lower()}.localregistry.chutes.ai:{settings.registry_proxy_port}"
+    )
     deployment_labels = {
         "chutes/deployment-id": deployment_id,
         "chutes/chute": "true",
@@ -384,10 +402,7 @@ def build_chute_job(
                     containers=[
                         V1Container(
                             name="chute",
-                            image=(
-                                f"{server.validator.lower()}.localregistry.chutes.ai:"
-                                f"{settings.registry_proxy_port}/{image}"
-                            ),
+                            image=f"{registry_ref}/{image}",
                             image_pull_policy="Always",
                             env=[
                                 V1EnvVar(

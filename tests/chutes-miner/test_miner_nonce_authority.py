@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -67,9 +68,28 @@ async def test_two_legitimate_deployments_get_distinct_authority_and_exact_repla
     coordinator = object.__new__(Gepetto)
     chute, server = _chute_and_server()
 
-    first_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_ONE)
-    second_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_TWO)
-    replayed_intent = await coordinator._begin_launch_intent(chute, server, None, DEPLOYMENT_ONE)
+    first_intent = await coordinator._begin_launch_intent(
+        chute,
+        server,
+        None,
+        DEPLOYMENT_ONE,
+        lease_owner="producer-1",
+    )
+    second_intent = await coordinator._begin_launch_intent(
+        chute,
+        server,
+        None,
+        DEPLOYMENT_TWO,
+        lease_owner="producer-2",
+    )
+    added[0].retry_lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    replayed_intent = await coordinator._begin_launch_intent(
+        chute,
+        server,
+        None,
+        DEPLOYMENT_ONE,
+        lease_owner="recovery-1",
+    )
 
     assert first_intent != second_intent
     assert replayed_intent == first_intent
@@ -79,6 +99,8 @@ async def test_two_legitimate_deployments_get_distinct_authority_and_exact_repla
     assert added[0].lineage_sha256 != added[1].lineage_sha256
     assert added[0].request_payload["lineage"]["deployment_id"] == DEPLOYMENT_ONE
     assert added[1].request_payload["lineage"]["deployment_id"] == DEPLOYMENT_TWO
+    assert added[0].retry_lease_owner == "recovery-1"
+    assert added[0].attempt_count == 2
 
 
 @pytest.mark.asyncio
@@ -91,7 +113,13 @@ async def test_launch_authority_rejects_noncanonical_deployment_ids(deployment_i
     chute, server = _chute_and_server()
 
     with pytest.raises(DeploymentFailure, match="deployment identity"):
-        await coordinator._begin_launch_intent(chute, server, None, deployment_id)
+        await coordinator._begin_launch_intent(
+            chute,
+            server,
+            None,
+            deployment_id,
+            lease_owner="producer-1",
+        )
 
 
 def test_replay_swapping_only_the_deployment_uuid_fails_closed():

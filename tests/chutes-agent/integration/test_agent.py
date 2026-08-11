@@ -143,15 +143,18 @@ async def test_error_propagation(resource_monitor):
     
     monitor = resource_monitor
     
-    # Test that client errors affect monitor status
+    # A connection failure during start() is recoverable: the monitor moves to
+    # DEGRADED (retrying in the background) rather than the terminal ERROR
+    # state, but still surfaces the underlying error to the caller and status.
     with patch.object(monitor.collector, 'collect_all_resources', side_effect=Exception("Client connection failed")):
-        try:
-            await monitor.start("https://control.example.com")
-        except Exception:
-            pass
-        
+        with patch.object(monitor, '_ensure_recovery_loop'):
+            try:
+                await monitor.start("https://control.example.com")
+            except Exception:
+                pass
+
         # Status should reflect the error
-        assert monitor.state == MonitoringState.ERROR
+        assert monitor.state == MonitoringState.DEGRADED
         assert "Client connection failed" in monitor.status.error_message
 
 @pytest.mark.asyncio
@@ -246,7 +249,7 @@ async def test_multi_namespace_integration(mock_namespaces):
     collector.core_v1.list_namespaced_service.return_value = mock_response
     
     # Test collection
-    resources = await collector.collect_all_resources()
+    await collector.collect_all_resources()
     
     # Verify calls were made for both namespaces
     assert collector.core_v1.list_namespaced_pod.call_count == 2

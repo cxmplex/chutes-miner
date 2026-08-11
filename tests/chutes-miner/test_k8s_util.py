@@ -54,7 +54,7 @@ def _make_inputs(version: str, tee: bool = False):
     return chute, server, service
 
 
-def _build_job(version: str):
+def _build_job(version: str, vm_version: str = None):
     chute, server, service = _make_inputs(version)
     return build_chute_job(
         deployment_id="deploy-1",
@@ -65,7 +65,41 @@ def _build_job(version: str):
         probe_port=8000,
         token="launch-token",
         config_id="config-1",
+        vm_version=vm_version,
     )
+
+
+def _image(job):
+    return job.spec.template.spec.containers[0].image
+
+
+def test_build_chute_job_uses_proxy_when_vm_version_unknown():
+    image = _image(_build_job("0.6.0"))
+    assert image.startswith("test_validator.localregistry.chutes.ai:")
+    assert image.endswith("/parachutes/test:latest")
+
+
+@pytest.mark.parametrize("vm_version", ["1.3.9", "1.3.0.rc5", "0.9.0", "garbage"])
+def test_build_chute_job_uses_proxy_for_pre_mtls_or_unknown_vm(vm_version):
+    image = _image(_build_job("0.6.0", vm_version=vm_version))
+    assert image.startswith("test_validator.localregistry.chutes.ai:")
+    assert image.endswith("/parachutes/test:latest")
+
+
+# semcomp compares only the X.Y.Z prefix, so an rc build of 1.4.0 gates on
+# 1.4.0. This direct path is retained for non-seedless compatibility only.
+@pytest.mark.parametrize("vm_version", ["1.4.0", "1.4.0.rc1", "1.5.2"])
+def test_build_chute_job_uses_direct_registry_for_nonseedless_mtls_vm(vm_version):
+    image = _image(_build_job("0.6.0", vm_version=vm_version))
+    assert image == "registry.chutes.ai/parachutes/test:latest"
+
+
+def test_direct_registry_cutover_can_be_disabled(monkeypatch):
+    from chutes_miner.api.k8s import util
+
+    monkeypatch.setattr(util.settings, "mtls_registry_min_version", "")
+    image = _image(_build_job("0.6.0", vm_version="1.5.2"))
+    assert image.startswith("test_validator.localregistry.chutes.ai:")
 
 
 @pytest.mark.parametrize("version", [None, "", "garbage", "0.3.60", "0.3.60.rc1"])
@@ -233,8 +267,14 @@ def test_seedless_job_uses_exact_registry_root_digest(monkeypatch):
         config_id="config-1",
         registry_repository="owner/image",
         registry_manifest_digest=root,
+        vm_version="1.5.2",
     )
-    assert job.spec.template.spec.containers[0].image.endswith(f"/owner/image@{root}")
+    assert job.spec.template.spec.containers[0].image == (
+        f"test_validator.localregistry.chutes.ai:30500/owner/image@{root}"
+    )
+    assert [secret.name for secret in job.spec.template.spec.image_pull_secrets] == [
+        "registry-scope-44b25fd6993edeb3b8ded5d90a7ed24479b70103"
+    ]
     assert job.spec.template.metadata.finalizers == [POD_TEARDOWN_FINALIZER]
 
 

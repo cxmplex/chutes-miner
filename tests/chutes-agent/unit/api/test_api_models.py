@@ -1,4 +1,3 @@
-import pytest
 from chutes_common.monitoring.models import MonitoringState, MonitoringStatus
 from chutes_common.monitoring.requests import StartMonitoringRequest
 
@@ -7,6 +6,7 @@ def test_monitoring_state_enum():
     assert MonitoringState.STOPPED == "stopped"
     assert MonitoringState.STARTING == "starting"
     assert MonitoringState.RUNNING == "running"
+    assert MonitoringState.DEGRADED == "degraded"
     assert MonitoringState.ERROR == "error"
 
 def test_start_monitoring_request():

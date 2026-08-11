@@ -116,6 +116,41 @@ async def test_seedless_route_returns_typed_unsupported_error(monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+async def test_nonseedless_route_requires_agent_api_before_kubernetes_access(monkeypatch):
+    from chutes_miner.api.server.router import create_server
+
+    monkeypatch.setattr(settings, "gpu_tee_only", False)
+    with pytest.raises(HTTPException) as caught:
+        await create_server(SimpleNamespace(agent_api=None), None, None)
+
+    assert caught.value.status_code == 400
+    assert "agent_api is required" in caught.value.detail
+
+
+@pytest.mark.asyncio
+async def test_nonseedless_route_maps_agent_kubeconfig_failure_to_bad_gateway(monkeypatch):
+    from chutes_miner.api.server import router
+
+    async def fail_kubeconfig(_agent_api):
+        raise RuntimeError("agent unavailable")
+
+    monkeypatch.setattr(settings, "gpu_tee_only", False)
+    monkeypatch.setattr(router, "get_server_kubeconfig", fail_kubeconfig)
+    with pytest.raises(HTTPException) as caught:
+        await router.create_server(
+            SimpleNamespace(agent_api="https://worker.example:32000", name="worker-1"),
+            None,
+            None,
+        )
+
+    assert caught.value.status_code == 502
+    assert caught.value.detail == (
+        "Failed to retrieve kubeconfig from agent at "
+        "https://worker.example:32000:\nagent unavailable"
+    )
+
+
 def test_gepetto_generic_gpu_deletion_rejects_reservation_owned_nodes():
     with pytest.raises(ValueError, match="exact teardown/reset"):
         Gepetto.require_generic_gpu_deletion("allocation-group-1")
