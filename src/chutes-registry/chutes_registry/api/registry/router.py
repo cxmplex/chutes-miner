@@ -143,9 +143,7 @@ def _quarantine_corrupt_scope_cache(path: Path, exc: Exception) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
-    logger.error(
-        "quarantined corrupt registry scope cache %s as %s: %s", path, quarantine, exc
-    )
+    logger.error("quarantined corrupt registry scope cache %s as %s: %s", path, quarantine, exc)
 
 
 def _load_scopes() -> None:
@@ -360,10 +358,7 @@ def _select_scope(
         if scope.get("expires_at_value") is not None
         and scope["expires_at_value"] > now
         and _scope_identity(scope) == current_identity
-        and (
-            launch_config_id is None
-            or scope.get("launch_config_id") == launch_config_id
-        )
+        and (launch_config_id is None or scope.get("launch_config_id") == launch_config_id)
     ]
     matches = [scope for scope in active if _matches(scope, method, uri)]
     if not matches:
@@ -371,9 +366,7 @@ def _select_scope(
     parsed = urlsplit(uri)
     if parsed.path.startswith("/v2/") and "/manifests/" in parsed.path:
         reference = parsed.path.rsplit("/manifests/", 1)[1]
-        exact_roots = [
-            scope for scope in matches if scope["manifest_digest"] == reference
-        ]
+        exact_roots = [scope for scope in matches if scope["manifest_digest"] == reference]
         if exact_roots:
             matches = exact_roots
             if len({scope["descriptor_closure_sha256"] for scope in matches}) != 1:
@@ -467,8 +460,7 @@ async def _mint_registry_scope(
             result.get("descriptor_closure_sha256", ""),
         )
         or any(
-            not isinstance(result.get(field), list)
-            or result[field] != sorted(set(result[field]))
+            not isinstance(result.get(field), list) or result[field] != sorted(set(result[field]))
             for field in (
                 "allowed_manifests",
                 "allowed_blobs",

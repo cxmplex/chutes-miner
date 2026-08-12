@@ -55,9 +55,7 @@ async def inspect_teardown_conflict(
             detail=str(exc),
         ) from exc
     if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Conflict not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conflict not found")
     return result
 
 
@@ -81,19 +79,11 @@ async def _recover_teardown_conflict(
             actor=settings.miner_ss58,
         )
     except DeploymentFailure as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Conflict not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conflict not found")
     if action == "requeue" or operation_kind == "deployment":
-        runner = (
-            coordinator.run
-            if operation_kind == "deployment"
-            else coordinator.run_orphan
-        )
+        runner = coordinator.run if operation_kind == "deployment" else coordinator.run_orphan
         asyncio.create_task(runner(operation_id))
     response_status = (
         "requeued"
@@ -181,11 +171,7 @@ async def purge_deployment(
     """
     gepetto = Gepetto()
     deployment = (
-        (
-            await db.execute(
-                select(Deployment).where(Deployment.deployment_id == deployment_id)
-            )
-        )
+        (await db.execute(select(Deployment).where(Deployment.deployment_id == deployment_id)))
         .unique()
         .scalar_one_or_none()
     )

@@ -104,9 +104,7 @@ async def ensure_registry_scope_registration_in_session(
         )
     }
     if observed != expected or row.desired_state != "active":
-        raise DeploymentFailure(
-            "registry scope authority conflicts with durable launch"
-        )
+        raise DeploymentFailure("registry scope authority conflicts with durable launch")
     return row
 
 
@@ -256,9 +254,7 @@ async def record_registry_scope_revoked(
             or expected["status"] not in {"revoked", "already_absent"}
             or ack != expected
         ):
-            raise DeploymentFailure(
-                "registry broker returned a malformed revocation ACK"
-            )
+            raise DeploymentFailure("registry broker returned a malformed revocation ACK")
         durable_ack = {
             "status": "revoked",
             "revoked": True,
@@ -349,9 +345,7 @@ async def registry_scope_work_items(
                         | (RegistryScopeIntent.next_retry_at <= now)
                     ),
                 )
-                .order_by(
-                    RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id
-                )
+                .order_by(RegistryScopeIntent.created_at, RegistryScopeIntent.launch_config_id)
             )
         ).scalars()
         return [

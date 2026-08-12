@@ -139,8 +139,7 @@ def _require_exact_active_registry_scope(
         "manifest_digest": manifest_digest,
     }
     if scope is None or any(
-        getattr(scope, field) != value
-        for field, value in expected_identity.items()
+        getattr(scope, field) != value for field, value in expected_identity.items()
     ):
         raise DeploymentFailure("durable registry scope authority conflicts")
     ack = scope.registration_ack
@@ -173,11 +172,7 @@ def _require_exact_active_registry_scope(
         )
     except ValueError:
         expires_at = None
-    if (
-        expires_at is None
-        or expires_at.tzinfo is None
-        or expires_at <= datetime.now(timezone.utc)
-    ):
+    if expires_at is None or expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
         raise DeploymentFailure("durable registry scope ACK is expired or malformed")
 
 
